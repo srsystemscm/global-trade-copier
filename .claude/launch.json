@@ -1,0 +1,15 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ui",
+      "runtimeExecutable": "powershell",
+      "runtimeArgs": [
+        "-NoProfile",
+        "-Command",
+        "cd 'C:\\Users\\c_mie\\OneDrive\\Documents\\Claude\\Projects\\Global Trade Copier\\ui'; $env:VITE_HUB_TARGET='http://127.0.0.1:8010'; npm run dev"
+      ],
+      "port": 5173
+    }
+  ]
+}

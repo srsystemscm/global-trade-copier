@@ -1,0 +1,41 @@
+[
+  {
+    "id": "mt4-demo-1",
+    "name": "MT4 Demo Slave",
+    "broker_type": "mt4",
+    "enabled": true,
+    "config": {
+      "host": "127.0.0.1",
+      "port": 5560,
+      "mode": "mirror",
+      "timeout_ms": 5000
+    }
+  },
+  {
+    "id": "schwab-demo-1",
+    "name": "Schwab Autonomous Demo",
+    "broker_type": "schwab",
+    "enabled": true,
+    "config": {
+      "mode": "autonomous",
+      "futures_account_id": "FUTURES-ACCT-1",
+      "brokerage_account_id": "BROKERAGE-ACCT-1",
+      "schwab_auth_base": "http://127.0.0.1:8801/oauth",
+      "schwab_api_base": "http://127.0.0.1:8801/trader/v1",
+      "schwab_market_base": "http://127.0.0.1:8801/marketdata/v1",
+      "symbol_map": {
+        "XAUUSD": ["MGC", "GLD"]
+      },
+      "atr_period": 14,
+      "sizing": {
+        "MGC": { "mode": "fixed_contracts", "contracts": 1 },
+        "GLD": { "mode": "dollar_notional", "notional": 5000 }
+      },
+      "risk_management": {
+        "breakeven_trigger_atr": 1.0,
+        "trailing_atr": 1.5,
+        "poll_interval_seconds": 15
+      }
+    }
+  }
+]

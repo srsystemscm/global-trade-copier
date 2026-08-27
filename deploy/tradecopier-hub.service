@@ -1,0 +1,31 @@
+[Unit]
+Description=Global Trade Copier hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradecopier
+Group=tradecopier
+WorkingDirectory=/opt/tradecopier/hub
+EnvironmentFile=/opt/tradecopier/hub/.env
+ExecStart=/opt/tradecopier/hub/.venv/bin/python /opt/tradecopier/hub/run.py
+
+# Auto-restart on crash, but back off so a persistently broken deploy
+# doesn't spin the CPU or hammer external APIs (Schwab/IBKR/SMTP) with a
+# tight reconnect loop.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Modest hardening -- the hub only needs to read/write its own directory
+# and talk to the network, nothing else on the box.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tradecopier/hub/data /opt/tradecopier/hub/logs
+
+[Install]
+WantedBy=multi-user.target
