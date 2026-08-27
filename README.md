@@ -113,3 +113,7 @@ account/TWS available), the MQL4 files (no MT4 terminal available; never
 compiled in MetaEditor), and the `/deploy` artifacts (no VPS available).
 See each subdirectory's README for the specific gaps and what to check
 first.
+
+## License
+
+[Apache 2.0](LICENSE)
