@@ -116,11 +116,26 @@ class MT4Adapter(BrokerAdapter):
         )
         return OrderResult(slave_ticket=int(reply["slave_ticket"]), price=reply.get("price"))
 
-    async def modify(self, slave_ticket: int, sl: Optional[float], tp: Optional[float]) -> None:
-        await self._request({"cmd": "MODIFY", "ticket": slave_ticket, "sl": sl, "tp": tp})
-
     async def close(self, slave_ticket: int) -> None:
-        await self._request({"cmd": "CLOSE", "ticket": slave_ticket})
+        reply = await self._request({"cmd": "CLOSE", "ticket": slave_ticket})
+        if reply.get("already_closed"):
+            # Not an error: the leg was closed by hand or by its own SL/TP
+            # before the master's CLOSE arrived. The EA reports this as
+            # success so the caller still records the close in the registry,
+            # but it's worth a line in the log since it means someone or
+            # something touched the slave account outside the copier.
+            logger.warning(
+                "MT4Adapter[%s] slave_ticket=%s was already closed before the CLOSE arrived",
+                self.slave_id, slave_ticket,
+            )
+
+    async def modify(self, slave_ticket: int, sl: Optional[float], tp: Optional[float]) -> None:
+        reply = await self._request({"cmd": "MODIFY", "ticket": slave_ticket, "sl": sl, "tp": tp})
+        if reply.get("already_closed"):
+            logger.warning(
+                "MT4Adapter[%s] slave_ticket=%s was already closed, ignoring MODIFY",
+                self.slave_id, slave_ticket,
+            )
 
     async def get_status(self) -> bool:
         try:

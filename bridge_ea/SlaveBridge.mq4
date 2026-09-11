@@ -110,6 +110,12 @@ string HandleModify(string json)
    if(!OrderSelect(ticket, SELECT_BY_TICKET))
       return StringFormat("{\"status\":\"error\",\"message\":\"ticket %d not found\"}", ticket);
 
+   // Same as CLOSE: nothing to modify on a position that's already gone.
+   // Without this, every later MODIFY the master sends for a hand-closed
+   // slave leg logs an error on the hub for no actionable reason.
+   if(OrderCloseTime() > 0)
+      return StringFormat("{\"status\":\"ok\",\"already_closed\":true,\"slave_ticket\":%d}", ticket);
+
    if(!OrderModify(ticket, OrderOpenPrice(), sl, tp, 0, clrNONE))
       return StringFormat("{\"status\":\"error\",\"message\":\"OrderModify failed: %d\"}", GetLastError());
 
@@ -123,6 +129,15 @@ string HandleClose(string json)
 
    if(!OrderSelect(ticket, SELECT_BY_TICKET))
       return StringFormat("{\"status\":\"error\",\"message\":\"ticket %d not found\"}", ticket);
+
+   // Already flat -- someone closed this leg by hand, or its SL/TP fired.
+   // OrderSelect() searches history as well as open trades, so we find it,
+   // and OrderClose() would reject it with 4108. That is the outcome CLOSE
+   // was asking for, so report success: returning an error leaves the hub's
+   // Trade Registry row stuck at OPEN forever, because MT4 mirror slaves
+   // can't reconcile (MT4Adapter has no get_open_positions()).
+   if(OrderCloseTime() > 0)
+      return StringFormat("{\"status\":\"ok\",\"already_closed\":true,\"slave_ticket\":%d}", ticket);
 
    double lots   = OrderLots();
    int    type   = OrderType();
