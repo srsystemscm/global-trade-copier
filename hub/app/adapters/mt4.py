@@ -73,7 +73,11 @@ class MT4Adapter(BrokerAdapter):
     async def _request_once(self, command: dict) -> dict:
         async with self._lock:
             assert self.sock is not None, "adapter not connected"
-            await self.sock.send_json(command)
+            # Compact separators, not send_json(): json.dumps() defaults to
+            # `", "` / `": "`, and SlaveBridge.mq4 parses by hand. The EA now
+            # skips whitespace, but keeping the wire compact means the format
+            # it sees is deterministic (and the frames are smaller).
+            await self.sock.send_string(json.dumps(command, separators=(",", ":")))
             try:
                 raw = await asyncio.wait_for(self.sock.recv(), timeout=self.timeout_s)
             except asyncio.TimeoutError:

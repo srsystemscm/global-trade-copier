@@ -46,13 +46,24 @@ struct OrderSnapshot
   };
 
 OrderSnapshot knownOrders[];
-datetime lastHeartbeatSent = 0;
+// GetTickCount() ms, not a datetime: TimeCurrent() is the last *quote*
+// time for the chart symbol and stops advancing when no ticks arrive
+// (weekend, closed market, illiquid symbol), which would stall the
+// heartbeat and make MasterWatchdog report a healthy master as down.
+// uint arithmetic wraps correctly across GetTickCount()'s ~49.7d rollover.
+uint lastHeartbeatSent = 0;
 
 //+------------------------------------------------------------------+
 int OnInit()
   {
    string pubAddr  = StringFormat("tcp://%s:%d", HubHost, HubPubPort);
    string pushAddr = StringFormat("tcp://%s:%d", HubHost, HubPushPort);
+
+   // LINGER=0 so OnDeinit can't block MT4's shutdown trying to flush queued
+   // frames to a hub that isn't there. Observed as "shutdown by timeout" in
+   // the Experts log (uninit reason 9) when closing the terminal.
+   pubSocket.setLinger(0);
+   pushSocket.setLinger(0);
 
    pubSocket.connect(pubAddr);
    pushSocket.connect(pushAddr);
@@ -78,12 +89,12 @@ void OnTimer()
    OrderSnapshot current[];
    TakeSnapshot(current);
    DiffAndPublish(knownOrders, current);
-   knownOrders = current;
+   CopySnapshots(knownOrders, current);
 
-   if(TimeCurrent() - lastHeartbeatSent >= HeartbeatIntervalMs / 1000)
+   if(GetTickCount() - lastHeartbeatSent >= (uint)HeartbeatIntervalMs)
      {
       SendHeartbeat();
-      lastHeartbeatSent = TimeCurrent();
+      lastHeartbeatSent = GetTickCount();
      }
   }
 
@@ -111,6 +122,19 @@ void TakeSnapshot(OrderSnapshot &out[])
       out[n].sl     = OrderStopLoss();
       out[n].tp     = OrderTakeProfit();
      }
+  }
+
+//+------------------------------------------------------------------+
+//| MQL4 has no whole-array assignment, and ArrayCopy() refuses any   |
+//| struct containing a string (OrderSnapshot.symbol), so the previous |
+//| snapshot has to be rebuilt element by element.                     |
+//+------------------------------------------------------------------+
+void CopySnapshots(OrderSnapshot &dst[], OrderSnapshot &src[])
+  {
+   int n = ArraySize(src);
+   ArrayResize(dst, n);
+   for(int i = 0; i < n; i++)
+      dst[i] = src[i];
   }
 
 //+------------------------------------------------------------------+
@@ -158,7 +182,7 @@ void PublishSignal(string action, OrderSnapshot &o)
       "\"lots\":%.2f,\"price\":%.5f,\"sl\":%.5f,\"tp\":%.5f,\"atr\":%.5f,\"account\":\"%d\",\"ts\":%.3f}",
       o.ticket, o.symbol, action, direction,
       o.lots, o.price, o.sl, o.tp, atr,
-      AccountNumber(), TimeGMT());
+      AccountNumber(), (double)TimeGMT());
 
    ZmqMsg msg(json);
    pubSocket.send(msg);
@@ -168,7 +192,7 @@ void PublishSignal(string action, OrderSnapshot &o)
 //+------------------------------------------------------------------+
 void SendHeartbeat()
   {
-   string json = StringFormat("{\"account\":\"%d\",\"ts\":%.3f}", AccountNumber(), TimeGMT());
+   string json = StringFormat("{\"account\":\"%d\",\"ts\":%.3f}", AccountNumber(), (double)TimeGMT());
    ZmqMsg msg(json);
    pushSocket.send(msg);
   }

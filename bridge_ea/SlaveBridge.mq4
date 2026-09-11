@@ -25,7 +25,19 @@ Socket  repSocket(zmqContext, ZMQ_REP);
 int OnInit()
   {
    string addr = StringFormat("tcp://*:%d", HubCommandPort);
-   repSocket.bind(addr);
+
+   // LINGER=0 so OnDeinit can't block MT4's shutdown waiting to flush a
+   // reply nobody is reading -- an unbounded linger shows up as
+   // "shutdown by timeout" in the Experts log and hangs terminal close.
+   repSocket.setLinger(0);
+
+   if(!repSocket.bind(addr))
+     {
+      Print("SlaveBridge FAILED to bind ", addr,
+            " -- another EA, or a stale mql-zmq context from a previous ",
+            "attach, is still holding that port. Restart the terminal.");
+      return(INIT_FAILED);
+     }
    Print("SlaveBridge listening on ", addr);
    EventSetMillisecondTimer(PollIntervalMs);
    return(INIT_SUCCEEDED);
@@ -126,39 +138,79 @@ string HandleClose(string json)
 //+------------------------------------------------------------------+
 //| Minimal flat-JSON value extraction -- every command here is a     |
 //| single-level object with string/number values, so a full parser   |
-//| isn't needed.                                                      |
+//| isn't needed. It does have to tolerate whitespace, though: the    |
+//| hub sends via Python's json.dumps(), which emits `"cmd": "PING"`  |
+//| with a space after the colon. Matching on the literal `"cmd":"`   |
+//| silently found nothing -- strings came back empty and every       |
+//| number came back 0.0 (lots=0 => OrderSend rejected). scripts/     |
+//| simulate_slave.py never caught it because json.loads() doesn't    |
+//| care about whitespace; only this parser does.                     |
+//+------------------------------------------------------------------+
+int SkipWhitespace(string json, int i)
+  {
+   int len = StringLen(json);
+   while(i < len)
+     {
+      ushort c = StringGetCharacter(json, i);
+      if(c == ' ' || c == '	' || c == '
+' || c == '')
+         i++;
+      else
+         break;
+     }
+   return i;
+  }
+
+//+------------------------------------------------------------------+
+//| Position just past `"<key>"` and its colon, or -1 if not present. |
+//+------------------------------------------------------------------+
+int FindValueStart(string json, string key)
+  {
+   string needle = "\"" + key + "\"";
+   int p = StringFind(json, needle);
+   if(p < 0)
+      return -1;
+   p = SkipWhitespace(json, p + StringLen(needle));
+   if(p >= StringLen(json) || StringGetCharacter(json, p) != ':')
+      return -1;
+   return SkipWhitespace(json, p + 1);
+  }
+
 //+------------------------------------------------------------------+
 string JsonGetString(string json, string key)
   {
-   string needle = "\"" + key + "\":\"";
-   int start = StringFind(json, needle);
-   if(start < 0)
+   int p = FindValueStart(json, key);
+   if(p < 0 || p >= StringLen(json))
       return "";
-   start += StringLen(needle);
-   int end = StringFind(json, "\"", start);
+   if(StringGetCharacter(json, p) != '"')
+      return "";
+   p++;
+   int end = StringFind(json, "\"", p);
    if(end < 0)
       return "";
-   return StringSubstr(json, start, end - start);
+   return StringSubstr(json, p, end - p);
   }
 
 //+------------------------------------------------------------------+
 double JsonGetDouble(string json, string key)
   {
-   string needle = "\"" + key + "\":";
-   int start = StringFind(json, needle);
-   if(start < 0)
+   int p = FindValueStart(json, key);
+   if(p < 0)
       return 0.0;
-   start += StringLen(needle);
-   int end = start;
-   int len = StringLen(json);
-   while(end < len)
+   int start = p;
+   int len   = StringLen(json);
+   while(p < len)
      {
-      ushort c = StringGetCharacter(json, end);
-      if((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.')
-         end++;
+      ushort c = StringGetCharacter(json, p);
+      if((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E')
+         p++;
       else
          break;
      }
-   return StrToDouble(StringSubstr(json, start, end - start));
+   // no digits consumed => JSON null (the hub sends `"sl": null` when the
+   // master has none), which MQL4 represents as 0.0 anyway.
+   if(p == start)
+      return 0.0;
+   return StrToDouble(StringSubstr(json, start, p - start));
   }
 //+------------------------------------------------------------------+

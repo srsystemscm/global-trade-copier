@@ -36,7 +36,14 @@ class SignalBus:
         logger.info("unregistered slave queue: %s", slave_id)
 
     def _dedup_key(self, signal: Signal) -> str:
-        return f"{signal.ticket}:{signal.ts}"
+        # `ts` comes from the master EA's TimeGMT(), which has whole-second
+        # resolution, while the EA polls every 500ms -- so keying on
+        # ticket+ts alone collides whenever two *different* actions land on
+        # the same ticket inside one wall-clock second (e.g. an OPEN followed
+        # by the broker setting SL/TP), silently dropping the second one.
+        # Including the action still deduplicates a genuinely replayed
+        # message, which is all this is meant to catch.
+        return f"{signal.ticket}:{signal.action}:{signal.ts}"
 
     def _is_duplicate(self, signal: Signal) -> bool:
         self._evict_expired()
@@ -87,7 +94,10 @@ class SignalBus:
             return
 
         if self._is_duplicate(signal):
-            logger.debug("dropping duplicate signal ticket=%s ts=%s", signal.ticket, signal.ts)
+            logger.debug(
+                "dropping duplicate signal ticket=%s action=%s ts=%s",
+                signal.ticket, signal.action, signal.ts,
+            )
             return
 
         self._seen[self._dedup_key(signal)] = time.time()
