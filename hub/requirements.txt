@@ -7,3 +7,9 @@ python-dotenv>=1.0
 httpx>=0.27
 pytest>=8.0
 python-multipart>=0.0.9
+
+# Optional -- only needed for IBKR slaves (app/adapters/ibkr.py lazy-imports
+# it, so the hub runs fine without it). ib_async is the maintained successor
+# to ib_insync, which was archived in March 2024; the adapter accepts either
+# but new installs should use ib_async.
+# ib_async>=1.0

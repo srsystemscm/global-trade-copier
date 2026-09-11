@@ -19,16 +19,19 @@ logger = logging.getLogger(__name__)
 
 class IBKRAdapter(BrokerAdapter):
     """Talks to Interactive Brokers via TWS/IB Gateway's API, through
-    ib_insync.
+    `ib_async`.
 
-    Dormant: registered in the adapter factory and structurally complete to
-    the same standard as SchwabAdapter, but not exercised against a real
-    TWS/Gateway in this environment -- there's no way to do that without an
-    actual IBKR account and a running terminal. `ib_insync` is lazy-imported
-    so it isn't a hard dependency for deployments that don't use IBKR;
-    `pip install ib_insync` when you're ready to migrate off Schwab (per
-    the project's design decision, that migration should be a config change
-    only -- Copy Engines only ever talk through the BrokerAdapter interface).
+    The client library is lazy-imported so it isn't a hard dependency for
+    deployments that don't use IBKR -- `pip install ib_async` on the hub
+    when you want it. Prefer `ib_async`: the original `ib_insync` was
+    archived in March 2024 after its author died, and `ib_async` is the
+    maintained drop-in successor. `ib_insync` is still accepted as a
+    fallback so existing installs keep working, but new setups should not
+    use it.
+
+    Per the project's design decision, swapping a slave onto IBKR is a
+    config change only -- Copy Engines only ever talk through the
+    BrokerAdapter interface.
 
     Unlike Schwab, IBKR uses a single account for both futures and
     equities, so `account_type` is accepted for interface parity but
@@ -58,25 +61,40 @@ class IBKRAdapter(BrokerAdapter):
         self.host = host
         self.port = port
         self.client_id = client_id
-        self.ib = None  # ib_insync.IB, created in connect()
+        self.ib = None  # the client instance (ib_async.IB), created in connect()
         self._contracts: Dict[str, object] = {}
         self._positions: Dict[int, dict] = {}
 
     @staticmethod
-    def _require_ib_insync():
+    def _require_ib():
+        """The ib_async module (or ib_insync as a legacy fallback).
+
+        ib_async is an API-compatible fork, so everything below works
+        against either one unchanged.
+        """
+        try:
+            import ib_async
+
+            return ib_async
+        except ImportError:
+            pass
         try:
             import ib_insync
+
+            logger.warning(
+                "using the archived ib_insync; ib_async is the maintained successor "
+                "-- `pip install ib_async` on the hub"
+            )
+            return ib_insync
         except ImportError as exc:
             raise AdapterConnectionError(
-                "ib_insync is not installed -- run `pip install ib_insync` on the hub to use "
-                "the IBKR adapter (it's kept optional since IBKR is dormant until you migrate "
-                "off Schwab)"
+                "no IBKR client library installed -- run `pip install ib_async` on the hub "
+                "to use the IBKR adapter (kept optional so non-IBKR deployments don't need it)"
             ) from exc
-        return ib_insync
 
     async def connect(self) -> None:
-        ib_insync = self._require_ib_insync()
-        self.ib = ib_insync.IB()
+        ib_mod = self._require_ib()
+        self.ib = ib_mod.IB()
         try:
             await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
         except Exception as exc:
@@ -93,10 +111,14 @@ class IBKRAdapter(BrokerAdapter):
             self.ib = None
 
     def _contract_for(self, symbol: str):
-        ib_insync = self._require_ib_insync()
-        if get_contract_spec(symbol):
-            return ib_insync.ContFuture(symbol, exchange="CME", currency="USD")
-        return ib_insync.Stock(symbol, exchange="SMART", currency="USD")
+        ib_mod = self._require_ib()
+        spec = get_contract_spec(symbol)
+        if spec:
+            # spec.exchange, not a hardcoded "CME": the micro complex spans
+            # COMEX (MGC), NYMEX (MCL) and CBOT (MYM) too, and IBKR's
+            # qualifyContracts() rejects the wrong exchange outright.
+            return ib_mod.ContFuture(symbol, exchange=spec.exchange, currency="USD")
+        return ib_mod.Stock(symbol, exchange="SMART", currency="USD")
 
     async def _qualified_contract(self, symbol: str):
         assert self.ib is not None, "adapter not connected"
@@ -109,13 +131,13 @@ class IBKRAdapter(BrokerAdapter):
         return self._contracts[symbol]
 
     async def open(self, order: OrderRequest) -> OrderResult:
-        ib_insync = self._require_ib_insync()
+        ib_mod = self._require_ib()
         assert self.ib is not None, "adapter not connected"
         contract = await self._qualified_contract(order.symbol)
         action = "BUY" if order.direction == "BUY" else "SELL"
         closing_action = "SELL" if action == "BUY" else "BUY"
 
-        entry = ib_insync.MarketOrder(action, order.size)
+        entry = ib_mod.MarketOrder(action, order.size)
         trade = self.ib.placeOrder(contract, entry)
         slave_ticket = trade.order.orderId
 
@@ -123,12 +145,12 @@ class IBKRAdapter(BrokerAdapter):
         if order.sl is not None or order.tp is not None:
             oca_group = f"tc-{self.slave_id}-{slave_ticket}"
             if order.sl is not None:
-                sl_order = ib_insync.StopOrder(closing_action, order.size, order.sl)
+                sl_order = ib_mod.StopOrder(closing_action, order.size, order.sl)
                 sl_order.ocaGroup = oca_group
                 sl_order.ocaType = 1  # cancel the sibling order(s) once one fills
                 sl_order_id = self.ib.placeOrder(contract, sl_order).order.orderId
             if order.tp is not None:
-                tp_order = ib_insync.LimitOrder(closing_action, order.size, order.tp)
+                tp_order = ib_mod.LimitOrder(closing_action, order.size, order.tp)
                 tp_order.ocaGroup = oca_group
                 tp_order.ocaType = 1
                 tp_order_id = self.ib.placeOrder(contract, tp_order).order.orderId
@@ -153,7 +175,7 @@ class IBKRAdapter(BrokerAdapter):
             self.ib.cancelOrder(trade.order)
 
     async def modify(self, slave_ticket: int, sl: Optional[float], tp: Optional[float]) -> None:
-        ib_insync = self._require_ib_insync()
+        ib_mod = self._require_ib()
         assert self.ib is not None, "adapter not connected"
         pos = self._positions.get(slave_ticket)
         if pos is None:
@@ -166,12 +188,12 @@ class IBKRAdapter(BrokerAdapter):
         oca_group = f"tc-{self.slave_id}-{slave_ticket}-{int(time.time())}"
         sl_order_id = tp_order_id = None
         if sl is not None:
-            sl_order = ib_insync.StopOrder(closing_action, pos["size"], sl)
+            sl_order = ib_mod.StopOrder(closing_action, pos["size"], sl)
             sl_order.ocaGroup = oca_group
             sl_order.ocaType = 1
             sl_order_id = self.ib.placeOrder(pos["contract"], sl_order).order.orderId
         if tp is not None:
-            tp_order = ib_insync.LimitOrder(closing_action, pos["size"], tp)
+            tp_order = ib_mod.LimitOrder(closing_action, pos["size"], tp)
             tp_order.ocaGroup = oca_group
             tp_order.ocaType = 1
             tp_order_id = self.ib.placeOrder(pos["contract"], tp_order).order.orderId
@@ -180,7 +202,7 @@ class IBKRAdapter(BrokerAdapter):
         pos["tp_order_id"] = tp_order_id
 
     async def close(self, slave_ticket: int) -> None:
-        ib_insync = self._require_ib_insync()
+        ib_mod = self._require_ib()
         assert self.ib is not None, "adapter not connected"
         pos = self._positions.get(slave_ticket)
         if pos is None:
@@ -190,7 +212,7 @@ class IBKRAdapter(BrokerAdapter):
         self._cancel_tracked_order(pos.get("tp_order_id"))
 
         closing_action = "SELL" if pos["direction"] == "BUY" else "BUY"
-        closing_order = ib_insync.MarketOrder(closing_action, pos["size"])
+        closing_order = ib_mod.MarketOrder(closing_action, pos["size"])
         self.ib.placeOrder(pos["contract"], closing_order)
         del self._positions[slave_ticket]
 

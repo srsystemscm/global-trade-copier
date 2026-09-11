@@ -9,6 +9,12 @@ class ContractSpec:
     tick_value: float
     point_value: float
     min_size: float = 1.0
+    # IBKR listing exchange. The CME Group "micro" complex is spread across
+    # four exchanges, and IBKR's qualifyContracts() fails outright on the
+    # wrong one -- it is not a hint, it is part of the contract's identity.
+    # Schwab doesn't need this (it routes by account), so it only shows up
+    # once you point an IBKR slave at these symbols.
+    exchange: str = "CME"
 
 
 # Indicative CME micro-futures specs (the default preset per the project's
@@ -16,12 +22,12 @@ class ContractSpec:
 # published contract specs before trading real size, and use `overrides` in
 # a slave's config to correct/extend these.
 MICRO_FUTURES_SPECS: Dict[str, ContractSpec] = {
-    "MGC": ContractSpec("MGC", tick_size=0.10, tick_value=1.00, point_value=10.0),   # Micro Gold
-    "MES": ContractSpec("MES", tick_size=0.25, tick_value=1.25, point_value=5.0),    # Micro E-mini S&P 500
-    "MNQ": ContractSpec("MNQ", tick_size=0.25, tick_value=0.50, point_value=2.0),    # Micro E-mini Nasdaq-100
-    "MYM": ContractSpec("MYM", tick_size=1.00, tick_value=0.50, point_value=0.50),   # Micro E-mini Dow
-    "M2K": ContractSpec("M2K", tick_size=0.10, tick_value=0.50, point_value=5.0),    # Micro E-mini Russell 2000
-    "MCL": ContractSpec("MCL", tick_size=0.01, tick_value=1.00, point_value=100.0),  # Micro WTI Crude Oil
+    "MGC": ContractSpec("MGC", tick_size=0.10, tick_value=1.00, point_value=10.0, exchange="COMEX"),  # Micro Gold
+    "MES": ContractSpec("MES", tick_size=0.25, tick_value=1.25, point_value=5.0, exchange="CME"),     # Micro E-mini S&P 500
+    "MNQ": ContractSpec("MNQ", tick_size=0.25, tick_value=0.50, point_value=2.0, exchange="CME"),     # Micro E-mini Nasdaq-100
+    "MYM": ContractSpec("MYM", tick_size=1.00, tick_value=0.50, point_value=0.50, exchange="CBOT"),   # Micro E-mini Dow
+    "M2K": ContractSpec("M2K", tick_size=0.10, tick_value=0.50, point_value=5.0, exchange="CME"),     # Micro E-mini Russell 2000
+    "MCL": ContractSpec("MCL", tick_size=0.01, tick_value=1.00, point_value=100.0, exchange="NYMEX"), # Micro WTI Crude Oil
 }
 
 
@@ -37,5 +43,6 @@ def get_contract_spec(symbol: str, overrides: Optional[Dict[str, dict]] = None) 
             tick_value=o["tick_value"],
             point_value=o["point_value"],
             min_size=o.get("min_size", 1.0),
+            exchange=o.get("exchange", "CME"),
         )
     return MICRO_FUTURES_SPECS.get(symbol)

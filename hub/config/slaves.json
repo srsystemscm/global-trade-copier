@@ -46,5 +46,34 @@
         "poll_interval_seconds": 15
       }
     }
+  },
+  {
+    "id": "ibkr-paper-1",
+    "name": "IBKR Paper (Autonomous)",
+    "broker_type": "ibkr",
+    "enabled": false,
+    "config": {
+      "mode": "autonomous",
+      "host": "127.0.0.1",
+      "port": 4002,
+      "client_id": 1,
+      "symbol_map": {
+        "XAUUSD": [
+          "GLD"
+        ]
+      },
+      "atr_period": 14,
+      "sizing": {
+        "GLD": {
+          "mode": "dollar_notional",
+          "notional": 5000
+        }
+      },
+      "risk_management": {
+        "breakeven_trigger_atr": 1.0,
+        "trailing_atr": 1.5,
+        "poll_interval_seconds": 15
+      }
+    }
   }
 ]
