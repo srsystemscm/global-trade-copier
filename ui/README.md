@@ -55,8 +55,10 @@ proxies `/slaves`, `/trades`, `/config`, `/status`, `/logs`, `/schwab`,
   was open before the hub restarted).
 - Live P&L on slave cards depends on the broker adapter implementing
   `get_open_positions()`. Schwab does; MT4 mirror slaves show open
-  position count only, with a note why P&L isn't available -- MT4 doesn't
-  report live P&L back over the existing ZMQ command protocol.
+  live P&L too, as of the bridge EA's `POSITIONS` command -- net of swap
+  and commission, straight from the slave terminal. A slave still running
+  an older EA build falls back to the previous "not supported" note until
+  it's recompiled.
 
 ## Verified
 

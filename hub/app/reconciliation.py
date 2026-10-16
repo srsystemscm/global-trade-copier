@@ -30,7 +30,11 @@ async def reconcile_slave(
         for account_type in account_types:
             live_positions.extend(await adapter.get_open_positions(account_type))
     except NotImplementedError:
-        logger.info("slave=%s adapter doesn't support position reconciliation, skipping", slave_id)
+        logger.info(
+            "slave=%s adapter can't report open positions, skipping reconciliation "
+            "(an MT4 slave here means the EA predates the POSITIONS command)",
+            slave_id,
+        )
         return
     except AdapterError as exc:
         logger.error("slave=%s reconciliation skipped, couldn't fetch live positions: %s", slave_id, exc)

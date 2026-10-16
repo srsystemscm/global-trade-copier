@@ -49,8 +49,9 @@ change, not a rewrite.
   client side (MT4 EA, Schwab HTTP client) reconnects on its own.
 - `app/reconciliation.py` -- on every engine start (hub startup or a slave
   added live), compares `slave_trades` OPEN rows against the broker's
-  `get_open_positions()` (skipped gracefully for MT4, which doesn't support
-  it). If the registry says OPEN but the broker doesn't have it, the
+  `get_open_positions()` (supported by every adapter as of the bridge EA's
+  POSITIONS command; an MT4 slave running an EA built before it degrades to
+  being skipped, with a log line telling you to recompile). If the registry says OPEN but the broker doesn't have it, the
   registry is corrected to CLOSED. If the broker has a position the
   registry doesn't know about, it's logged and left alone -- can't safely
   assume an untracked position is the copier's to touch.
@@ -102,8 +103,9 @@ New `logs` table (id, ts, level, logger, message). No migration -- delete
   keeps managing already-open positions regardless of pause state.
 - `app/adapters/base.py` gained a 10th method, `get_open_positions()`
   (+ a `Position` dataclass), for the dashboard's live P&L. Implemented in
-  `SchwabAdapter`; `MT4Adapter` raises `NotImplementedError` (mirror-mode
-  slave cards show position count without live P&L).
+  `SchwabAdapter`, `IBKRAdapter`, and -- since the bridge EA gained a
+  `POSITIONS` command -- `MT4Adapter` too, so mirror-mode slave cards now
+  show live P&L (net of swap and commission) like any other slave.
 - `/ui` -- Vite + React (see `ui/README.md`).
 
 ### Schema change from Phase 3
@@ -122,7 +124,7 @@ New `logs` table (id, ts, level, logger, message). No migration -- delete
   balances): `connect`, `disconnect`, `open`, `modify`, `close`,
   `get_status`, `get_account_summary`, `get_price_history`, `get_quote`.
 - `app/adapters/mt4.py` -- `MT4Adapter`: one ZMQ REQ socket per slave,
-  sends `{"cmd": "OPEN"|"MODIFY"|"CLOSE"|"PING", ...}` and waits for a JSON
+  sends `{"cmd": "OPEN"|"MODIFY"|"CLOSE"|"PING"|"POSITIONS", ...}` and waits for a JSON
   ACK. REQ/REP allows only one request in flight; a timeout rebuilds the
   socket since a REQ socket that never got its reply is stuck. Doesn't
   implement the Phase 3 market-data/account methods (mirror mode never

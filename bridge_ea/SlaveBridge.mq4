@@ -1,7 +1,8 @@
 //+------------------------------------------------------------------+
 //| SlaveBridge.mq4                                                    |
 //| Phase 2: slave-side bridge EA. Binds a ZMQ REP socket and executes |
-//| OPEN / MODIFY / CLOSE commands sent by the hub's MT4Adapter,       |
+//| OPEN / MODIFY / CLOSE / POSITIONS commands sent by the hub's       |
+//| MT4Adapter,                                                        |
 //| replying with a JSON ACK (or error) for every command received.   |
 //|                                                                    |
 //| Requires the mql-zmq library (https://github.com/dingmaotu/mql-zmq)|
@@ -77,6 +78,8 @@ string HandleCommand(string json)
       return HandleModify(json);
    if(cmd == "CLOSE")
       return HandleClose(json);
+   if(cmd == "POSITIONS")
+      return HandlePositions();
 
    return StringFormat("{\"status\":\"error\",\"message\":\"unknown cmd '%s'\"}", cmd);
   }
@@ -148,6 +151,47 @@ string HandleClose(string json)
       return StringFormat("{\"status\":\"error\",\"message\":\"OrderClose failed: %d\"}", GetLastError());
 
    return "{\"status\":\"ok\"}";
+  }
+
+//+------------------------------------------------------------------+
+//| Reports every open market position on this account, so the hub's   |
+//| MT4Adapter can implement get_open_positions(). Two things depend   |
+//| on it: Trade Registry reconciliation (which was skipped entirely   |
+//| for MT4 slaves, meaning a row that drifted from the account could  |
+//| never be corrected), and the dashboard's live P&L for MT4 slaves.  |
+//|                                                                     |
+//| Reports ALL positions, not just copier-placed ones: reconciliation  |
+//| specifically needs to see untracked positions so it can warn about  |
+//| them rather than assume they're ours to touch.                      |
+//+------------------------------------------------------------------+
+string HandlePositions()
+  {
+   string items = "";
+   int    n     = 0;
+
+   for(int i = 0; i < OrdersTotal(); i++)
+     {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+         continue;
+      if(OrderType() != OP_BUY && OrderType() != OP_SELL)
+         continue;   // pending orders aren't positions
+
+      if(n > 0)
+         items += ",";
+
+      // Signed quantity, matching the hub's Position.quantity convention.
+      double qty = (OrderType() == OP_BUY) ? OrderLots() : -OrderLots();
+      // Net floating P&L: gross profit plus the carrying costs, so the
+      // dashboard shows what the account would actually realise.
+      double pnl = OrderProfit() + OrderSwap() + OrderCommission();
+
+      items += StringFormat(
+         "{\"ticket\":%d,\"symbol\":\"%s\",\"quantity\":%.2f,\"average_price\":%.5f,\"unrealized_pnl\":%.2f}",
+         OrderTicket(), OrderSymbol(), qty, OrderOpenPrice(), pnl);
+      n++;
+     }
+
+   return StringFormat("{\"status\":\"ok\",\"positions\":[%s]}", items);
   }
 
 //+------------------------------------------------------------------+

@@ -17,23 +17,77 @@ Two EAs, one per role:
 - `SlaveBridge.mq4` -- runs on a **slave** account. Binds a ZMQ REP socket
   and executes whatever the hub's `MT4Adapter` sends it: `OPEN` ->
   `OrderSend`, `MODIFY` -> `OrderModify`, `CLOSE` -> `OrderClose`, `PING` ->
-  a bare ACK for health checks. Replies with a JSON ACK or error for every
+  a bare ACK for health checks, and `POSITIONS` -> every open market
+  position on the account. Replies with a JSON ACK or error for every
   command.
+
+  `POSITIONS` is what lets `MT4Adapter` implement `get_open_positions()`,
+  which in turn enables Trade Registry reconciliation for MT4 slaves and
+  live P&L on the dashboard. It reports *all* positions, not just
+  copier-placed ones, because reconciliation specifically needs to notice
+  untracked positions so it can warn about them instead of assuming they're
+  the copier's to touch.
+
+  `CLOSE` and `MODIFY` are idempotent against an already-closed ticket: if
+  `OrderCloseTime()` is non-zero the EA replies
+  `{"status":"ok","already_closed":true}` rather than letting `OrderClose`
+  fail with 4108. A leg closed by hand (or by its own SL/TP) before the
+  master's CLOSE arrived has reached the state CLOSE was asking for, and
+  reporting it as an error used to strand the registry row at `OPEN`.
 
 ## Dependencies
 
 Both EAs need the [mql-zmq](https://github.com/dingmaotu/mql-zmq) binding,
 since MQL4 has no native ZeroMQ support:
 
-1. Download the mql-zmq release matching your MT4 build (32-bit).
-2. Copy `Zmq.mqh` and its dependency headers into `MQL4/Include/Zmq/`.
-3. Copy `libzmq.dll` (and `libsodium.dll` if required by your build) into
+1. Download mql-zmq (https://github.com/dingmaotu/mql-zmq). MT4 is always
+   32-bit, so you want `Library/MT4`, not `Library/MT5`.
+2. Copy **both** include trees:
+   - `Include/Zmq/*.mqh` -> `MQL4/Include/Zmq/`
+   - `Include/Mql/Lang/*.mqh` -> `MQL4/Include/Mql/Lang/`
+
+   The second one is not optional and is easy to miss. `Zmq.mqh` includes
+   `Mql/Lang/Native.mqh`; without it MetaEditor fails with
+   `error 106: can't open "Mql/Lang/Native.mqh"` and then cascades into
+   dozens of bogus "undeclared identifier" errors from that one cause.
+3. Copy `libzmq.dll` **and** `libsodium.dll` from `Library/MT4` into
    `MQL4/Libraries/`.
-4. In MetaTrader: Tools -> Options -> Expert Advisors -> check
-   "Allow DLL imports".
-5. Attach the relevant EA to a chart on each terminal and check the Experts
+4. Install the **Visual C++ 2015 redistributable** if it isn't already
+   present -- without it the DLLs fail to load with an unhelpful error
+   rather than a clear one.
+5. In MetaTrader: Tools -> Options -> Expert Advisors -> check
+   "Allow DLL imports". The slave terminal also needs **AutoTrading** on,
+   or `OrderSend` fails with 4109 (`trade not allowed`) while everything
+   else looks healthy.
+6. Attach the relevant EA to a chart on each terminal and check the Experts
    log for `TradeCopierBridge connected: ...` (master) or `SlaveBridge
    listening on ...` (slave).
+
+`Include/Mql/Lang/` ships inside mql-zmq as a subset of mql4-lib -- you
+don't need to install mql4-lib separately.
+
+### Compiling from the command line
+
+`metaeditor.exe /compile:"<path to .mq4>" /log:"<logfile>"` compiles without
+opening the GUI, which is the quickest way to see real errors. **If the
+terminal is a portable instance, pass `/portable` as well** -- otherwise
+MetaEditor creates a fresh roaming data folder, looks for the includes
+there, and fails with `error 106` even though they're installed correctly
+next to the exe. The log is UTF-16.
+
+### Restarting cleanly
+
+mql-zmq's `Context` is a *named, shared* handle, and MT4 does not unload the
+DLL when an EA is removed -- so the ZMQ context and its I/O thread outlive
+the EA. Sockets stay bound or stay retrying with nothing servicing them,
+which looks like a port that accepts connections but never answers.
+
+**Removing or re-attaching the EA does not give you clean ZMQ state. Only
+restarting the terminal does.** `SlaveBridge` checks `bind()`'s return value
+and will say so explicitly if the port is still held.
+
+Note also that MT4 only reloads a recompiled EA once the terminal processes
+the file-change event, which generally needs the terminal window focused.
 
 ## TradeCopierBridge.mq4 (master) inputs
 
@@ -72,6 +126,17 @@ development: it binds the same REP port and answers OPEN/MODIFY/CLOSE/PING
 from an in-memory ticket book, so the hub side (adapters, Copy Engine, Trade
 Registry) can be exercised without MT4 running at all. See
 `hub/README.md` for the full walkthrough.
+
+## Symbol names must match on both terminals
+
+Mirror mode passes the master's symbol string straight through -- there is
+no translation. If the master trades `XAUUSD` and the slave broker calls it
+`GOLD` or `XAUUSD.raw`, `OrderSend` fails with 4106 (`unknown symbol`).
+
+The symbol also has to be **in the slave's Market Watch**, not merely
+offered by the broker: an unselected symbol makes `MarketInfo()` return 0
+and the order is rejected. You can check without opening the GUI by looking
+for the symbol in `<data folder>/history/<server>/symbols.sel`.
 
 ## Schwab slaves (Phase 3) don't use a bridge EA at all
 

@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 
 
 class MT4Adapter(BrokerAdapter):
-    """Talks to a slave MT4 bridge EA over a ZMQ REQ/REP pair.
+    """Talks to a slave MT4 bridge EA over a ZMQ REQ/REP pair, speaking
+    OPEN / MODIFY / CLOSE / PING / POSITIONS.
 
     REQ/REP allows exactly one request in flight at a time -- if a reply
     never arrives the socket is stuck (it will refuse to send again) until
@@ -153,5 +154,41 @@ class MT4Adapter(BrokerAdapter):
     async def get_quote(self, symbol: str) -> float:
         raise NotImplementedError("MT4Adapter (mirror mode) does not support quotes")
 
-    async def get_open_positions(self, account_type: str) -> List[Position]:
-        raise NotImplementedError("MT4Adapter (mirror mode) does not report live positions/P&L")
+    async def get_open_positions(self, account_type: Optional[str] = None) -> List[Position]:
+        """Open market positions on the slave account, via the EA's POSITIONS
+        command. `account_type` is accepted for interface parity and ignored:
+        an MT4 terminal is a single account.
+
+        This is what lets reconciliation run for MT4 slaves at all. Before the
+        POSITIONS command existed this raised NotImplementedError, so
+        reconcile_slave() skipped MT4 entirely and a slave_trades row that
+        drifted from the account (a leg closed by hand, an SL that fired while
+        the hub was down) could never be corrected.
+        """
+        try:
+            reply = await self._request({"cmd": "POSITIONS"})
+        except AdapterRejectedError as exc:
+            # An EA built before POSITIONS existed answers "unknown cmd".
+            # Degrade to the old behaviour rather than failing the caller --
+            # a hub upgraded ahead of the EAs on someone's desktop is a
+            # perfectly ordinary state.
+            if "unknown cmd" in str(exc).lower():
+                logger.warning(
+                    "slave=%s EA predates the POSITIONS command -- recompile bridge_ea/SlaveBridge.mq4 "
+                    "to enable reconciliation and live P&L for this slave",
+                    self.slave_id,
+                )
+                raise NotImplementedError("slave EA predates the POSITIONS command") from exc
+            raise
+
+        positions = []
+        for p in reply.get("positions", []):
+            positions.append(
+                Position(
+                    symbol=p["symbol"],
+                    quantity=float(p["quantity"]),
+                    average_price=float(p["average_price"]),
+                    unrealized_pnl=p.get("unrealized_pnl"),
+                )
+            )
+        return positions
