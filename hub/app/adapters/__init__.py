@@ -62,6 +62,8 @@ def create_adapter(slave: SlaveConfig) -> BrokerAdapter:
             host=slave.config.get("host", "127.0.0.1"),
             port=slave.config.get("port", 7497),  # TWS paper trading default; 7496 live, 4002/4001 for Gateway
             client_id=slave.config.get("client_id", 1),
+            market_data_type=slave.config.get("market_data_type"),
+            quote_timeout=float(slave.config.get("quote_timeout", 1.0)),
         )
 
     raise ValueError(f"no adapter registered for broker_type={slave.broker_type!r}")

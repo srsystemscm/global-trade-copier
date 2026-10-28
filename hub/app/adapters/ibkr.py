@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from typing import Dict, List, Optional
@@ -56,11 +57,25 @@ class IBKRAdapter(BrokerAdapter):
     failure modes are observable -- not before.
     """
 
-    def __init__(self, slave_id: str, host: str, port: int, client_id: int) -> None:
+    def __init__(
+        self,
+        slave_id: str,
+        host: str,
+        port: int,
+        client_id: int,
+        market_data_type: Optional[int] = None,
+        quote_timeout: float = 1.0,
+    ) -> None:
         self.slave_id = slave_id
         self.host = host
         self.port = port
         self.client_id = client_id
+        # 1=live, 2=frozen, 3=delayed, 4=delayed-frozen. None leaves IBKR's
+        # default (live). A fresh account has no market data subscriptions,
+        # so live returns NaN and get_quote() fails -- delayed (3) is free
+        # and plenty for paper testing. See config/slaves.json.
+        self.market_data_type = market_data_type
+        self.quote_timeout = quote_timeout
         self.ib = None  # the client instance (ib_async.IB), created in connect()
         self._contracts: Dict[str, object] = {}
         self._positions: Dict[int, dict] = {}
@@ -101,6 +116,16 @@ class IBKRAdapter(BrokerAdapter):
             raise AdapterConnectionError(
                 f"could not connect to IBKR TWS/Gateway at {self.host}:{self.port}: {exc}"
             ) from exc
+        if self.market_data_type is not None:
+            self.ib.reqMarketDataType(self.market_data_type)
+            logger.info(
+                "IBKRAdapter[%s] requesting market data type %s (%s)",
+                self.slave_id,
+                self.market_data_type,
+                {1: "live", 2: "frozen", 3: "delayed", 4: "delayed-frozen"}.get(
+                    self.market_data_type, "unknown"
+                ),
+            )
         logger.info(
             "IBKRAdapter[%s] connected to %s:%s (clientId=%s)", self.slave_id, self.host, self.port, self.client_id
         )
@@ -246,11 +271,22 @@ class IBKRAdapter(BrokerAdapter):
         assert self.ib is not None, "adapter not connected"
         contract = await self._qualified_contract(symbol)
         ticker = self.ib.reqMktData(contract, "", False, False)
-        await self.ib.sleep(1)  # let the snapshot populate
+        # asyncio.sleep, NOT ib.sleep(): IB.sleep() is a *synchronous* helper
+        # that returns a bool, so `await self.ib.sleep(1)` raised
+        # "object bool can't be used in 'await' expression" on every call.
+        # It also drives the event loop re-entrantly, which is wrong inside a
+        # running one -- it exists for sync scripts. (reqTickersAsync() is the
+        # tidier one-shot if this ever needs revisiting.)
+        await asyncio.sleep(self.quote_timeout)
         price = ticker.marketPrice()
         self.ib.cancelMktData(contract)
         if price != price:  # NaN: no price arrived
-            raise AdapterRejectedError(f"IBKR returned no market price for symbol={symbol}")
+            raise AdapterRejectedError(
+                f"IBKR returned no market price for symbol={symbol} "
+                f"(market_data_type={self.market_data_type}). A fresh account has no market "
+                f"data subscriptions -- set \"market_data_type\": 3 (delayed) in the slave's "
+                f"config, or subscribe to the relevant feed."
+            )
         return float(price)
 
     async def get_open_positions(self, account_type: str) -> List[Position]:
