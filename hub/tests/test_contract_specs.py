@@ -74,3 +74,20 @@ def test_equities_have_no_spec_so_they_route_as_stock():
     to a futures spec -- that's what sends it down the Stock/SMART path and
     sidesteps the ContFuture order-placement gap entirely."""
     assert get_contract_spec("GLD") is None
+
+
+# --- full-size contracts ---------------------------------------------------
+
+def test_gc_is_full_size_comex_gold():
+    """GC is 100 troy oz on COMEX -- 10x MGC. Routing it to CME (the old
+    hardcoded default) would fail qualifyContracts outright."""
+    spec = get_contract_spec("GC")
+    assert spec is not None
+    assert spec.exchange == "COMEX"
+    assert spec.point_value == 100.0
+    assert spec.tick_size == 0.10
+    assert spec.tick_value == 10.00
+
+
+def test_gc_and_mgc_differ_by_ten_times():
+    assert get_contract_spec("GC").point_value == 10 * get_contract_spec("MGC").point_value

@@ -38,13 +38,13 @@ class IBKRAdapter(BrokerAdapter):
     equities, so `account_type` is accepted for interface parity but
     ignored.
 
-    KNOWN GAP: `_qualified_contract` resolves futures as `ContFuture`
-    (continuous, auto-rolling), which is correct for quotes/historical bars
-    but IBKR does not accept continuous contracts for order placement --
-    real trading needs a dated `Future` contract for the current front
-    month (via `reqContractDetails` or IB's `lastTradeDateOrContractMonth`).
-    This needs to be resolved properly before `open()` is used for futures
-    against a live account.
+    Futures resolution: `_qualified_contract` asks for a `ContFuture` and
+    then converts it to the dated contract behind it, because IBKR accepts a
+    continuous contract for market data but not for order placement. The
+    ContFuture step isn't incidental -- it's what picks the *liquid* front
+    month rather than the nearest expiry, which for GC is an illiquid serial
+    month. Cached contracts are re-resolved once their last trading day
+    passes, so a long-running hub rolls over on its own.
 
     TODO (deliberately deferred, not forgotten): unlike MT4Adapter and
     SchwabAdapter, none of this adapter's ib_insync calls are wrapped in
@@ -145,15 +145,54 @@ class IBKRAdapter(BrokerAdapter):
             return ib_mod.ContFuture(symbol, exchange=spec.exchange, currency="USD")
         return ib_mod.Stock(symbol, exchange="SMART", currency="USD")
 
+    @staticmethod
+    def _is_expired(contract) -> bool:
+        """True once a dated future's last trading day has passed."""
+        expiry = getattr(contract, "lastTradeDateOrContractMonth", "")
+        if not expiry or len(expiry) < 8:
+            return False
+        return expiry[:8] < time.strftime("%Y%m%d")
+
     async def _qualified_contract(self, symbol: str):
         assert self.ib is not None, "adapter not connected"
-        if symbol not in self._contracts:
-            contract = self._contract_for(symbol)
-            qualified = await self.ib.qualifyContractsAsync(contract)
-            if not qualified:
-                raise AdapterRejectedError(f"IBKR could not qualify a contract for symbol={symbol}")
-            self._contracts[symbol] = qualified[0]
-        return self._contracts[symbol]
+
+        cached = self._contracts.get(symbol)
+        if cached is not None and not self._is_expired(cached):
+            return cached
+
+        ib_mod = self._require_ib()
+        contract = self._contract_for(symbol)
+        qualified = await self.ib.qualifyContractsAsync(contract)
+        if not qualified:
+            raise AdapterRejectedError(f"IBKR could not qualify a contract for symbol={symbol}")
+        resolved = qualified[0]
+
+        if isinstance(contract, ib_mod.ContFuture):
+            # IBKR qualifies a ContFuture happily but refuses it for order
+            # placement. Qualifying resolves it to the conId of the actual
+            # front-month contract, so re-qualifying that conId as a dated
+            # Future yields something placeable.
+            #
+            # Going through ContFuture rather than picking the nearest expiry
+            # ourselves matters: for GC the nearest expiry is an illiquid
+            # serial month (GCX6), while ContFuture follows liquidity and
+            # picks GCZ6. Verified against a live Gateway.
+            dated = await self.ib.qualifyContractsAsync(
+                ib_mod.Future(conId=resolved.conId, exchange=resolved.exchange)
+            )
+            if not dated:
+                raise AdapterRejectedError(
+                    f"IBKR could not resolve a dated front-month contract for symbol={symbol}"
+                )
+            resolved = dated[0]
+            logger.info(
+                "IBKRAdapter[%s] %s -> %s (expiry %s, conId %s)",
+                self.slave_id, symbol, resolved.localSymbol,
+                resolved.lastTradeDateOrContractMonth, resolved.conId,
+            )
+
+        self._contracts[symbol] = resolved
+        return resolved
 
     async def open(self, order: OrderRequest) -> OrderResult:
         ib_mod = self._require_ib()
@@ -246,7 +285,11 @@ class IBKRAdapter(BrokerAdapter):
 
     async def get_account_summary(self, account_type: str) -> AccountSummary:
         assert self.ib is not None, "adapter not connected"
-        summary = {item.tag: item.value for item in self.ib.accountSummary()}
+        # accountSummaryAsync(), NOT accountSummary(): the sync accessor falls
+        # back to self._run() when its cache is cold, which raises
+        # "RuntimeError: This event loop is already running" inside the hub's
+        # loop. Same trap as IB.sleep(). Verified against a live Gateway.
+        summary = {item.tag: item.value for item in await self.ib.accountSummaryAsync()}
         try:
             balance = float(summary["TotalCashValue"])
             equity = float(summary["NetLiquidation"])
@@ -281,11 +324,23 @@ class IBKRAdapter(BrokerAdapter):
         price = ticker.marketPrice()
         self.ib.cancelMktData(contract)
         if price != price:  # NaN: no price arrived
+            if self.market_data_type in (3, 4):
+                hint = (
+                    "already requesting delayed data, so the usual cause is another IBKR "
+                    "session holding the market data line -- IBKR allows one per account, and "
+                    "a second login (mobile app, Client Portal, another TWS/Gateway) takes it, "
+                    "logging 'Error 162: ... connected from a different IP address'. Otherwise "
+                    "the account has no subscription covering this instrument."
+                )
+            else:
+                hint = (
+                    "a fresh account has no market data subscriptions, and live data then "
+                    'returns nothing -- set "market_data_type": 3 (delayed, free) in the '
+                    "slave's config, or subscribe to the relevant feed."
+                )
             raise AdapterRejectedError(
                 f"IBKR returned no market price for symbol={symbol} "
-                f"(market_data_type={self.market_data_type}). A fresh account has no market "
-                f"data subscriptions -- set \"market_data_type\": 3 (delayed) in the slave's "
-                f"config, or subscribe to the relevant feed."
+                f"(market_data_type={self.market_data_type}): {hint}"
             )
         return float(price)
 

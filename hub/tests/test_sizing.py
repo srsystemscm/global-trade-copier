@@ -100,3 +100,38 @@ def test_resolve_sizing_config_shared_vs_per_symbol_override():
     }
     assert resolve_sizing_config(cfg, "GLD")["mode"] == "fixed_contracts"
     assert resolve_sizing_config(cfg, "MGC")["mode"] == "dollar_notional"
+
+
+# --- GC sizing: why fixed_contracts, not dollar_notional -------------------
+# Documents the trap behind the ibkr-paper-1 config. GC is 100 troy oz, so a
+# $5k notional buys 0.0116 contracts, which floors to zero and silently skips
+# the trade. Discovered while pointing the IBKR paper slave at GC.
+
+from app.contract_specs import get_contract_spec
+from app.sizing import compute_size
+
+
+def test_dollar_notional_on_gc_floors_to_zero_and_skips():
+    result = compute_size(
+        sizing_config={"mode": "dollar_notional", "notional": 5000},
+        master_lots=0.10,
+        entry_price=4300.0,
+        stop_price=None,
+        contract_spec=get_contract_spec("GC"),
+        account_balance=1_000_000.0, account_equity=1_000_000.0,
+    )
+    assert result.skipped is True
+    assert result.size == 0
+
+
+def test_fixed_contracts_on_gc_places_one():
+    result = compute_size(
+        sizing_config={"mode": "fixed_contracts", "contracts": 1},
+        master_lots=0.10,
+        entry_price=4300.0,
+        stop_price=None,
+        contract_spec=get_contract_spec("GC"),
+        account_balance=1_000_000.0, account_equity=1_000_000.0,
+    )
+    assert result.skipped is False
+    assert result.size == 1

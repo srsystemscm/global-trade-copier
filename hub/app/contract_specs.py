@@ -17,8 +17,9 @@ class ContractSpec:
     exchange: str = "CME"
 
 
-# Indicative CME micro-futures specs (the default preset per the project's
-# design decisions). Exchange specs can change -- verify against CME's
+# Indicative CME-complex futures specs: the micro preset (the project's
+# default per its design decisions) plus the full-size contracts that have
+# been needed so far. Exchange specs can change -- verify against CME's
 # published contract specs before trading real size, and use `overrides` in
 # a slave's config to correct/extend these.
 MICRO_FUTURES_SPECS: Dict[str, ContractSpec] = {
@@ -28,6 +29,11 @@ MICRO_FUTURES_SPECS: Dict[str, ContractSpec] = {
     "MYM": ContractSpec("MYM", tick_size=1.00, tick_value=0.50, point_value=0.50, exchange="CBOT"),   # Micro E-mini Dow
     "M2K": ContractSpec("M2K", tick_size=0.10, tick_value=0.50, point_value=5.0, exchange="CME"),     # Micro E-mini Russell 2000
     "MCL": ContractSpec("MCL", tick_size=0.01, tick_value=1.00, point_value=100.0, exchange="NYMEX"), # Micro WTI Crude Oil
+
+    # Full-size. GC is 100 troy oz -- 10x MGC, so roughly $430k notional per
+    # contract at $4,300 gold. Size it deliberately; dollar_notional will
+    # floor to zero (and skip the trade) for any sensible notional.
+    "GC":  ContractSpec("GC",  tick_size=0.10, tick_value=10.00, point_value=100.0, exchange="COMEX"), # Gold
 }
 
 

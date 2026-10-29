@@ -61,14 +61,14 @@
       "quote_timeout": 3.0,
       "symbol_map": {
         "XAUUSD": [
-          "GLD"
+          "GC"
         ]
       },
       "atr_period": 14,
       "sizing": {
-        "GLD": {
-          "mode": "dollar_notional",
-          "notional": 5000
+        "GC": {
+          "mode": "fixed_contracts",
+          "contracts": 1
         }
       },
       "risk_management": {

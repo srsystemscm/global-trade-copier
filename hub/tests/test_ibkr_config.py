@@ -47,10 +47,15 @@ def test_port_default_is_tws_paper():
     assert create_adapter(s).port == 7497
 
 
-def test_adapter_has_no_import_time_dependency_on_ib_async():
-    """ib_async is lazy-imported so non-IBKR deployments don't need it --
-    constructing the adapter must not require it."""
+def test_constructing_the_adapter_does_not_import_ib_async():
+    """ib_async is lazy-imported so non-IBKR deployments don't need it.
+    Constructing must not touch it; only _require_ib() resolves the module
+    (and here, where ib_async IS installed, it returns it)."""
+    import sys
+
+    before = "ib_async" in sys.modules
     a = create_adapter(_slave())
-    with pytest.raises(Exception) as exc:
-        a._require_ib()
-    assert "ib_async" in str(exc.value)
+    assert ("ib_async" in sys.modules) == before, "constructing imported ib_async"
+
+    mod = a._require_ib()
+    assert hasattr(mod, "IB") and hasattr(mod, "ContFuture")
