@@ -134,6 +134,8 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
             engine.slave_config = slave.config
             engine.atr_period = slave.config.get("atr_period", 14)
             engine.risk_config = slave.config.get("risk_management", {})
+            if hasattr(engine, "roll_config"):
+                engine.roll_config = slave.config.get("contract_roll", {})
 
     if payload.paused is not None:
         set_paused(slave_id, payload.paused)
