@@ -77,6 +77,8 @@ class IBKRAdapter(BrokerAdapter):
         # and plenty for paper testing. See config/slaves.json.
         self.market_data_type = market_data_type
         self.quote_timeout = quote_timeout
+        # how long to let IBKR's async rejection of a bracket leg arrive
+        self.bracket_check_delay = 1.0
         self.ib = None  # the client instance (ib_async.IB), created in connect()
         # (symbol, month_slot) -> qualified contract
         self._contracts: Dict[tuple, object] = {}
@@ -287,20 +289,28 @@ class IBKRAdapter(BrokerAdapter):
         action = "BUY" if order.direction == "BUY" else "SELL"
         closing_action = "SELL" if action == "BUY" else "BUY"
 
+        sl_price = self._round_to_tick(order.sl, order.symbol)
+        tp_price = self._round_to_tick(order.tp, order.symbol)
+        if sl_price != order.sl or tp_price != order.tp:
+            logger.debug(
+                "IBKRAdapter[%s] %s snapped to tick: sl %s -> %s, tp %s -> %s",
+                self.slave_id, order.symbol, order.sl, sl_price, order.tp, tp_price,
+            )
+
         entry = ib_mod.MarketOrder(action, order.size)
         trade = self.ib.placeOrder(contract, entry)
         slave_ticket = trade.order.orderId
 
         sl_order_id = tp_order_id = None
-        if order.sl is not None or order.tp is not None:
+        if sl_price is not None or tp_price is not None:
             oca_group = f"tc-{self.slave_id}-{slave_ticket}"
-            if order.sl is not None:
-                sl_order = ib_mod.StopOrder(closing_action, order.size, order.sl)
+            if sl_price is not None:
+                sl_order = ib_mod.StopOrder(closing_action, order.size, sl_price)
                 sl_order.ocaGroup = oca_group
                 sl_order.ocaType = 1  # cancel the sibling order(s) once one fills
                 sl_order_id = self.ib.placeOrder(contract, sl_order).order.orderId
-            if order.tp is not None:
-                tp_order = ib_mod.LimitOrder(closing_action, order.size, order.tp)
+            if tp_price is not None:
+                tp_order = ib_mod.LimitOrder(closing_action, order.size, tp_price)
                 tp_order.ocaGroup = oca_group
                 tp_order.ocaType = 1
                 tp_order_id = self.ib.placeOrder(contract, tp_order).order.orderId
@@ -312,6 +322,27 @@ class IBKRAdapter(BrokerAdapter):
             "sl_order_id": sl_order_id,
             "tp_order_id": tp_order_id,
         }
+
+        # A rejected bracket leg leaves a filled position with no protection,
+        # and IBKR rejects asynchronously -- placeOrder returns happily and
+        # the cancel arrives moments later. Reporting success regardless is
+        # how a naked position gets recorded as a protected one. Seen live:
+        # both legs rejected on Error 110 while the entry filled.
+        await asyncio.sleep(self.bracket_check_delay)
+        for label, order_id in (("stop", sl_order_id), ("target", tp_order_id)):
+            if order_id is None:
+                continue
+            trade = next((t for t in self.ib.trades() if t.order.orderId == order_id), None)
+            status = trade.orderStatus.status if trade is not None else "unknown"
+            if status in ("Cancelled", "Inactive", "ApiCancelled", "unknown"):
+                why = ""
+                if trade is not None and trade.log:
+                    why = trade.log[-1].message or ""
+                logger.error(
+                    "IBKRAdapter[%s] %s leg for slave_ticket=%s was %s -- THE POSITION IS "
+                    "UNPROTECTED on that side. %s",
+                    self.slave_id, label, slave_ticket, status, why,
+                )
         logger.info(
             "IBKRAdapter[%s] opened %s %s x%s -> ticket=%s", self.slave_id, action, order.symbol, order.size, slave_ticket
         )
@@ -440,6 +471,26 @@ class IBKRAdapter(BrokerAdapter):
                 f"usually the instrument's session is closed. Otherwise: {hint}"
             )
         return float(price)
+
+    @staticmethod
+    def _round_to_tick(price: Optional[float], symbol: str) -> Optional[float]:
+        """Snap a price to the contract's minimum price variation.
+
+        IBKR rejects anything else outright with "Error 110: The price does
+        not conform to the minimum price variation for this contract". Our
+        SL/TP come out of ATR arithmetic, so they're arbitrary floats --
+        3954.8454525079565 on a contract that moves in 0.10 steps. Seen live:
+        both bracket legs rejected, leaving a filled position with no stop.
+        """
+        if price is None:
+            return None
+        spec = get_contract_spec(symbol)
+        tick = spec.tick_size if spec else 0.01
+        if not tick or tick <= 0:
+            return price
+        # round the multiple, not the price: tick sizes like 0.10 aren't
+        # exact in binary floating point
+        return round(round(price / tick) * tick, 10)
 
     @staticmethod
     def _info(symbol: str, contract) -> ContractInfo:
