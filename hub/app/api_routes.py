@@ -10,7 +10,15 @@ from app.adapters.base import AdapterError
 from app.config import settings
 from app.db import db_cursor, get_config_value, list_logs, set_config_value
 from app.engine_manager import start_engine_for_slave, stop_engine
-from app.slaves import delete_slave, get_slave, insert_slave, list_all_slaves, set_paused, update_slave
+from app.slaves import (
+    delete_slave,
+    get_slave,
+    insert_slave,
+    list_all_slaves,
+    set_enabled,
+    set_paused,
+    update_slave,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +39,10 @@ class SlaveUpdate(BaseModel):
     name: Optional[str] = None
     config: Optional[Dict[str, Any]] = None
     paused: Optional[bool] = None
+    # Was missing, so PATCH {"enabled": false} was silently dropped by
+    # pydantic and the route answered 200 with the slave still enabled --
+    # a no-op that reported success.
+    enabled: Optional[bool] = None
 
 
 class RiskUpdate(BaseModel):
@@ -142,6 +154,20 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
         engine = _find_engine(request, slave_id)
         if engine is not None:
             engine.paused = payload.paused
+        slave = get_slave(slave_id)
+
+    if payload.enabled is not None and payload.enabled != slave.enabled:
+        set_enabled(slave_id, payload.enabled)
+        engine = _find_engine(request, slave_id)
+        if payload.enabled and engine is None:
+            slave = get_slave(slave_id)
+            engine = await start_engine_for_slave(
+                slave, request.app.state.bus, request.app.state.events, request.app.state.notifier
+            )
+            request.app.state.engines.append(engine)
+        elif not payload.enabled and engine is not None:
+            await stop_engine(engine, request.app.state.bus)
+            request.app.state.engines.remove(engine)
         slave = get_slave(slave_id)
 
     return await _slave_summary(request, slave)

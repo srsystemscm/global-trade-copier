@@ -191,7 +191,44 @@ class SchwabAdapter(BrokerAdapter):
             self._positions[entry_order_id]["stop_order_id"] = stop_id
             self._positions[entry_order_id]["limit_order_id"] = limit_id
 
-        return OrderResult(slave_ticket=entry_order_id)
+        return OrderResult(
+            slave_ticket=entry_order_id,
+            sl_order_id=self._positions[entry_order_id]["stop_order_id"],
+            tp_order_id=self._positions[entry_order_id]["limit_order_id"],
+        )
+
+    async def restore_position(self, slave_ticket: int, state: dict) -> None:
+        """Rebuild bookkeeping for a position open before the hub restarted.
+
+        Schwab keeps the same kind of per-position state IBKR does -- which
+        account the order went to, the Schwab-side symbol, and the bracket's
+        child order ids -- all of it in memory. Without this, a restart leaves
+        a live position that modify() and close() both reject.
+        """
+        symbol = state.get("slave_symbol") or state.get("symbol")
+        if not symbol:
+            logger.warning(
+                "SchwabAdapter[%s] cannot restore slave_ticket=%s: no symbol recorded",
+                self.slave_id, slave_ticket,
+            )
+            return
+        is_future = get_contract_spec(symbol) is not None
+        self._positions[slave_ticket] = {
+            "account_id": self._account_id_for(symbol),
+            "symbol": self._futures_symbol(symbol) if is_future else symbol,
+            "asset_type": "FUTURE" if is_future else "EQUITY",
+            "direction": state["direction"],
+            "size": state["size"],
+            "is_future": is_future,
+            "sl": state.get("sl"),
+            "tp": state.get("tp"),
+            "stop_order_id": state.get("sl_order_id"),
+            "limit_order_id": state.get("tp_order_id"),
+        }
+        logger.info(
+            "SchwabAdapter[%s] restored slave_ticket=%s on %s (%s %s)",
+            self.slave_id, slave_ticket, symbol, state["direction"], state["size"],
+        )
 
     @staticmethod
     def _extract_order_id(resp: httpx.Response) -> int:

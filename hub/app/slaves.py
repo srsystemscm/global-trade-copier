@@ -118,6 +118,14 @@ def set_paused(slave_id: str, paused: bool) -> None:
         cur.execute("UPDATE slaves SET paused = ? WHERE id = ?", (int(paused), slave_id))
 
 
+def set_enabled(slave_id: str, enabled: bool) -> None:
+    """Enable or disable a slave. Unlike `paused`, this governs whether an
+    engine exists at all -- a disabled slave keeps its config and history but
+    holds no broker connection."""
+    with db_cursor() as cur:
+        cur.execute("UPDATE slaves SET enabled = ? WHERE id = ?", (int(enabled), slave_id))
+
+
 def delete_slave(slave_id: str) -> None:
     with db_cursor() as cur:
         cur.execute("DELETE FROM slaves WHERE id = ?", (slave_id,))
