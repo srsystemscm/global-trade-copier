@@ -66,6 +66,7 @@ class IBKRAdapter(BrokerAdapter):
         client_id: int,
         market_data_type: Optional[int] = None,
         quote_timeout: float = 1.0,
+        bracket_tif: str = "GTC",
     ) -> None:
         self.slave_id = slave_id
         self.host = host
@@ -79,6 +80,14 @@ class IBKRAdapter(BrokerAdapter):
         self.quote_timeout = quote_timeout
         # how long to let IBKR's async rejection of a bracket leg arrive
         self.bracket_check_delay = 1.0
+        # Time in force for the protective legs. GTC by default because a
+        # stop that expires at the session close leaves the position naked
+        # overnight, silently -- and IBKR's account-level order preset
+        # supplies DAY whenever the order doesn't say otherwise ("Error
+        # 10349: Order TIF was set to DAY based on order preset"). Relying on
+        # a GUI preset the code can't see means a fresh Gateway install
+        # regresses it without a trace.
+        self.bracket_tif = bracket_tif
         self.ib = None  # the client instance (ib_async.IB), created in connect()
         # (symbol, month_slot) -> qualified contract
         self._contracts: Dict[tuple, object] = {}
@@ -305,12 +314,12 @@ class IBKRAdapter(BrokerAdapter):
         if sl_price is not None or tp_price is not None:
             oca_group = f"tc-{self.slave_id}-{slave_ticket}"
             if sl_price is not None:
-                sl_order = ib_mod.StopOrder(closing_action, order.size, sl_price)
+                sl_order = self._protective(ib_mod.StopOrder(closing_action, order.size, sl_price))
                 sl_order.ocaGroup = oca_group
                 sl_order.ocaType = 1  # cancel the sibling order(s) once one fills
                 sl_order_id = self.ib.placeOrder(contract, sl_order).order.orderId
             if tp_price is not None:
-                tp_order = ib_mod.LimitOrder(closing_action, order.size, tp_price)
+                tp_order = self._protective(ib_mod.LimitOrder(closing_action, order.size, tp_price))
                 tp_order.ocaGroup = oca_group
                 tp_order.ocaType = 1
                 tp_order_id = self.ib.placeOrder(contract, tp_order).order.orderId
@@ -369,12 +378,16 @@ class IBKRAdapter(BrokerAdapter):
         oca_group = f"tc-{self.slave_id}-{slave_ticket}-{int(time.time())}"
         sl_order_id = tp_order_id = None
         if sl is not None:
-            sl_order = ib_mod.StopOrder(closing_action, pos["size"], sl)
+            sl_order = self._protective(
+                ib_mod.StopOrder(closing_action, pos["size"], self._round_to_tick(sl, pos["contract"].symbol))
+            )
             sl_order.ocaGroup = oca_group
             sl_order.ocaType = 1
             sl_order_id = self.ib.placeOrder(pos["contract"], sl_order).order.orderId
         if tp is not None:
-            tp_order = ib_mod.LimitOrder(closing_action, pos["size"], tp)
+            tp_order = self._protective(
+                ib_mod.LimitOrder(closing_action, pos["size"], self._round_to_tick(tp, pos["contract"].symbol))
+            )
             tp_order.ocaGroup = oca_group
             tp_order.ocaType = 1
             tp_order_id = self.ib.placeOrder(pos["contract"], tp_order).order.orderId
@@ -471,6 +484,15 @@ class IBKRAdapter(BrokerAdapter):
                 f"usually the instrument's session is closed. Otherwise: {hint}"
             )
         return float(price)
+
+    def _protective(self, order):
+        """Stamp a protective leg's time-in-force.
+
+        Deliberately not applied to the entry: a market order that can't fill
+        is better off expiring than resting indefinitely as GTC.
+        """
+        order.tif = self.bracket_tif
+        return order
 
     @staticmethod
     def _round_to_tick(price: Optional[float], symbol: str) -> Optional[float]:

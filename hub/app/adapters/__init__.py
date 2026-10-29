@@ -64,6 +64,7 @@ def create_adapter(slave: SlaveConfig) -> BrokerAdapter:
             client_id=slave.config.get("client_id", 1),
             market_data_type=slave.config.get("market_data_type"),
             quote_timeout=float(slave.config.get("quote_timeout", 1.0)),
+            bracket_tif=slave.config.get("bracket_tif", "GTC"),
         )
 
     raise ValueError(f"no adapter registered for broker_type={slave.broker_type!r}")
