@@ -148,10 +148,10 @@ class MT4Adapter(BrokerAdapter):
     async def get_account_summary(self, account_type: str) -> AccountSummary:
         raise NotImplementedError("MT4Adapter (mirror mode) does not support account summaries")
 
-    async def get_price_history(self, symbol: str, period: int) -> List[Bar]:
+    async def get_price_history(self, symbol: str, period: int, month_slot: int = 0) -> List[Bar]:
         raise NotImplementedError("MT4Adapter (mirror mode) does not support price history / ATR")
 
-    async def get_quote(self, symbol: str) -> float:
+    async def get_quote(self, symbol: str, month_slot: int = 0) -> float:
         raise NotImplementedError("MT4Adapter (mirror mode) does not support quotes")
 
     async def get_open_positions(self, account_type: Optional[str] = None) -> List[Position]:

@@ -50,8 +50,19 @@ def compute_size(
     contract_spec: Optional[ContractSpec],
 ) -> SizingResult:
     """Computes the slave order size (contracts for futures, shares for
-    equities/ETFs). Always floors to a whole unit and skips the trade if
-    that's less than 1 -- never place a 0-size order.
+    equities/ETFs).
+
+    Rounding to whole units is controlled by `sizing_config["rounding"]`:
+
+    - "nearest_min1" (default) -- round half up, never below one unit.
+    - "floor"                  -- round down, skip the trade below one unit.
+
+    Never places a zero-size order either way.
+
+    `sizing_config["max_risk_pct"]`, if set, is a ceiling checked against the
+    *final* size: when even the minimum tradeable size risks more than that
+    fraction of the capital base, the trade is skipped rather than taken at
+    the wrong size. Requires a stop price to measure risk against.
     """
     mode = sizing_config.get("mode")
 
@@ -97,12 +108,70 @@ def compute_size(
         raise ValueError(f"unknown sizing mode {mode!r}")
 
     min_size = contract_spec.min_size if contract_spec else 1.0
-    # round before flooring: tick sizes like 0.10 aren't exact in binary
-    # floating point, so a "genuinely whole" unit count can land a hair
-    # below the boundary (e.g. 104.99999999999999) and floor one unit too
-    # many -- 6dp is far finer than any real contract/share count needs.
+    # round before the rounding rule: tick sizes like 0.10 aren't exact in
+    # binary floating point, so a "genuinely whole" unit count can land a
+    # hair below the boundary (e.g. 104.99999999999999) and lose a unit --
+    # 6dp is far finer than any real contract/share count needs.
     units = round(size / min_size, 6)
-    size = math.floor(units) * min_size
-    if size < min_size:
-        return SizingResult(size=0, skipped=True, reason=f"computed size {size} < min size {min_size}, skipping")
-    return SizingResult(size=size)
+
+    if units <= 0:
+        return SizingResult(size=0, skipped=True, reason=f"computed size {size} is not positive")
+
+    rounding = sizing_config.get("rounding", "nearest_min1")
+    if rounding == "floor":
+        whole = math.floor(units)
+        if whole < 1:
+            return SizingResult(
+                size=0, skipped=True, reason=f"computed size {size} < min size {min_size}, skipping"
+            )
+    elif rounding == "nearest_min1":
+        # Round half up, floor of one. A master lot size rarely maps to a
+        # whole number of futures contracts, and the practice this mirrors
+        # is: >.5 round up, <.5 round down, but never below one contract.
+        #
+        # The floor is the sharp edge. A model asking for 0.3 contracts gets
+        # 1 -- more than three times the intended size, and on a contract
+        # like GC (100oz, ~$430k notional) that is a real risk difference,
+        # not a rounding detail. Use "floor" to skip undersized trades
+        # instead.
+        whole = max(math.floor(units + 0.5), 1)
+    else:
+        raise ValueError(f"unknown sizing rounding {rounding!r} (expected 'nearest_min1' or 'floor')")
+
+    final = whole * min_size
+
+    # Ceiling check. The min-one-contract floor above can hand back more size
+    # than the model asked for, and when volatility widens stops a single
+    # contract alone can carry more risk than the account should take. This is
+    # the escape hatch: skip the trade rather than take it at the wrong size.
+    max_risk_pct = sizing_config.get("max_risk_pct")
+    if max_risk_pct is not None:
+        if stop_price is None:
+            return SizingResult(size=0, skipped=True, reason="max_risk_pct requires a stop price")
+        stop_distance = abs(entry_price - stop_price)
+        if stop_distance <= 0:
+            return SizingResult(size=0, skipped=True, reason="max_risk_pct: stop distance is zero")
+        if contract_spec:
+            risk_per_unit = (stop_distance / contract_spec.tick_size) * contract_spec.tick_value
+        else:
+            risk_per_unit = stop_distance
+        capital_base = capital_base_amount(
+            sizing_config.get("capital_base", "balance"),
+            account_balance,
+            account_equity,
+            float(sizing_config.get("fixed_offset", 0.0)),
+            float(sizing_config.get("fixed_amount", 0.0)),
+        )
+        risk = final * risk_per_unit
+        ceiling = capital_base * float(max_risk_pct)
+        if risk > ceiling:
+            return SizingResult(
+                size=0,
+                skipped=True,
+                reason=(
+                    f"size {final} risks {risk:.2f}, over the {float(max_risk_pct):.2%} ceiling "
+                    f"of {ceiling:.2f} -- volatility too wide for the smallest tradeable size"
+                ),
+            )
+
+    return SizingResult(size=final)

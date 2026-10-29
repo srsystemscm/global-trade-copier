@@ -11,7 +11,7 @@ from app.models import Signal
 from app.notifier import Notifier
 from app.risk_controls import is_within_trading_hours
 from app.sizing import compute_size, resolve_sizing_config
-from app.symbol_mapper import map_symbol
+from app.routing import Route, describe_refusal, resolve_routes
 
 logger = logging.getLogger(__name__)
 
@@ -121,9 +121,12 @@ class AutonomousCopyEngine:
             await self._emit("trading_hours_blocked", master_ticket=signal.ticket)
             return
 
-        targets = map_symbol(self.slave_config, signal.symbol)
-        if not targets:
-            logger.warning("slave=%s no symbol_map entry for master symbol=%s", self.slave_id, signal.symbol)
+        routes = resolve_routes(self.slave_config, signal)
+        if not routes:
+            logger.warning("slave=%s refusing signal ticket=%s: %s",
+                           self.slave_id, signal.ticket, describe_refusal(self.slave_config, signal))
+            await self._emit("signal_unrouted", master_ticket=signal.ticket,
+                             symbol=signal.symbol, magic=signal.magic)
             return
 
         if not signal.atr or signal.atr <= 0:
@@ -142,20 +145,28 @@ class AutonomousCopyEngine:
         sl_mult = abs(signal.price - signal.sl) / signal.atr if signal.sl is not None else None
         tp_mult = abs(signal.tp - signal.price) / signal.atr if signal.tp is not None else None
 
-        for target_symbol in targets:
-            await self._open_one(signal, target_symbol, sl_mult, tp_mult)
+        for route in routes:
+            await self._open_one(signal, route, sl_mult, tp_mult)
 
     async def _open_one(
-        self, signal: Signal, target_symbol: str, sl_mult: Optional[float], tp_mult: Optional[float]
+        self, signal: Signal, route: Route, sl_mult: Optional[float], tp_mult: Optional[float]
     ) -> None:
-        bars = await self.adapter.get_price_history(target_symbol, self.atr_period)
+        target_symbol = route.target
+
+        # ATR from the FRONT month, price from the route's own month.
+        # Volatility is a property of the underlying and the front month is
+        # where the volume is -- slot 2 on gold trades ~174 contracts/day, too
+        # thin for a dependable ATR. The price level is not interchangeable
+        # though: the calendar spread is real (GCZ6 4051.6 vs GCJ7 4118.5), so
+        # stops and targets must be struck off the contract actually traded.
+        bars = await self.adapter.get_price_history(target_symbol, self.atr_period, month_slot=0)
         try:
             slave_atr = compute_atr(bars, self.atr_period)
         except ValueError as exc:
             logger.error("slave=%s skipping %s: %s", self.slave_id, target_symbol, exc)
             return
 
-        quote = await self.adapter.get_quote(target_symbol)
+        quote = await self.adapter.get_quote(target_symbol, month_slot=route.month_slot)
         sign = 1 if signal.direction == "BUY" else -1
         slave_sl = quote - sign * sl_mult * slave_atr if sl_mult is not None else None
         slave_tp = quote + sign * tp_mult * slave_atr if tp_mult is not None else None
@@ -164,7 +175,7 @@ class AutonomousCopyEngine:
         account_type = "futures" if spec else "brokerage"
         account = await self.adapter.get_account_summary(account_type)
 
-        sizing_config = resolve_sizing_config(self.slave_config, target_symbol)
+        sizing_config = route.sizing or resolve_sizing_config(self.slave_config, target_symbol)
         sizing_result = compute_size(
             sizing_config=sizing_config,
             master_lots=signal.lots or 0.0,
@@ -185,6 +196,7 @@ class AutonomousCopyEngine:
             sl=slave_sl,
             tp=slave_tp,
             master_ticket=signal.ticket,
+            month_slot=route.month_slot,
         )
         result = await self.adapter.open(order)
         trade_registry.record_open(self.slave_id, signal.ticket, target_symbol, result.slave_ticket)
@@ -197,11 +209,16 @@ class AutonomousCopyEngine:
             "sl": slave_sl,
             "tp": slave_tp,
             "breakeven_done": False,
+            "month_slot": route.month_slot,
+            # per-route overrides, falling back to the slave's defaults
+            "risk_config": route.risk_management or self.risk_config,
         }
         logger.info(
             "slave=%s opened %s master_ticket=%s -> slave_ticket=%s size=%s sl=%s tp=%s",
             self.slave_id, target_symbol, signal.ticket, result.slave_ticket, sizing_result.size, slave_sl, slave_tp,
         )
+        if route.month_slot:
+            logger.info("slave=%s   (magic=%s -> month_slot=%s)", self.slave_id, signal.magic, route.month_slot)
         await self._emit(
             "slave_open",
             master_ticket=signal.ticket,
@@ -255,13 +272,14 @@ class AutonomousCopyEngine:
 
     async def _check_risk(self, key: Tuple[int, str], pos: dict) -> None:
         _master_ticket, target_symbol = key
-        quote = await self.adapter.get_quote(target_symbol)
+        quote = await self.adapter.get_quote(target_symbol, month_slot=pos.get("month_slot", 0))
         sign = 1 if pos["direction"] == "BUY" else -1
         favorable_move = sign * (quote - pos["entry_price"])
         atr = pos["atr"]
 
-        be_trigger_atr = self.risk_config.get("breakeven_trigger_atr")
-        trailing_atr = self.risk_config.get("trailing_atr")
+        risk_config = pos.get("risk_config") or self.risk_config
+        be_trigger_atr = risk_config.get("breakeven_trigger_atr")
+        trailing_atr = risk_config.get("trailing_atr")
 
         new_sl = pos["sl"]
 

@@ -266,7 +266,7 @@ class IBKRAdapter(BrokerAdapter):
     async def open(self, order: OrderRequest) -> OrderResult:
         ib_mod = self._require_ib()
         assert self.ib is not None, "adapter not connected"
-        contract = await self._qualified_contract(order.symbol)
+        contract = await self._qualified_contract(order.symbol, order.month_slot)
         action = "BUY" if order.direction == "BUY" else "SELL"
         closing_action = "SELL" if action == "BUY" else "BUY"
 
@@ -366,9 +366,9 @@ class IBKRAdapter(BrokerAdapter):
             raise AdapterRejectedError(f"IBKR account summary missing expected field: {exc}") from exc
         return AccountSummary(balance=balance, equity=equity)
 
-    async def get_price_history(self, symbol: str, period: int) -> List[Bar]:
+    async def get_price_history(self, symbol: str, period: int, month_slot: int = 0) -> List[Bar]:
         assert self.ib is not None, "adapter not connected"
-        contract = await self._qualified_contract(symbol)
+        contract = await self._qualified_contract(symbol, month_slot)
         bars = await self.ib.reqHistoricalDataAsync(
             contract,
             endDateTime="",
@@ -379,9 +379,9 @@ class IBKRAdapter(BrokerAdapter):
         )
         return [Bar(high=b.high, low=b.low, close=b.close) for b in bars]
 
-    async def get_quote(self, symbol: str) -> float:
+    async def get_quote(self, symbol: str, month_slot: int = 0) -> float:
         assert self.ib is not None, "adapter not connected"
-        contract = await self._qualified_contract(symbol)
+        contract = await self._qualified_contract(symbol, month_slot)
         ticker = self.ib.reqMktData(contract, "", False, False)
         # asyncio.sleep, NOT ib.sleep(): IB.sleep() is a *synchronous* helper
         # that returns a bool, so `await self.ib.sleep(1)` raised

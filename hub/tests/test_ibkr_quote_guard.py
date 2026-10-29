@@ -36,7 +36,7 @@ def _quote(price):
     a = IBKRAdapter("t", "127.0.0.1", 4002, client_id=1, quote_timeout=0)
     a.ib = _FakeIB(price)
 
-    async def contract(symbol):
+    async def contract(symbol, month_slot=0):
         return object()
 
     a._qualified_contract = contract  # type: ignore[assignment]

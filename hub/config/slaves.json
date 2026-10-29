@@ -59,18 +59,20 @@
       "client_id": 1,
       "market_data_type": 3,
       "quote_timeout": 3.0,
-      "symbol_map": {
-        "XAUUSD": [
-          "GC"
-        ]
-      },
       "atr_period": 14,
-      "sizing": {
-        "GC": {
-          "mode": "fixed_contracts",
-          "contracts": 1
+      "routes": [
+        {
+          "symbol": "XAUUSD",
+          "target": "GC",
+          "month_slot": 0,
+          "sizing": {
+            "mode": "fixed_contracts",
+            "contracts": 1,
+            "rounding": "nearest_min1",
+            "max_risk_pct": 0.01
+          }
         }
-      },
+      ],
       "risk_management": {
         "breakeven_trigger_atr": 1.0,
         "trailing_atr": 1.5,

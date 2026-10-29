@@ -321,7 +321,7 @@ class SchwabAdapter(BrokerAdapter):
             raise AdapterRejectedError(f"could not find balance/equity fields in Schwab account response: {data}")
         return AccountSummary(balance=float(balance), equity=float(equity))
 
-    async def get_price_history(self, symbol: str, period: int) -> List[Bar]:
+    async def get_price_history(self, symbol: str, period: int, month_slot: int = 0) -> List[Bar]:
         is_future = get_contract_spec(symbol) is not None
         schwab_symbol = self._futures_symbol(symbol) if is_future else symbol
         resp = await self._request(
@@ -339,7 +339,7 @@ class SchwabAdapter(BrokerAdapter):
         candles = data.get("candles", [])
         return [Bar(high=c["high"], low=c["low"], close=c["close"]) for c in candles]
 
-    async def get_quote(self, symbol: str) -> float:
+    async def get_quote(self, symbol: str, month_slot: int = 0) -> float:
         is_future = get_contract_spec(symbol) is not None
         schwab_symbol = self._futures_symbol(symbol) if is_future else symbol
         resp = await self._request("GET", f"{self.market_base}/quotes", params={"symbols": schwab_symbol})
