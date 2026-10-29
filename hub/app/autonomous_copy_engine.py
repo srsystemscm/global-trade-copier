@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Any, Dict, Optional, Tuple
 
 from app import trade_registry
@@ -11,6 +12,7 @@ from app.models import Signal
 from app.notifier import Notifier
 from app.risk_controls import is_within_trading_hours
 from app.sizing import compute_size, resolve_sizing_config
+from app.contract_roll import roll_sequence, volume_crossover
 from app.routing import Route, describe_refusal, resolve_routes
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,8 @@ class AutonomousCopyEngine:
         self.slave_config = slave_config
         self.atr_period = slave_config.get("atr_period", 14)
         self.risk_config = slave_config.get("risk_management", {})
+        self.roll_config = slave_config.get("contract_roll", {})
+        self._last_roll_check = 0.0
 
         # keyed by (master_ticket, slave_symbol)
         self._positions: Dict[Tuple[int, str], dict] = {}
@@ -153,13 +157,19 @@ class AutonomousCopyEngine:
     ) -> None:
         target_symbol = route.target
 
-        # ATR from the FRONT month, price from the route's own month.
-        # Volatility is a property of the underlying and the front month is
-        # where the volume is -- slot 2 on gold trades ~174 contracts/day, too
-        # thin for a dependable ATR. The price level is not interchangeable
-        # though: the calendar spread is real (GCZ6 4051.6 vs GCJ7 4118.5), so
-        # stops and targets must be struck off the contract actually traded.
-        bars = await self.adapter.get_price_history(target_symbol, self.atr_period, month_slot=0)
+        # ATR and price both come from the contract actually traded. A back
+        # month's own volatility is what its stops have to survive, and
+        # borrowing the front month's would misstate it -- deferred months
+        # damp differently, and the calendar spread between them is real
+        # money (GCZ6 4051.6 vs GCJ7 4118.5).
+        #
+        # The cost is that thin back months give thin bars: slot 2 on gold
+        # trades ~174 contracts/day. compute_atr() raises on insufficient
+        # history and the open is skipped with a reason rather than sized off
+        # a bad number.
+        bars = await self.adapter.get_price_history(
+            target_symbol, self.atr_period, month_slot=route.month_slot
+        )
         try:
             slave_atr = compute_atr(bars, self.atr_period)
         except ValueError as exc:
@@ -201,6 +211,16 @@ class AutonomousCopyEngine:
         result = await self.adapter.open(order)
         trade_registry.record_open(self.slave_id, signal.ticket, target_symbol, result.slave_ticket)
 
+        # Pin the concrete contract. Slot numbers shift under you when the
+        # front month rolls; an expiry doesn't, and the roll needs to know
+        # exactly what it's moving from.
+        try:
+            info = await self.adapter.resolve_contract(target_symbol, route.month_slot)
+            contract_id, contract_local, contract_expiry = (
+                info.contract_id, info.local_symbol, info.expiry)
+        except NotImplementedError:
+            contract_id = contract_local = contract_expiry = None
+
         self._positions[(signal.ticket, target_symbol)] = {
             "slave_ticket": result.slave_ticket,
             "entry_price": quote,
@@ -209,9 +229,18 @@ class AutonomousCopyEngine:
             "sl": slave_sl,
             "tp": slave_tp,
             "breakeven_done": False,
+            "size": sizing_result.size,
             "month_slot": route.month_slot,
             # per-route overrides, falling back to the slave's defaults
             "risk_config": route.risk_management or self.risk_config,
+            "contract_id": contract_id,
+            "contract_local": contract_local,
+            "contract_expiry": contract_expiry,
+            # kept so a roll can re-derive stops on the new contract's own ATR
+            # rather than carrying absolute prices across a calendar spread
+            "sl_mult": sl_mult,
+            "tp_mult": tp_mult,
+            "direction": signal.direction,
         }
         logger.info(
             "slave=%s opened %s master_ticket=%s -> slave_ticket=%s size=%s sl=%s tp=%s",
@@ -269,6 +298,144 @@ class AutonomousCopyEngine:
                     await self._check_risk(key, pos)
                 except AdapterError as exc:
                     logger.error("slave=%s risk check failed for %s: %s", self.slave_id, key, exc)
+            try:
+                await self._check_rolls()
+            except AdapterError as exc:
+                logger.error("slave=%s roll check failed: %s", self.slave_id, exc)
+
+    async def _check_rolls(self) -> None:
+        """Coordinated per-symbol roll sweep, outermost expiry first.
+
+        The trigger is evaluated once per symbol on the FRONT month, not per
+        position. When the front is dying every position for that symbol has
+        to shift together -- rolling only the front one would land it on the
+        month the next strategy still holds, and on a netting account they'd
+        merge.
+        """
+        if not self.roll_config.get("enabled", False) or not self._positions:
+            return
+
+        interval = float(self.roll_config.get("check_interval_seconds", 3600))
+        now = time.time()
+        if now - self._last_roll_check < interval:
+            return
+        self._last_roll_check = now
+
+        by_symbol: Dict[str, list] = {}
+        for key, pos in self._positions.items():
+            if pos.get("contract_id") is not None:
+                by_symbol.setdefault(key[1], []).append((key, pos))
+
+        min_ratio = float(self.roll_config.get("min_volume_ratio", 1.0))
+        for symbol, items in by_symbol.items():
+            try:
+                front = await self.adapter.get_contract_volume(symbol, month_slot=0)
+                nxt = await self.adapter.get_contract_volume(symbol, month_slot=1)
+            except NotImplementedError:
+                continue
+
+            decision = volume_crossover(front, nxt, min_ratio)
+            logger.info("slave=%s roll check %s: %s", self.slave_id, symbol, decision.reason)
+            if not decision.should_roll:
+                continue
+
+            for key, pos in roll_sequence(items):
+                try:
+                    await self._roll_one(key, pos, decision.reason)
+                except AdapterError as exc:
+                    # Stop the sweep: a half-rolled symbol is recoverable, but
+                    # continuing would move the next position into the contract
+                    # this one failed to vacate.
+                    logger.error(
+                        "slave=%s roll failed for %s (%s) -- halting this symbol's sweep: %s",
+                        self.slave_id, symbol, pos.get("contract_local"), exc,
+                    )
+                    break
+
+    async def _roll_one(self, key: Tuple[int, str], pos: dict, reason: str) -> None:
+        master_ticket, symbol = key
+        nxt = await self.adapter.next_contract_after(symbol, pos["contract_id"])
+        if nxt is None:
+            logger.error(
+                "slave=%s cannot roll %s %s: no liquid contract beyond it",
+                self.slave_id, symbol, pos.get("contract_local"),
+            )
+            return
+
+        old_local = pos.get("contract_local")
+        old_ticket = pos["slave_ticket"]
+
+        # Stops are re-derived on the new contract's own ATR rather than
+        # carried across. The calendar spread is real money (GCZ6 4051.6 vs
+        # GCJ7 4118.5), so an absolute level transplanted between contracts is
+        # simply wrong, and shift errors would compound over repeated rolls.
+        bars = await self.adapter.get_price_history(
+            symbol, self.atr_period, contract_id=nxt.contract_id
+        )
+        try:
+            new_atr = compute_atr(bars, self.atr_period)
+        except ValueError as exc:
+            logger.error("slave=%s not rolling %s: %s", self.slave_id, symbol, exc)
+            return
+        quote = await self.adapter.get_quote(symbol, contract_id=nxt.contract_id)
+
+        sign = 1 if pos["direction"] == "BUY" else -1
+        sl_mult, tp_mult = pos.get("sl_mult"), pos.get("tp_mult")
+        new_sl = quote - sign * sl_mult * new_atr if sl_mult is not None else None
+        new_tp = quote + sign * tp_mult * new_atr if tp_mult is not None else None
+        # A position already moved to breakeven keeps that protection: on the
+        # new contract breakeven is the new entry, not the old price.
+        if pos.get("breakeven_done") and (new_sl is None or sign * (quote - new_sl) > 0):
+            new_sl = quote
+
+        await self.adapter.close(old_ticket)
+        order = OrderRequest(
+            symbol=symbol,
+            direction=pos["direction"],
+            size=pos["size"],
+            sl=new_sl,
+            tp=new_tp,
+            master_ticket=master_ticket,
+            contract_id=nxt.contract_id,
+        )
+        result = await self.adapter.open(order)
+
+        trade_registry.record_open(self.slave_id, master_ticket, symbol, result.slave_ticket)
+        pos.update({
+            "slave_ticket": result.slave_ticket,
+            "entry_price": quote,
+            "atr": new_atr,
+            "sl": new_sl,
+            "tp": new_tp,
+            "contract_id": nxt.contract_id,
+            "contract_local": nxt.local_symbol,
+            "contract_expiry": nxt.expiry,
+        })
+
+        logger.info(
+            "slave=%s rolled %s %s -> %s: slave_ticket %s -> %s, sl=%s tp=%s (%s)",
+            self.slave_id, symbol, old_local, nxt.local_symbol,
+            old_ticket, result.slave_ticket, new_sl, new_tp, reason,
+        )
+        await self._emit(
+            "contract_roll",
+            master_ticket=master_ticket,
+            slave_symbol=symbol,
+            from_contract=old_local,
+            to_contract=nxt.local_symbol,
+            slave_ticket=result.slave_ticket,
+            sl=new_sl,
+            tp=new_tp,
+        )
+        if self.notifier:
+            await self.notifier.notify(
+                "contract_roll",
+                f"Slave {self.slave_id} rolled {symbol} {old_local} -> {nxt.local_symbol}",
+                slave_id=self.slave_id,
+                master_ticket=master_ticket,
+                from_contract=old_local,
+                to_contract=nxt.local_symbol,
+            )
 
     async def _check_risk(self, key: Tuple[int, str], pos: dict) -> None:
         _master_ticket, target_symbol = key

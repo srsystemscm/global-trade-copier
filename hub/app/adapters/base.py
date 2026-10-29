@@ -42,6 +42,9 @@ class OrderRequest:
     # keep strategies on one netting account from merging into one position.
     # Ignored by brokers/instruments that have no contract months.
     month_slot: int = 0
+    # An exact contract to trade, overriding month_slot. Set when rolling: the
+    # destination is a specific contract, not "whatever slot N is right now".
+    contract_id: Optional[int] = None
 
 
 @dataclass
@@ -54,6 +57,20 @@ class OrderResult:
 class AccountSummary:
     balance: float
     equity: float
+
+
+@dataclass
+class ContractInfo:
+    """One dated futures contract, identified concretely rather than by slot.
+
+    Positions store this so a roll targets an exact contract: slot numbering
+    shifts under you when the front month rolls, an expiry does not.
+    """
+
+    symbol: str          # root, e.g. "GC"
+    contract_id: int     # broker contract id (IBKR conId)
+    local_symbol: str    # e.g. "GCZ6"
+    expiry: str          # YYYYMMDD
 
 
 @dataclass
@@ -103,10 +120,33 @@ class BrokerAdapter(abc.ABC):
     async def get_account_summary(self, account_type: str) -> AccountSummary: ...
 
     @abc.abstractmethod
-    async def get_price_history(self, symbol: str, period: int, month_slot: int = 0) -> List[Bar]: ...
+    async def get_price_history(
+        self, symbol: str, period: int, month_slot: int = 0, contract_id: Optional[int] = None
+    ) -> List[Bar]: ...
 
     @abc.abstractmethod
-    async def get_quote(self, symbol: str, month_slot: int = 0) -> float: ...
+    async def get_quote(
+        self, symbol: str, month_slot: int = 0, contract_id: Optional[int] = None
+    ) -> float: ...
+
+    # --- contract months (futures only) ---------------------------------
+    # Default to NotImplementedError so brokers and instruments without
+    # contract months are simply skipped by the roller rather than special
+    # -cased at every call site.
+
+    async def resolve_contract(self, symbol: str, month_slot: int = 0) -> "ContractInfo":
+        """The concrete contract a (symbol, month_slot) currently resolves to."""
+        raise NotImplementedError(f"{type(self).__name__} has no contract months")
+
+    async def next_contract_after(self, symbol: str, contract_id: int) -> Optional["ContractInfo"]:
+        """The next liquid contract after `contract_id`, or None if it's the last."""
+        raise NotImplementedError(f"{type(self).__name__} has no contract months")
+
+    async def get_contract_volume(
+        self, symbol: str, month_slot: int = 0, contract_id: Optional[int] = None
+    ) -> Optional[float]:
+        """Session volume for one contract. None when no figure is available."""
+        raise NotImplementedError(f"{type(self).__name__} has no contract months")
 
     @abc.abstractmethod
     async def get_open_positions(self, account_type: str) -> List[Position]: ...

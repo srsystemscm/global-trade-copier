@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 
 from app.adapters.base import (
     AccountSummary,
+    ContractInfo,
     AdapterConnectionError,
     AdapterRejectedError,
     BrokerAdapter,
@@ -187,6 +188,22 @@ class IBKRAdapter(BrokerAdapter):
         out.sort(key=lambda k: k.lastTradeDateOrContractMonth)
         return out
 
+    async def _contract_by_id(self, symbol: str, contract_id: int):
+        """A specific contract by id -- the roll destination, and anything else
+        that must not be re-derived from a slot number that may have shifted."""
+        ib_mod = self._require_ib()
+        qualified = await self.ib.qualifyContractsAsync(
+            ib_mod.Future(conId=contract_id, exchange=get_contract_spec(symbol).exchange)
+        )
+        if not qualified:
+            raise AdapterRejectedError(f"IBKR could not qualify contract_id={contract_id} for {symbol}")
+        return qualified[0]
+
+    async def _contract_for_request(self, symbol: str, month_slot: int, contract_id: Optional[int]):
+        if contract_id is not None:
+            return await self._contract_by_id(symbol, contract_id)
+        return await self._qualified_contract(symbol, month_slot)
+
     async def _qualified_contract(self, symbol: str, month_slot: int = 0):
         """`month_slot` 0 is the front month, 1 the next liquid month, and so
         on. Strategies that would otherwise net against each other on a single
@@ -266,7 +283,7 @@ class IBKRAdapter(BrokerAdapter):
     async def open(self, order: OrderRequest) -> OrderResult:
         ib_mod = self._require_ib()
         assert self.ib is not None, "adapter not connected"
-        contract = await self._qualified_contract(order.symbol, order.month_slot)
+        contract = await self._contract_for_request(order.symbol, order.month_slot, order.contract_id)
         action = "BUY" if order.direction == "BUY" else "SELL"
         closing_action = "SELL" if action == "BUY" else "BUY"
 
@@ -366,9 +383,11 @@ class IBKRAdapter(BrokerAdapter):
             raise AdapterRejectedError(f"IBKR account summary missing expected field: {exc}") from exc
         return AccountSummary(balance=balance, equity=equity)
 
-    async def get_price_history(self, symbol: str, period: int, month_slot: int = 0) -> List[Bar]:
+    async def get_price_history(
+        self, symbol: str, period: int, month_slot: int = 0, contract_id: Optional[int] = None
+    ) -> List[Bar]:
         assert self.ib is not None, "adapter not connected"
-        contract = await self._qualified_contract(symbol, month_slot)
+        contract = await self._contract_for_request(symbol, month_slot, contract_id)
         bars = await self.ib.reqHistoricalDataAsync(
             contract,
             endDateTime="",
@@ -379,9 +398,11 @@ class IBKRAdapter(BrokerAdapter):
         )
         return [Bar(high=b.high, low=b.low, close=b.close) for b in bars]
 
-    async def get_quote(self, symbol: str, month_slot: int = 0) -> float:
+    async def get_quote(
+        self, symbol: str, month_slot: int = 0, contract_id: Optional[int] = None
+    ) -> float:
         assert self.ib is not None, "adapter not connected"
-        contract = await self._qualified_contract(symbol, month_slot)
+        contract = await self._contract_for_request(symbol, month_slot, contract_id)
         ticker = self.ib.reqMktData(contract, "", False, False)
         # asyncio.sleep, NOT ib.sleep(): IB.sleep() is a *synchronous* helper
         # that returns a bool, so `await self.ib.sleep(1)` raised
@@ -419,6 +440,41 @@ class IBKRAdapter(BrokerAdapter):
                 f"usually the instrument's session is closed. Otherwise: {hint}"
             )
         return float(price)
+
+    @staticmethod
+    def _info(symbol: str, contract) -> ContractInfo:
+        return ContractInfo(
+            symbol=symbol,
+            contract_id=contract.conId,
+            local_symbol=contract.localSymbol,
+            expiry=contract.lastTradeDateOrContractMonth,
+        )
+
+    async def resolve_contract(self, symbol: str, month_slot: int = 0) -> ContractInfo:
+        return self._info(symbol, await self._qualified_contract(symbol, month_slot))
+
+    async def next_contract_after(self, symbol: str, contract_id: int) -> Optional[ContractInfo]:
+        months = await self._liquid_dated_contracts(symbol)
+        ids = [k.conId for k in months]
+        if contract_id not in ids:
+            # Already past its last trading day, so it's gone from the live
+            # list. Fall back to the nearest liquid month still available.
+            return self._info(symbol, months[0]) if months else None
+        idx = ids.index(contract_id) + 1
+        return self._info(symbol, months[idx]) if idx < len(months) else None
+
+    async def get_contract_volume(
+        self, symbol: str, month_slot: int = 0, contract_id: Optional[int] = None
+    ) -> Optional[float]:
+        assert self.ib is not None, "adapter not connected"
+        contract = await self._contract_for_request(symbol, month_slot, contract_id)
+        ticker = self.ib.reqMktData(contract, "", False, False)
+        await asyncio.sleep(self.quote_timeout)
+        volume = ticker.volume
+        self.ib.cancelMktData(contract)
+        if volume != volume or volume is None or volume < 0:   # NaN / absent
+            return None
+        return float(volume)
 
     async def get_open_positions(self, account_type: str) -> List[Position]:
         assert self.ib is not None, "adapter not connected"

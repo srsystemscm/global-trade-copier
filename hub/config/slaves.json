@@ -77,6 +77,11 @@
         "breakeven_trigger_atr": 1.0,
         "trailing_atr": 1.5,
         "poll_interval_seconds": 15
+      },
+      "contract_roll": {
+        "enabled": true,
+        "min_volume_ratio": 1.0,
+        "check_interval_seconds": 3600
       }
     }
   }
