@@ -95,10 +95,10 @@ class MT4Adapter(BrokerAdapter):
                 raise AdapterRejectedError(reply.get("message", "slave rejected command"))
             return reply
 
-    async def _request(self, command: dict) -> dict:
+    async def _request(self, command: dict, retries: Optional[int] = None) -> dict:
         return await retry_async(
             lambda: self._request_once(command),
-            retries=self.max_retries,
+            retries=self.max_retries if retries is None else retries,
             base_delay=self.retry_base_delay,
             retryable=(AdapterTimeoutError,),
         )
@@ -166,7 +166,12 @@ class MT4Adapter(BrokerAdapter):
         the hub was down) could never be corrected.
         """
         try:
-            reply = await self._request({"cmd": "POSITIONS"})
+            # retries=0 deliberately. This is a read behind GET /status, which
+            # the dashboard polls every 5s; retrying a dead slave 3x with
+            # backoff made each poll take ~20s and pile requests up. A trade
+            # command is worth retrying, a status read is not -- it just needs
+            # to say "unknown" quickly.
+            reply = await self._request({"cmd": "POSITIONS"}, retries=0)
         except AdapterRejectedError as exc:
             # An EA built before POSITIONS existed answers "unknown cmd".
             # Degrade to the old behaviour rather than failing the caller --

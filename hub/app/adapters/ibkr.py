@@ -323,7 +323,12 @@ class IBKRAdapter(BrokerAdapter):
         await asyncio.sleep(self.quote_timeout)
         price = ticker.marketPrice()
         self.ib.cancelMktData(contract)
-        if price != price:  # NaN: no price arrived
+        # NaN *or* a non-positive sentinel. IBKR returns -1 (not NaN) when
+        # there's no market -- seen live on GLD outside the US cash session
+        # while GC, which trades nearly 24h, quoted fine. A -1 slipping
+        # through is worse than an error: sizing divides by it and the
+        # ATR-derived SL/TP get computed off a negative price.
+        if price != price or price <= 0:
             if self.market_data_type in (3, 4):
                 hint = (
                     "already requesting delayed data, so the usual cause is another IBKR "
@@ -339,8 +344,10 @@ class IBKRAdapter(BrokerAdapter):
                     "slave's config, or subscribe to the relevant feed."
                 )
             raise AdapterRejectedError(
-                f"IBKR returned no market price for symbol={symbol} "
-                f"(market_data_type={self.market_data_type}): {hint}"
+                f"IBKR returned no usable market price for symbol={symbol} "
+                f"(got {price!r}, market_data_type={self.market_data_type}). "
+                f"A negative price means IBKR has no market for it right now -- "
+                f"usually the instrument's session is closed. Otherwise: {hint}"
             )
         return float(price)
 

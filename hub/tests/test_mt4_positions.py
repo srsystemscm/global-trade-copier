@@ -17,8 +17,11 @@ from app.adapters.mt4 import MT4Adapter
 def _adapter(reply=None, raises=None):
     a = MT4Adapter(slave_id="t", host="127.0.0.1", port=1)
 
-    async def fake_request(command):
+    async def fake_request(command, retries=None):
         assert command == {"cmd": "POSITIONS"}
+        # a status read must not retry a dead slave -- GET /status is polled
+        # every 5s by the dashboard
+        assert retries == 0, f"POSITIONS should not retry, got retries={retries!r}"
         if raises is not None:
             raise raises
         return reply
