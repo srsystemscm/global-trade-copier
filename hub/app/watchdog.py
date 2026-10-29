@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from app.adapters.base import AdapterError, BrokerAdapter
 from app.events import EventBus
@@ -32,6 +32,7 @@ class SlaveWatchdog:
         account_types: List[Optional[str]],
         poll_interval: float,
         drawdown_alert_pct: float,
+        is_paused: Optional[Callable[[], bool]] = None,
     ) -> None:
         self.slave_id = slave_id
         self.adapter = adapter
@@ -40,8 +41,14 @@ class SlaveWatchdog:
         self.account_types = account_types
         self.poll_interval = poll_interval
         self.drawdown_alert_pct = drawdown_alert_pct
+        # A paused slave is deliberately idle, so health-checking it is noise:
+        # it reports "disconnected" for a condition the operator created on
+        # purpose, and on MT4 each failed PING costs three retries with
+        # backoff. Left unchecked that buries real signals in the log.
+        self.is_paused = is_paused or (lambda: False)
 
         self.connected: Optional[bool] = None  # None = not checked yet
+        self._paused_logged = False
         self._account_summary_supported = True
         self._peak_equity: Dict[Optional[str], float] = {}
         self._drawdown_alerted: Dict[Optional[str], bool] = {}
@@ -61,6 +68,18 @@ class SlaveWatchdog:
     async def _loop(self) -> None:
         while True:
             await asyncio.sleep(self.poll_interval)
+            if self.is_paused():
+                if not self._paused_logged:
+                    logger.info("slave=%s paused, suspending health checks", self.slave_id)
+                    self._paused_logged = True
+                # Forget the last known state so the first poll after resume
+                # re-baselines silently instead of firing a connect/disconnect
+                # transition for time the slave spent deliberately idle.
+                self.connected = None
+                continue
+            if self._paused_logged:
+                logger.info("slave=%s resumed, health checks back on", self.slave_id)
+                self._paused_logged = False
             await self._check_connectivity()
             if self._account_summary_supported:
                 await self._check_drawdown()
