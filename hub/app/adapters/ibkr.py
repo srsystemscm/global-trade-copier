@@ -77,7 +77,8 @@ class IBKRAdapter(BrokerAdapter):
         self.market_data_type = market_data_type
         self.quote_timeout = quote_timeout
         self.ib = None  # the client instance (ib_async.IB), created in connect()
-        self._contracts: Dict[str, object] = {}
+        # (symbol, month_slot) -> qualified contract
+        self._contracts: Dict[tuple, object] = {}
         self._positions: Dict[int, dict] = {}
 
     @staticmethod
@@ -153,15 +154,58 @@ class IBKRAdapter(BrokerAdapter):
             return False
         return expiry[:8] < time.strftime("%Y%m%d")
 
-    async def _qualified_contract(self, symbol: str):
+    async def _liquid_dated_contracts(self, symbol: str) -> List:
+        """Unexpired dated contracts for a futures root, liquid months only,
+        nearest first.
+
+        Serial months are filtered out because they're near-dead: measured on
+        COMEX gold, cycle months carried 100-29,000 contracts/day while the
+        serials between them carried 0-23. A strategy routed to "the next
+        expiry" rather than "the next liquid expiry" would sit in one of
+        those.
+        """
+        assert self.ib is not None, "adapter not connected"
+        ib_mod = self._require_ib()
+        spec = get_contract_spec(symbol)
+        if spec is None:
+            raise AdapterRejectedError(f"{symbol} has no futures spec, so it has no contract months")
+
+        details = await self.ib.reqContractDetailsAsync(
+            ib_mod.Future(symbol, exchange=spec.exchange, currency="USD")
+        )
+        today = time.strftime("%Y%m%d")
+        out, seen = [], set()
+        for d in details:
+            k = d.contract
+            expiry = k.lastTradeDateOrContractMonth or ""
+            if len(expiry) < 8 or expiry[:8] < today or k.conId in seen:
+                continue
+            if spec.liquid_months and int(expiry[4:6]) not in spec.liquid_months:
+                continue
+            seen.add(k.conId)
+            out.append(k)
+        out.sort(key=lambda k: k.lastTradeDateOrContractMonth)
+        return out
+
+    async def _qualified_contract(self, symbol: str, month_slot: int = 0):
+        """`month_slot` 0 is the front month, 1 the next liquid month, and so
+        on. Strategies that would otherwise net against each other on a single
+        IBKR account are separated by giving each its own slot -- same
+        contract size, so they stay risk-equivalent.
+        """
         assert self.ib is not None, "adapter not connected"
 
-        cached = self._contracts.get(symbol)
+        cached = self._contracts.get((symbol, month_slot))
         if cached is not None and not self._is_expired(cached):
             return cached
 
         ib_mod = self._require_ib()
         contract = self._contract_for(symbol)
+        if month_slot and not isinstance(contract, ib_mod.ContFuture):
+            raise AdapterRejectedError(
+                f"month_slot={month_slot} requested for {symbol}, which isn't a future "
+                f"-- only futures have contract months"
+            )
         qualified = await self.ib.qualifyContractsAsync(contract)
         if not qualified:
             raise AdapterRejectedError(f"IBKR could not qualify a contract for symbol={symbol}")
@@ -191,7 +235,32 @@ class IBKRAdapter(BrokerAdapter):
                 resolved.lastTradeDateOrContractMonth, resolved.conId,
             )
 
-        self._contracts[symbol] = resolved
+            if month_slot:
+                # Step out from the front month through the liquid cycle. The
+                # front month comes from ContFuture (which follows liquidity),
+                # so this stays anchored to the contract IBKR itself treats as
+                # current, rather than to a calendar rule of our own.
+                months = await self._liquid_dated_contracts(symbol)
+                ids = [k.conId for k in months]
+                if resolved.conId not in ids:
+                    raise AdapterRejectedError(
+                        f"front month {resolved.localSymbol} for {symbol} isn't in its liquid "
+                        f"cycle -- check liquid_months in contract_specs.py"
+                    )
+                idx = ids.index(resolved.conId) + month_slot
+                if idx >= len(months):
+                    raise AdapterRejectedError(
+                        f"{symbol} has no liquid contract at month_slot={month_slot} "
+                        f"(only {len(months) - ids.index(resolved.conId)} ahead of the front month)"
+                    )
+                resolved = months[idx]
+                logger.info(
+                    "IBKRAdapter[%s] %s slot %s -> %s (expiry %s)",
+                    self.slave_id, symbol, month_slot,
+                    resolved.localSymbol, resolved.lastTradeDateOrContractMonth,
+                )
+
+        self._contracts[(symbol, month_slot)] = resolved
         return resolved
 
     async def open(self, order: OrderRequest) -> OrderResult:

@@ -43,6 +43,8 @@ struct OrderSnapshot
    double price;
    double sl;
    double tp;
+   int    magic;    // OrderMagicNumber() -- identifies which strategy opened it
+   string comment;  // OrderComment() -- secondary identifier, free-form
   };
 
 OrderSnapshot knownOrders[];
@@ -121,6 +123,11 @@ void TakeSnapshot(OrderSnapshot &out[])
       out[n].price  = OrderOpenPrice();
       out[n].sl     = OrderStopLoss();
       out[n].tp     = OrderTakeProfit();
+      // Several strategies can run on one master account and trade the same
+      // symbol. The magic number is what tells them apart, and the hub routes
+      // on it -- without this every strategy's signals are indistinguishable.
+      out[n].magic   = OrderMagicNumber();
+      out[n].comment = OrderComment();
      }
   }
 
@@ -179,14 +186,40 @@ void PublishSignal(string action, OrderSnapshot &o)
    double atr = iATR(o.symbol, AtrTimeframe, AtrPeriod, 0);
    string json = StringFormat(
       "{\"ticket\":%d,\"symbol\":\"%s\",\"action\":\"%s\",\"direction\":\"%s\"," +
-      "\"lots\":%.2f,\"price\":%.5f,\"sl\":%.5f,\"tp\":%.5f,\"atr\":%.5f,\"account\":\"%d\",\"ts\":%.3f}",
+      "\"lots\":%.2f,\"price\":%.5f,\"sl\":%.5f,\"tp\":%.5f,\"atr\":%.5f," +
+      "\"magic\":%d,\"comment\":\"%s\",\"account\":\"%d\",\"ts\":%.3f}",
       o.ticket, o.symbol, action, direction,
       o.lots, o.price, o.sl, o.tp, atr,
+      o.magic, JsonEscape(o.comment),
       AccountNumber(), (double)TimeGMT());
 
    ZmqMsg msg(json);
    pubSocket.send(msg);
    Print(action, " ticket=", o.ticket, " -> ", json);
+  }
+
+//+------------------------------------------------------------------+
+//| OrderComment() is broker-controlled text and can contain quotes or |
+//| backslashes (brokers append things like "[sl]" or "to #123456"),   |
+//| which would produce malformed JSON the hub silently drops.         |
+//+------------------------------------------------------------------+
+string JsonEscape(string raw)
+  {
+   string out = "";
+   int n = StringLen(raw);
+   for(int i = 0; i < n; i++)
+     {
+      ushort ch = StringGetCharacter(raw, i);
+      if(ch == '"' || ch == '\\')
+         out += "\\";
+      else if(ch < 32)   // control chars: drop rather than emit raw
+        {
+         out += " ";
+         continue;
+        }
+      out += ShortToString(ch);
+     }
+   return out;
   }
 
 //+------------------------------------------------------------------+

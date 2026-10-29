@@ -91,3 +91,37 @@ def test_gc_is_full_size_comex_gold():
 
 def test_gc_and_mgc_differ_by_ten_times():
     assert get_contract_spec("GC").point_value == 10 * get_contract_spec("MGC").point_value
+
+
+# --- liquid month cycles ---------------------------------------------------
+# Strategies on one IBKR account are separated by contract month, so routing
+# must land on months that actually trade. Measured on COMEX gold via the
+# Gateway: GCZ6 29,179 contracts/day, GCG7 2,098, GCJ7 174 -- while the serial
+# months between them (GCX6 7, GCF7 23, GCH7 20) are effectively dead.
+
+def test_gold_cycle_is_feb_apr_jun_aug_dec():
+    for sym in ("GC", "MGC"):
+        assert get_contract_spec(sym).liquid_months == (2, 4, 6, 8, 12), sym
+
+
+def test_equity_index_micros_are_quarterly():
+    for sym in ("MES", "MNQ", "MYM", "M2K"):
+        assert get_contract_spec(sym).liquid_months == (3, 6, 9, 12), sym
+
+
+def test_crude_has_no_restriction():
+    """Empty means every month is liquid -- CL trades all twelve."""
+    assert get_contract_spec("MCL").liquid_months == ()
+
+
+def test_serial_months_are_excluded_for_gold():
+    cycle = get_contract_spec("GC").liquid_months
+    for serial in (1, 3, 5, 7, 9, 10, 11):   # Jan Mar May Jul Sep Oct Nov
+        assert serial not in cycle
+
+
+def test_override_can_supply_a_cycle():
+    spec = get_contract_spec("GC", overrides={
+        "GC": {"tick_size": 0.1, "tick_value": 10.0, "point_value": 100.0,
+               "exchange": "COMEX", "liquid_months": [6, 12]}})
+    assert tuple(spec.liquid_months) == (6, 12)

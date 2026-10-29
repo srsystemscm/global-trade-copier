@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 
 @dataclass
@@ -15,6 +15,12 @@ class ContractSpec:
     # Schwab doesn't need this (it routes by account), so it only shows up
     # once you point an IBKR slave at these symbols.
     exchange: str = "CME"
+    # Months (1-12) that actually carry volume. Serial months exist for most
+    # of these roots but are near-dead: measured on COMEX gold, cycle months
+    # ran 100-29,000 contracts/day while serials ran 0-23. Routing a strategy
+    # to "the next expiry" instead of "the next *liquid* expiry" would park it
+    # in one of those. Empty means every month is liquid (e.g. crude).
+    liquid_months: Tuple[int, ...] = ()
 
 
 # Indicative CME-complex futures specs: the micro preset (the project's
@@ -23,17 +29,17 @@ class ContractSpec:
 # published contract specs before trading real size, and use `overrides` in
 # a slave's config to correct/extend these.
 MICRO_FUTURES_SPECS: Dict[str, ContractSpec] = {
-    "MGC": ContractSpec("MGC", tick_size=0.10, tick_value=1.00, point_value=10.0, exchange="COMEX"),  # Micro Gold
-    "MES": ContractSpec("MES", tick_size=0.25, tick_value=1.25, point_value=5.0, exchange="CME"),     # Micro E-mini S&P 500
-    "MNQ": ContractSpec("MNQ", tick_size=0.25, tick_value=0.50, point_value=2.0, exchange="CME"),     # Micro E-mini Nasdaq-100
-    "MYM": ContractSpec("MYM", tick_size=1.00, tick_value=0.50, point_value=0.50, exchange="CBOT"),   # Micro E-mini Dow
-    "M2K": ContractSpec("M2K", tick_size=0.10, tick_value=0.50, point_value=5.0, exchange="CME"),     # Micro E-mini Russell 2000
+    "MGC": ContractSpec("MGC", tick_size=0.10, tick_value=1.00, point_value=10.0, exchange="COMEX", liquid_months=(2, 4, 6, 8, 12)),  # Micro Gold
+    "MES": ContractSpec("MES", tick_size=0.25, tick_value=1.25, point_value=5.0, exchange="CME", liquid_months=(3, 6, 9, 12)),     # Micro E-mini S&P 500
+    "MNQ": ContractSpec("MNQ", tick_size=0.25, tick_value=0.50, point_value=2.0, exchange="CME", liquid_months=(3, 6, 9, 12)),     # Micro E-mini Nasdaq-100
+    "MYM": ContractSpec("MYM", tick_size=1.00, tick_value=0.50, point_value=0.50, exchange="CBOT", liquid_months=(3, 6, 9, 12)),   # Micro E-mini Dow
+    "M2K": ContractSpec("M2K", tick_size=0.10, tick_value=0.50, point_value=5.0, exchange="CME", liquid_months=(3, 6, 9, 12)),     # Micro E-mini Russell 2000
     "MCL": ContractSpec("MCL", tick_size=0.01, tick_value=1.00, point_value=100.0, exchange="NYMEX"), # Micro WTI Crude Oil
 
     # Full-size. GC is 100 troy oz -- 10x MGC, so roughly $430k notional per
     # contract at $4,300 gold. Size it deliberately; dollar_notional will
     # floor to zero (and skip the trade) for any sensible notional.
-    "GC":  ContractSpec("GC",  tick_size=0.10, tick_value=10.00, point_value=100.0, exchange="COMEX"), # Gold
+    "GC":  ContractSpec("GC",  tick_size=0.10, tick_value=10.00, point_value=100.0, exchange="COMEX", liquid_months=(2, 4, 6, 8, 12)), # Gold
 }
 
 
@@ -50,5 +56,6 @@ def get_contract_spec(symbol: str, overrides: Optional[Dict[str, dict]] = None) 
             point_value=o["point_value"],
             min_size=o.get("min_size", 1.0),
             exchange=o.get("exchange", "CME"),
+            liquid_months=tuple(o.get("liquid_months", ())),
         )
     return MICRO_FUTURES_SPECS.get(symbol)
