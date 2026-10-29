@@ -49,6 +49,30 @@ CREATE TABLE IF NOT EXISTS slave_trades (
     UNIQUE (slave_id, master_ticket, slave_symbol)
 );
 
+CREATE TABLE IF NOT EXISTS engine_positions (
+    slave_id        TEXT    NOT NULL,
+    master_ticket   INTEGER NOT NULL,
+    slave_symbol    TEXT    NOT NULL,
+    slave_ticket    INTEGER NOT NULL,
+    direction       TEXT    NOT NULL,
+    size            REAL    NOT NULL,
+    entry_price     REAL,
+    atr             REAL,
+    sl              REAL,
+    tp              REAL,
+    sl_mult         REAL,                -- ATR multiples the position was opened
+    tp_mult         REAL,                -- with; a roll re-derives stops from these
+    breakeven_done  INTEGER NOT NULL DEFAULT 0,
+    month_slot      INTEGER NOT NULL DEFAULT 0,
+    contract_id     INTEGER,             -- concrete futures contract, not a slot:
+    contract_local  TEXT,                -- slot numbering shifts when the front
+    contract_expiry TEXT,                -- month rolls, an expiry does not
+    sl_order_id     INTEGER,             -- broker-side bracket legs, so they can
+    tp_order_id     INTEGER,             -- be cancelled/replaced after a restart
+    updated_at      REAL    NOT NULL,
+    PRIMARY KEY (slave_id, master_ticket, slave_symbol)
+);
+
 CREATE TABLE IF NOT EXISTS logs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     ts              REAL NOT NULL,

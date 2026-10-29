@@ -355,7 +355,9 @@ class IBKRAdapter(BrokerAdapter):
         logger.info(
             "IBKRAdapter[%s] opened %s %s x%s -> ticket=%s", self.slave_id, action, order.symbol, order.size, slave_ticket
         )
-        return OrderResult(slave_ticket=slave_ticket)
+        return OrderResult(
+            slave_ticket=slave_ticket, sl_order_id=sl_order_id, tp_order_id=tp_order_id
+        )
 
     def _cancel_tracked_order(self, order_id: Optional[int]) -> None:
         if order_id is None:
@@ -521,6 +523,28 @@ class IBKRAdapter(BrokerAdapter):
             contract_id=contract.conId,
             local_symbol=contract.localSymbol,
             expiry=contract.lastTradeDateOrContractMonth,
+        )
+
+    async def restore_position(self, slave_ticket: int, state: dict) -> None:
+        contract_id = state.get("contract_id")
+        symbol = state.get("slave_symbol") or state.get("symbol")
+        if contract_id is None or not symbol:
+            logger.warning(
+                "IBKRAdapter[%s] cannot restore slave_ticket=%s: no contract recorded",
+                self.slave_id, slave_ticket,
+            )
+            return
+        contract = await self._contract_by_id(symbol, int(contract_id))
+        self._positions[slave_ticket] = {
+            "contract": contract,
+            "direction": state["direction"],
+            "size": state["size"],
+            "sl_order_id": state.get("sl_order_id"),
+            "tp_order_id": state.get("tp_order_id"),
+        }
+        logger.info(
+            "IBKRAdapter[%s] restored slave_ticket=%s on %s (%s %s)",
+            self.slave_id, slave_ticket, contract.localSymbol, state["direction"], state["size"],
         )
 
     async def resolve_contract(self, symbol: str, month_slot: int = 0) -> ContractInfo:

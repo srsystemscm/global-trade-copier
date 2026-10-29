@@ -13,6 +13,7 @@ from app.notifier import Notifier
 from app.risk_controls import is_within_trading_hours
 from app.sizing import compute_size, resolve_sizing_config
 from app.contract_roll import roll_sequence, volume_crossover
+from app import position_store
 from app.routing import Route, describe_refusal, resolve_routes
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,34 @@ class AutonomousCopyEngine:
         self._positions: Dict[Tuple[int, str], dict] = {}
         self._consume_task: Optional[asyncio.Task] = None
         self._monitor_task: Optional[asyncio.Task] = None
+
+    async def restore(self) -> None:
+        """Reload positions that were open when the hub last stopped.
+
+        Called before the engine starts consuming signals, so a restart is
+        invisible to a position's lifecycle: the trailing monitor picks it
+        back up and a later CLOSE still finds it.
+        """
+        restored = 0
+        for key, pos in position_store.load_all(self.slave_id):
+            master_ticket, slave_symbol = key
+            try:
+                await self.adapter.restore_position(
+                    pos["slave_ticket"], {**pos, "slave_symbol": slave_symbol}
+                )
+            except Exception as exc:
+                # Keep the engine's own record either way -- losing it would
+                # strand the position entirely. A failed adapter restore just
+                # means the broker-side handle has to be rebuilt later.
+                logger.error(
+                    "slave=%s could not restore adapter state for %s slave_ticket=%s: %s",
+                    self.slave_id, slave_symbol, pos["slave_ticket"], exc,
+                )
+            self._positions[key] = pos
+            restored += 1
+        if restored:
+            logger.info("slave=%s restored %d open position(s) across the restart",
+                        self.slave_id, restored)
 
     def start(self) -> None:
         self._consume_task = asyncio.create_task(self._run(), name=f"autonomous-engine-{self.slave_id}")
@@ -241,7 +270,12 @@ class AutonomousCopyEngine:
             "sl_mult": sl_mult,
             "tp_mult": tp_mult,
             "direction": signal.direction,
+            "sl_order_id": result.sl_order_id,
+            "tp_order_id": result.tp_order_id,
         }
+        position_store.save(
+            self.slave_id, signal.ticket, target_symbol, self._positions[(signal.ticket, target_symbol)]
+        )
         logger.info(
             "slave=%s opened %s master_ticket=%s -> slave_ticket=%s size=%s sl=%s tp=%s",
             self.slave_id, target_symbol, signal.ticket, result.slave_ticket, sizing_result.size, slave_sl, slave_tp,
@@ -269,6 +303,7 @@ class AutonomousCopyEngine:
             await self.adapter.close(mapping.slave_ticket)
             trade_registry.record_close(self.slave_id, signal.ticket, mapping.slave_symbol)
             self._positions.pop((signal.ticket, mapping.slave_symbol), None)
+            position_store.delete(self.slave_id, signal.ticket, mapping.slave_symbol)
             logger.info(
                 "slave=%s closed %s slave_ticket=%s (master closed)",
                 self.slave_id, mapping.slave_symbol, mapping.slave_ticket,
@@ -410,7 +445,10 @@ class AutonomousCopyEngine:
             "contract_id": nxt.contract_id,
             "contract_local": nxt.local_symbol,
             "contract_expiry": nxt.expiry,
+            "sl_order_id": result.sl_order_id,
+            "tp_order_id": result.tp_order_id,
         })
+        position_store.save(self.slave_id, master_ticket, symbol, pos)
 
         logger.info(
             "slave=%s rolled %s %s -> %s: slave_ticket %s -> %s, sl=%s tp=%s (%s)",
@@ -462,6 +500,7 @@ class AutonomousCopyEngine:
         if new_sl is not None and new_sl != pos["sl"]:
             await self.adapter.modify(pos["slave_ticket"], new_sl, pos["tp"])
             pos["sl"] = new_sl
+            position_store.save(self.slave_id, key[0], target_symbol, pos)
             logger.info(
                 "slave=%s trailing %s slave_ticket=%s -> sl=%s",
                 self.slave_id, target_symbol, pos["slave_ticket"], new_sl,

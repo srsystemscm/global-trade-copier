@@ -1,7 +1,7 @@
 import logging
 from typing import List, Optional
 
-from app import trade_registry
+from app import position_store, trade_registry
 from app.adapters.base import AdapterError, BrokerAdapter
 from app.events import EventBus
 
@@ -46,6 +46,11 @@ async def reconcile_slave(
         if row.slave_symbol in live_symbols:
             continue
         trade_registry.record_close(slave_id, row.master_ticket, row.slave_symbol)
+        # Drop the durable engine state too. Leaving it would restore the
+        # position on the next start, and the trailing monitor would then
+        # place a stop for something the broker doesn't hold -- on a flat
+        # account that opens a position rather than protecting one.
+        position_store.delete(slave_id, row.master_ticket, row.slave_symbol)
         logger.warning(
             "slave=%s reconciliation: %s (master_ticket=%s, slave_ticket=%s) was OPEN in the "
             "registry but the broker doesn't have it open -- marked CLOSED",

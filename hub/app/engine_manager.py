@@ -57,6 +57,9 @@ async def start_engine_for_slave(slave: SlaveConfig, bus: SignalBus, events: Eve
         drawdown_alert_pct=settings.drawdown_alert_pct,
         is_paused=lambda: engine.paused,
     )
+    if hasattr(engine, "restore"):
+        await engine.restore()
+
     watchdog.start()
     engine.watchdog = watchdog  # type: ignore[attr-defined]
 

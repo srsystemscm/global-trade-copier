@@ -51,6 +51,10 @@ class OrderRequest:
 class OrderResult:
     slave_ticket: int
     price: Optional[float] = None
+    # Broker-side bracket legs, recorded so they survive a hub restart --
+    # without them a restored position can't have its stop moved or cancelled.
+    sl_order_id: Optional[int] = None
+    tp_order_id: Optional[int] = None
 
 
 @dataclass
@@ -141,6 +145,17 @@ class BrokerAdapter(abc.ABC):
     async def next_contract_after(self, symbol: str, contract_id: int) -> Optional["ContractInfo"]:
         """The next liquid contract after `contract_id`, or None if it's the last."""
         raise NotImplementedError(f"{type(self).__name__} has no contract months")
+
+    async def restore_position(self, slave_ticket: int, state: dict) -> None:
+        """Rebuild this adapter's in-memory bookkeeping for a position that
+        was open before the hub restarted.
+
+        Without it an adapter that tracks positions in memory (IBKR, Schwab)
+        can't modify or close anything it didn't open this process lifetime.
+        Default is a no-op: MT4 holds no per-position state -- it addresses
+        orders by the terminal's own ticket.
+        """
+        return None
 
     async def get_contract_volume(
         self, symbol: str, month_slot: int = 0, contract_id: Optional[int] = None
