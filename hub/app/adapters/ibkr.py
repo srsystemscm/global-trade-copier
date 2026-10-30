@@ -58,6 +58,10 @@ class IBKRAdapter(BrokerAdapter):
     failure modes are observable -- not before.
     """
 
+    # IB Gateway force-restarts daily and this session dies with it. Nothing
+    # in ib_async re-establishes it, so the watchdog has to.
+    requires_session_recovery = True
+
     def __init__(
         self,
         slave_id: str,
@@ -145,8 +149,19 @@ class IBKRAdapter(BrokerAdapter):
 
     async def disconnect(self) -> None:
         if self.ib is not None:
-            self.ib.disconnect()
+            try:
+                self.ib.disconnect()
+            except Exception as exc:
+                # Recovery calls this to clean up a session that is already
+                # dead, which is exactly when disconnect() is most likely to
+                # throw. Dropping the reference is what matters -- connect()
+                # builds a fresh IB() -- so never let this stop a reconnect.
+                logger.debug("IBKRAdapter[%s] disconnect of a dead session: %s", self.slave_id, exc)
             self.ib = None
+            # Qualified contracts are keyed to the old session's conIds. They
+            # survive a reconnect in practice, but re-qualifying is cheap and
+            # a stale handle fails as a rejected order.
+            self._contracts.clear()
 
     def _contract_for(self, symbol: str):
         ib_mod = self._require_ib()

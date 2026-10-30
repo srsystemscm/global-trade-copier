@@ -47,6 +47,25 @@ async def start_engine_for_slave(slave: SlaveConfig, bus: SignalBus, events: Eve
     else:
         engine = CopyEngine(slave.id, adapter, queue, paused=slave.paused, events=events, notifier=notifier)
 
+    async def recover_session() -> None:
+        """Re-run this slave's startup path after its broker session died.
+
+        Deliberately the same three steps in the same order as above --
+        connect, reconcile, restore -- rather than a bare reconnect. Order
+        matters: reconcile marks registry rows CLOSED (and drops their
+        position_store entries) for anything the broker no longer holds, so
+        restore then rebuilds only what is genuinely still open. A position
+        stopped out while the session was down would otherwise come back as
+        live state, and the trailing monitor would place a stop for
+        something the broker doesn't hold -- which on a flat account opens a
+        position rather than protecting one.
+        """
+        await adapter.disconnect()
+        await adapter.connect()
+        await reconcile_slave(slave.id, adapter, account_types, events)
+        if hasattr(engine, "restore"):
+            await engine.restore()
+
     watchdog = SlaveWatchdog(
         slave.id,
         adapter,
@@ -56,6 +75,14 @@ async def start_engine_for_slave(slave: SlaveConfig, bus: SignalBus, events: Eve
         poll_interval=settings.watchdog_poll_interval_seconds,
         drawdown_alert_pct=settings.drawdown_alert_pct,
         is_paused=lambda: engine.paused,
+        # Only adapters holding a stateful session need rebuilding; MT4 and
+        # Schwab recover through their own next call, so leave them exactly
+        # as they were.
+        recover=recover_session if adapter.requires_session_recovery else None,
+        on_session_state=engine.set_session_up,
+        recovery_max_attempts=settings.session_recovery_max_attempts,
+        recovery_base_delay=settings.session_recovery_base_delay,
+        recovery_max_delay=settings.session_recovery_max_delay,
     )
     if hasattr(engine, "restore"):
         await engine.restore()

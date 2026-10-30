@@ -11,6 +11,7 @@ from app.events import EventBus
 from app.models import Signal
 from app.notifier import Notifier
 from app.risk_controls import is_within_trading_hours
+from app.session_gate import SessionGateMixin
 from app.sizing import compute_size, resolve_sizing_config
 from app.contract_roll import roll_sequence, volume_crossover
 from app import position_store
@@ -19,7 +20,7 @@ from app.routing import Route, describe_refusal, resolve_routes
 logger = logging.getLogger(__name__)
 
 
-class AutonomousCopyEngine:
+class AutonomousCopyEngine(SessionGateMixin):
     """Autonomous-mode copy engine: one instance per slave.
 
     Unlike mirror mode, this does not copy the master's absolute SL/TP.
@@ -119,6 +120,8 @@ class AutonomousCopyEngine:
             signal = await self.queue.get()
             if self.paused:
                 logger.debug("slave=%s paused, dropping %s ticket=%s", self.slave_id, signal.action, signal.ticket)
+                continue
+            if await self.refuse_while_down(signal):
                 continue
             try:
                 await self._handle(signal)
@@ -328,15 +331,34 @@ class AutonomousCopyEngine:
         interval = self.risk_config.get("poll_interval_seconds", 15)
         while True:
             await asyncio.sleep(interval)
+
+            # Every check below needs the broker, so there is nothing to do
+            # with a dead session but wait for the watchdog to rebuild it.
+            # Skipping is also what keeps the task alive: a risk check
+            # against a disconnected adapter raises AssertionError, which
+            # isn't an AdapterError, so it would escape the handlers below
+            # and end this task for the life of the process -- taking every
+            # position's trailing stop with it, silently, and not coming
+            # back when the session does.
+            if not self.session_up:
+                logger.debug("slave=%s broker session down, skipping monitor pass", self.slave_id)
+                continue
+
             for key, pos in list(self._positions.items()):
                 try:
                     await self._check_risk(key, pos)
                 except AdapterError as exc:
                     logger.error("slave=%s risk check failed for %s: %s", self.slave_id, key, exc)
+                except Exception:
+                    # Belt and braces for the same failure mode: one bad
+                    # position must not cost every other position its stop.
+                    logger.exception("slave=%s risk check raised for %s", self.slave_id, key)
             try:
                 await self._check_rolls()
             except AdapterError as exc:
                 logger.error("slave=%s roll check failed: %s", self.slave_id, exc)
+            except Exception:
+                logger.exception("slave=%s roll check raised", self.slave_id)
 
     async def _check_rolls(self) -> None:
         """Coordinated per-symbol roll sweep, outermost expiry first.

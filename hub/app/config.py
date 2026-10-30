@@ -35,6 +35,15 @@ class Settings(BaseSettings):
     watchdog_stale_heartbeat_seconds: float = 30.0
     drawdown_alert_pct: float = 0.05
 
+    # Broker session recovery, for adapters with requires_session_recovery.
+    # IB Gateway force-restarts once a day and takes a minute or two to come
+    # back, so the schedule has to outlast that -- otherwise every scheduled
+    # restart reports as an outage. 5s doubling to a 60s ceiling over 8
+    # attempts spans ~5 minutes.
+    session_recovery_max_attempts: int = 8
+    session_recovery_base_delay: float = 5.0
+    session_recovery_max_delay: float = 60.0
+
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_user: str = ""

@@ -8,11 +8,12 @@ from app.events import EventBus
 from app.models import Signal
 from app.notifier import Notifier
 from app.risk_controls import is_within_trading_hours
+from app.session_gate import SessionGateMixin
 
 logger = logging.getLogger(__name__)
 
 
-class CopyEngine:
+class CopyEngine(SessionGateMixin):
     """Mirror-mode copy engine: one instance per slave.
 
     Copies OPEN with the absolute SL/TP the master sent, and follows MODIFY
@@ -58,6 +59,8 @@ class CopyEngine:
             signal = await self.queue.get()
             if self.paused:
                 logger.debug("slave=%s paused, dropping %s ticket=%s", self.slave_id, signal.action, signal.ticket)
+                continue
+            if await self.refuse_while_down(signal):
                 continue
             try:
                 await self._handle(signal)

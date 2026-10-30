@@ -102,6 +102,14 @@ class BrokerAdapter(abc.ABC):
     the dashboard needs live position P&L.
     """
 
+    # True for adapters holding a stateful broker session that, once dropped,
+    # cannot be re-established by the adapter's own next call. The watchdog
+    # rebuilds those; everything else is left alone. MT4Adapter rebuilds its
+    # REQ socket on timeout and Schwab is stateless HTTP, so only IBKR --
+    # whose single TCP session dies on IB Gateway's forced daily restart --
+    # sets this.
+    requires_session_recovery: bool = False
+
     @abc.abstractmethod
     async def connect(self) -> None: ...
 
