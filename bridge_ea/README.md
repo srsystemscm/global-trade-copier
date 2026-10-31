@@ -170,3 +170,135 @@ ZMQ has no built-in authentication or encryption -- anyone who can reach
 plaintext. `deploy/ufw-rules.sh` restricts those ports on the VPS side to
 your MT4 machine's IP; see that script's header comment for the VPN
 alternative if your IP isn't static.
+
+## MT5 slaves: `SlaveBridge.mq5`
+
+`SlaveBridge.mq5` 1.00 is the MT5 port of `SlaveBridge.mq4` 1.03. It speaks
+the identical JSON wire format over the same ZMQ REP socket, so **the hub
+needs no changes at all** -- an MT5 slave still registers as
+`"broker_type": "mt4"` in `hub/config/slaves.json`, because `MT4Adapter` is
+pure JSON-over-ZMQ REQ/REP and never calls anything MT4-specific.
+
+It is not a transliteration. MQL5 has none of `OrderSend()`, `OrderClose()`,
+`OrderModify()`, `OrderSelect()`, `MarketInfo()`, `OrdersTotal()` or
+`OrderProfit()`, so all five handlers are rebuilt around `MqlTradeRequest`
+and the position API. The places where a literal port would be *silently*
+wrong are marked `PORT NOTE` in the source. The two that matter most:
+
+- **A closed position is simply absent in MQL5.** In MQL4,
+  `OrderSelect(ticket, SELECT_BY_TICKET)` searches history too, so
+  `OrderCloseTime() > 0` identifies a hand-closed leg -- which is how 1.02
+  reports it as success instead of an error. `PositionSelectByTicket()` has
+  no such fallback, so the port adds `HistorySelectByPosition()` to tell
+  "closed" from "never existed". Without it every hand-closed leg returns an
+  error and strands its Trade Registry row at `OPEN` forever.
+- **`MqlTradeResult` carries no position ticket**, and the hub keys every
+  later MODIFY/CLOSE on whatever OPEN returns. On a hedging account it
+  equals the opening order's ticket, but the position can lag the
+  `OrderSend()` return, so `ResolvePositionTicket()` waits for it and falls
+  back to the deal's `DEAL_POSITION_ID`.
+
+### The slave MT5 account must be in hedging mode
+
+MT4 accounts are always hedging: every `OrderSend` makes its own independent
+ticket. An MT5 account can be **netting**, where one symbol holds at most
+one position -- a second BUY merges into it and a SELL reduces it.
+
+That breaks the copier's model outright, not cosmetically. `slave_trades` is
+keyed `UNIQUE(slave_id, master_ticket, slave_symbol)` and
+`get_open_mappings()` hands the engine exactly one `slave_ticket` per master
+ticket. On a netting account two master tickets in the same symbol collapse
+onto one position, so closing the first closes the second master's volume
+too, and an opposite-direction signal silently nets an existing leg away.
+
+`OnInit` reads `ACCOUNT_MARGIN_MODE` and refuses to start on anything but
+`ACCOUNT_MARGIN_MODE_RETAIL_HEDGING`. `AllowNettingAccount=true` overrides
+that with a loud warning; it is only safe with one open position per symbol
+at a time.
+
+### mql-zmq needs a one-word patch to compile under MQL5
+
+mql-zmq ships 64-bit DLLs under `Library/MT5`, but its **headers do not
+compile with the MQL5 compiler as shipped** -- upstream included. Every
+`zmq_*` import that takes a C string declares it `const char &[]`, while the
+MQL-side buffer comes from `StringToUtf8(..., uchar &[])`. MQL4 allows that
+implicit array conversion; MQL5 rejects it with `error 246: parameter
+convertion type 'char[]' to 'const uchar[] &' is not allowed`, 26 times,
+all of them inside mql-zmq rather than in your EA.
+
+`char` and `uchar` are both one byte, so aligning them changes nothing on
+the wire. From the `Include/Zmq` directory of your MQL5 tree:
+
+```powershell
+Get-ChildItem *.mqh | ForEach-Object {
+  $r = New-Object System.IO.StreamReader($_.FullName, $true)
+  $text = $r.ReadToEnd(); $enc = $r.CurrentEncoding; $r.Close()
+  [System.IO.File]::WriteAllText($_.FullName, ($text -replace '\bchar\b','uchar'), $enc)
+}
+```
+
+Letting StreamReader detect the encoding is not optional: `Zmq.mqh`
+ships as **UTF-16LE** while its siblings are ASCII, so a naive text
+rewrite either mangles it or skips it silently -- and skipping it leaves
+exactly one error (`zmq_has`) behind.
+
+The 20 substituted lines are the `zmq_bind` / `zmq_connect` / `zmq_unbind` /
+`zmq_disconnect` / `zmq_socket_monitor` / `zmq_msg_gets` / `zmq_has` /
+`zmq_z85_*` / `zmq_curve_*` imports and the local `char arr[]` / `char str[]`
+/ `char buf[]` buffers that feed them.
+
+### Install
+
+1. mql-zmq includes -> `MQL5/Include/Zmq/` and `MQL5/Include/Mql/Lang/`,
+   then apply the patch above.
+2. `Library/MT5` `libzmq.dll` + `libsodium.dll` -> `MQL5/Libraries/`.
+   **MT5 is 64-bit: the MT4 DLLs are 32-bit and will not load.**
+3. Visual C++ 2015 redistributable, as for MT4.
+4. Tools > Options > Expert Advisors > Allow DLL imports.
+5. AutoTrading on, and "Allow Algo Trading" on for the EA -- otherwise every
+   trade fails with retcode 10027 while everything else looks healthy. The
+   EA warns about both at start-up rather than failing, since they are
+   checkbox state you can flip after attaching.
+6. Attach to a chart and check Experts for
+   `SlaveBridge.mq5 1.00 listening on tcp://*:5560`, which also prints the
+   account number and its margin mode.
+
+Command-line compile (the log is UTF-16):
+
+```bash
+metaeditor64.exe /compile:"<path to .mq5>" /include:"<MQL5 dir>" /log:"<logfile>"
+```
+
+### `SlaveBridge.mq5` inputs
+
+| Input | Default | Purpose |
+|---|---|---|
+| `HubCommandPort` | `5560` | REP port this EA binds -- must match the `port` set for this slave in `hub/config/slaves.json` |
+| `PollIntervalMs` | `100` | How often to poll for a command |
+| `Slippage` | `5` | `deviation` (points) on market orders |
+| `MagicNumber` | `0` | Stamped on every copier position |
+| `AllowNettingAccount` | `false` | Overrides the hedging-only guard; read the section above first |
+
+### Two things mirror mode does not do for you
+
+Neither is new to MT5, but both were invisible while master and slave were
+two terminals at the same broker:
+
+- **No symbol translation.** `CopyEngine` passes the master's symbol string
+  through verbatim, so an MT4 master trading `XAUUSD` against an MT5 broker
+  calling it `XAUUSD.r` or `GOLD` is a rejected order. The EA names this
+  case explicitly instead of returning a bare retcode, and `SymbolSelect()`
+  handles the Market Watch half. `app/symbol_mapper.py` exists but mirror
+  mode never calls it -- wiring that in is a hub change, not an EA one.
+- **No lot scaling.** `size = signal.lots`, 1:1. The port rounds to the
+  symbol's `SYMBOL_VOLUME_STEP` and **refuses** anything outside its
+  min/max rather than clamping: a master `0.01` against a slave minimum of
+  `0.10` would otherwise silently trade ten times the intended risk.
+
+### Status
+
+Compiles clean (0 errors, 0 warnings) against the patched includes with
+MetaEditor 5 x64. **Never run against a live terminal or a real account** --
+no OPEN, MODIFY, CLOSE or POSITIONS command has been executed by this EA
+yet, and the hedging guard, fill-mode selection and position-ticket
+resolution are all first-run-untested.
