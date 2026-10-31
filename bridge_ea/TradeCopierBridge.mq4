@@ -16,8 +16,15 @@
 //| - Copy Zmq.mqh (and its dependencies) into MQL4/Include/Zmq/       |
 //| - Copy libzmq.dll + libsodium.dll into MQL4/Libraries/              |
 //| - Enable "Allow DLL imports" for this EA                           |
+//|                                                                    |
+//| Versions (bump both lines below with every change):                |
+//|   1.00 2026-08-26 initial build                                    |
+//|   1.01 2026-09-10 fixes from the first real terminal shakeout      |
+//|   1.02 2026-10-29 magic number carried through the signal          |
 //+------------------------------------------------------------------+
 #property strict
+#property version   "1.02"
+#define   BRIDGE_VERSION "1.02"
 
 #include <Zmq/Zmq.mqh>
 
@@ -70,7 +77,7 @@ int OnInit()
    pubSocket.connect(pubAddr);
    pushSocket.connect(pushAddr);
 
-   Print("TradeCopierBridge connected: PUB->", pubAddr, "  PUSH->", pushAddr);
+   Print("TradeCopierBridge ", BRIDGE_VERSION, " connected: PUB->", pubAddr, "  PUSH->", pushAddr);
 
    TakeSnapshot(knownOrders);
    EventSetMillisecondTimer(PollIntervalMs);

@@ -9,8 +9,16 @@
 //| - Copy Zmq.mqh (and its dependencies) into MQL4/Include/Zmq/       |
 //| - Copy libzmq.dll + libsodium.dll into MQL4/Libraries/              |
 //| - Enable "Allow DLL imports" for this EA                           |
+//|                                                                    |
+//| Versions (bump both lines below with every change):                |
+//|   1.00 2026-08-26 initial build                                    |
+//|   1.01 2026-09-10 fixes from the first real terminal shakeout      |
+//|   1.02 2026-09-10 an already-closed leg counts as success          |
+//|   1.03 2026-10-16 POSITIONS command (reconciliation, live P&L)     |
 //+------------------------------------------------------------------+
 #property strict
+#property version   "1.03"
+#define   BRIDGE_VERSION "1.03"
 
 #include <Zmq/Zmq.mqh>
 
@@ -39,7 +47,7 @@ int OnInit()
             "attach, is still holding that port. Restart the terminal.");
       return(INIT_FAILED);
      }
-   Print("SlaveBridge listening on ", addr);
+   Print("SlaveBridge ", BRIDGE_VERSION, " listening on ", addr);
    EventSetMillisecondTimer(PollIntervalMs);
    return(INIT_SUCCEEDED);
   }

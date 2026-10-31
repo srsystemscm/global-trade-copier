@@ -1,5 +1,10 @@
 # Bridge EAs (Phase 6)
 
+**Versions:** each EA carries `#property version` and `BRIDGE_VERSION`
+(same value), printed in the Experts log on start-up, with a version history
+in its header comment. Current: `TradeCopierBridge` 1.02, `SlaveBridge` 1.03.
+Bump both lines in the EA with every change.
+
 Two EAs, one per role:
 
 - `TradeCopierBridge.mq4` -- runs on the **master** account. Snapshots open
