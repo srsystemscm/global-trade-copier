@@ -238,3 +238,23 @@ def test_the_columns_are_added_to_an_existing_table():
     assert row is not None, "the existing row was lost"
     assert row["slave_ticket"] == 42
     assert row["slave_price"] is None
+
+
+def test_an_unknown_master_exit_is_recorded_as_absent_not_zero():
+    """TradeCopierBridge 1.03 sends price=0 on a CLOSE when it cannot find
+    the order in the history pool. Stored literally that is not a missing
+    value, it is an outlier the size of the instrument -- a 4029-point
+    round trip on a gold trade."""
+    broker = FakeBroker(fill_price=4029.57, close_price=4055.10)
+    _journey(broker, [_open(), _open(action="CLOSE", price=0.0)])
+
+    row = _row()
+    assert row["status"] == "CLOSED"
+    assert row["master_close_price"] is None
+    assert row["slave_close_price"] == 4055.10, "the slave's own exit is still captured"
+
+
+def test_a_real_master_exit_is_still_recorded():
+    broker = FakeBroker(fill_price=4029.57, close_price=4055.10)
+    _journey(broker, [_open(), _open(action="CLOSE", price=4055.00)])
+    assert _row()["master_close_price"] == 4055.00

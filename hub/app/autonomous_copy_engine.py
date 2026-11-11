@@ -324,7 +324,9 @@ class AutonomousCopyEngine(SessionGateMixin):
             slave_close = await self.adapter.close(mapping.slave_ticket)
             trade_registry.record_close(
                 self.slave_id, signal.account, signal.ticket, mapping.slave_symbol,
-                master_close_price=signal.price,
+                # 0 means the EA could not determine the exit; recorded as
+                # "not captured" rather than as a price of zero.
+                master_close_price=signal.price or None,
                 slave_close_price=slave_close,
             )
             self._positions.pop((signal.account, signal.ticket, mapping.slave_symbol), None)

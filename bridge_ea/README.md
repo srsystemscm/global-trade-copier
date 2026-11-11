@@ -2,7 +2,7 @@
 
 **Versions:** each EA carries `#property version` and `BRIDGE_VERSION`
 (same value), printed in the Experts log on start-up, with a version history
-in its header comment. Current: `TradeCopierBridge` 1.02, `SlaveBridge` 1.05 (.mq4) /
+in its header comment. Current: `TradeCopierBridge` 1.03, `SlaveBridge` 1.05 (.mq4) /
 1.02 (.mq5).
 Bump both lines in the EA with every change.
 

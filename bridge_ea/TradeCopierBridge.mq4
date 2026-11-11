@@ -21,10 +21,11 @@
 //|   1.00 2026-08-26 initial build                                    |
 //|   1.01 2026-09-10 fixes from the first real terminal shakeout      |
 //|   1.02 2026-10-29 magic number carried through the signal          |
+//|   1.03 2026-11-11 CLOSE publishes the exit price, not the entry    |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.02"
-#define   BRIDGE_VERSION "1.02"
+#property version   "1.03"
+#define   BRIDGE_VERSION "1.03"
 
 #include <Zmq/Zmq.mqh>
 
@@ -181,8 +182,28 @@ void DiffAndPublish(OrderSnapshot &prev[], OrderSnapshot &curr[])
    // closed
    for(int i = 0; i < ArraySize(prev); i++)
      {
-      if(FindByTicket(curr, prev[i].ticket) < 0)
-         PublishSignal("CLOSE", prev[i]);
+      if(FindByTicket(curr, prev[i].ticket) >= 0)
+         continue;
+
+      // prev[i].price is OrderOpenPrice() -- the ENTRY. Publishing that on a
+      // CLOSE reported every exit as its own entry, which is worse than
+      // useless because it looks plausible: every round trip appears to have
+      // made exactly nothing, and the copy's round-trip variance cannot be
+      // measured at all. Found on the first live MT4 -> MT5 run.
+      //
+      // OrderSelect(SELECT_BY_TICKET) searches the history pool as well as
+      // open trades, so once the order is gone from the open list its real
+      // exit is there to be read.
+      OrderSnapshot closed;
+      closed = prev[i];
+      closed.price = 0.0;   // 0 = "unknown", which the hub stores as NULL
+      if(OrderSelect(prev[i].ticket, SELECT_BY_TICKET) && OrderCloseTime() > 0)
+         closed.price = OrderClosePrice();
+      else
+         Print("TradeCopierBridge: no close price for ticket ", prev[i].ticket,
+               " -- reporting it as unknown rather than guessing");
+
+      PublishSignal("CLOSE", closed);
      }
   }
 

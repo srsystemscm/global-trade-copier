@@ -147,7 +147,9 @@ class CopyEngine(SessionGateMixin):
                 slave_close = await self.adapter.close(mapping.slave_ticket)
                 trade_registry.record_close(
                     self.slave_id, signal.account, signal.ticket, mapping.slave_symbol,
-                    master_close_price=signal.price,
+                    # 0 means the EA could not determine the exit; recorded as
+                    # "not captured" rather than as a price of zero.
+                    master_close_price=signal.price or None,
                     slave_close_price=slave_close,
                 )
                 logger.info("slave=%s closed slave_ticket=%s", self.slave_id, mapping.slave_ticket)
