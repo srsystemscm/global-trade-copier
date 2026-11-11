@@ -72,6 +72,11 @@ input bool   DoMaeModify         = true;
 //--- one -- no MODIFY signal at all, which is the opposite of the point.
 input int    MAE_DELAY_MS        = 1500;
 
+//--- Hold the position this long after the MAE modify, then close it, so a
+//--- single run produces the whole OPEN -> MODIFY -> CLOSE sequence the
+//--- copier has to carry. 0 leaves the trade open.
+input int    CloseAfterMs        = 5000;
+
 //--- fxDreema's POINT_FORMAT_RULES, which decide what a "pip" is
 input string POINT_FORMAT_RULES  = "0.001=0.01,0.00001=0.0001,0.000001=0.0001";
 
@@ -160,25 +165,38 @@ void OnStart()
          DoubleToStr(op, digits), "  sl=", DoubleToStr(oldSl, digits),
          "  tp=", DoubleToStr(OrderTakeProfit(), digits), "  magic=", magic);
 
+   //--- Deliberately no early returns from here on: whatever happens to the
+   //--- MAE step, the position still has to be closed, or a skipped modify
+   //--- would silently leave a live trade behind.
    if(!DoMaeModify)
-     {
       Print("MAE modify skipped (DoMaeModify = false)");
-      return;
-     }
-   if(oldSl <= 0.0)
-     {
+   else if(oldSl <= 0.0)
       Print("MAE modify skipped: the order has no stop to widen.");
-      return;
+   else
+     {
+      //--- Let the master bridge EA observe the original stop first.
+      Sleep(MAE_DELAY_MS);
+      DoMaeStep(ticket, op, oldSl, type, symbol, digits);
      }
 
-   //--- Let the master bridge EA observe the original stop first.
-   Sleep(MAE_DELAY_MS);
+   if(CloseAfterMs > 0)
+     {
+      Sleep(CloseAfterMs);
+      CloseTicket(ticket, symbol, digits);
+     }
+   else
+      Print("Leaving ticket ", ticket, " open (CloseAfterMs = 0)");
+  }
 
-   //--- blocks 4302 / 4319: NewSLTPmode "percent", RelativeTo "openprice".
-   //--- For a buy  : SL = OP - (OP - oldSL) * pct / 100
-   //--- For a sell : SL = OP + (oldSL - OP) * pct / 100
-   //--- Both are "scale the existing stop DISTANCE by pct", which is why 200
-   //--- widens rather than tightens.
+//+------------------------------------------------------------------+
+//| blocks 4302 / 4319: NewSLTPmode "percent", RelativeTo "openprice" |
+//|   buy : SL = OP - (OP - oldSL) * pct / 100                        |
+//|   sell: SL = OP + (oldSL - OP) * pct / 100                        |
+//| Both scale the existing stop DISTANCE by pct, which is why 200    |
+//| widens rather than tightens.                                      |
+//+------------------------------------------------------------------+
+void DoMaeStep(int ticket, double op, double oldSl, int type, string symbol, int digits)
+  {
    double newSl;
    if(GoLong)
       newSl = op - ((op - oldSl) * MAE_DISTANCE / 100.0);
@@ -210,6 +228,42 @@ void OnStart()
          "  (distance ", DoubleToStr(MathAbs(op - oldSl), digits), " -> ",
          DoubleToStr(MathAbs(op - newSl), digits),
          ", ", MAE_DISTANCE, "% of the original)");
+  }
+
+//+------------------------------------------------------------------+
+//| Close at market, so the run ends flat and the copier sees a CLOSE |
+//| rather than a position left hanging on both accounts.             |
+//+------------------------------------------------------------------+
+void CloseTicket(int ticket, string symbol, int digits)
+  {
+   if(!OrderSelect(ticket, SELECT_BY_TICKET))
+     {
+      Print("ERROR: could not select ticket ", ticket, " to close it. ",
+            "CHECK THE ACCOUNT -- it may still be open.");
+      return;
+     }
+   if(OrderCloseTime() > 0)
+     {
+      Print("CLOSE skipped: ticket ", ticket, " is already closed (stop hit?).");
+      return;
+     }
+
+   double price = (OrderType() == OP_BUY) ? MarketInfo(symbol, MODE_BID)
+                                          : MarketInfo(symbol, MODE_ASK);
+
+   if(!OrderClose(ticket, OrderLots(), NormalizeDouble(price, digits),
+                  (int)(SPREAD_SLIPPAGE * PipValue(symbol)), clrDeepPink))
+     {
+      Print("ERROR: OrderClose failed: ", GetLastError(),
+            " -- ticket ", ticket, " IS STILL OPEN, close it by hand.");
+      return;
+     }
+
+   if(OrderSelect(ticket, SELECT_BY_TICKET))
+      Print("CLOSE ticket=", ticket, " @ ", DoubleToStr(OrderClosePrice(), digits),
+            "  profit=", DoubleToStr(OrderProfit(), 2));
+   else
+      Print("CLOSE ticket=", ticket, " done");
   }
 
 
