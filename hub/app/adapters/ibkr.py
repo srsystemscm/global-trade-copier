@@ -108,6 +108,8 @@ class IBKRAdapter(BrokerAdapter):
         market_data_type: Optional[int] = None,
         quote_timeout: float = 1.0,
         bracket_tif: str = "GTC",
+        entry_tif: str = "DAY",
+        fill_timeout: float = 10.0,
         account: Optional[str] = None,
     ) -> None:
         self.slave_id = slave_id
@@ -130,6 +132,19 @@ class IBKRAdapter(BrokerAdapter):
         # a GUI preset the code can't see means a fresh Gateway install
         # regresses it without a trace.
         self.bracket_tif = bracket_tif
+        # Time in force for the ENTRY, stated explicitly for the same reason
+        # the brackets are: left unset, IBKR's account preset supplies DAY
+        # and reports it as "Error 10349", cancelling the order and
+        # re-creating it before it fills. The fill survives that, but the
+        # order passes through Cancelled on the way, so anything watching
+        # order state sees a failure that isn't one. DAY is what the preset
+        # was imposing anyway, and it is what an entry should have: a market
+        # order that cannot fill is better off expiring than resting.
+        self.entry_tif = entry_tif
+        # How long to wait for the fill before recording the trade without a
+        # price. The order is live at the broker either way -- a timeout here
+        # means "no price captured", never "no position".
+        self.fill_timeout = fill_timeout
         # Which of the login's accounts this slave trades. Empty means
         # "work it out at connect time" -- see _resolve_account().
         self.account = account or ""
@@ -380,6 +395,7 @@ class IBKRAdapter(BrokerAdapter):
         else:
             entry = ib_mod.MarketOrder(action, order.size)
         entry.outsideRth = order.outside_rth
+        entry.tif = self.entry_tif
         trade = self._place(contract, entry)
         slave_ticket = trade.order.orderId
 
@@ -427,11 +443,15 @@ class IBKRAdapter(BrokerAdapter):
                     "UNPROTECTED on that side. %s",
                     self.slave_id, label, slave_ticket, status, why,
                 )
+        fill_price, fill_size = await self._await_fill(trade, "entry")
         logger.info(
-            "IBKRAdapter[%s] opened %s %s x%s -> ticket=%s", self.slave_id, action, order.symbol, order.size, slave_ticket
+            "IBKRAdapter[%s] opened %s %s x%s -> ticket=%s%s",
+            self.slave_id, action, order.symbol, order.size, slave_ticket,
+            "" if fill_price is None else " filled %s @ %s" % (fill_size, fill_price),
         )
         return OrderResult(
-            slave_ticket=slave_ticket, sl_order_id=sl_order_id, tp_order_id=tp_order_id
+            slave_ticket=slave_ticket, price=fill_price, lots=fill_size,
+            sl_order_id=sl_order_id, tp_order_id=tp_order_id,
         )
 
     def _cancel_tracked_order(self, order_id: Optional[int]) -> None:
@@ -472,7 +492,7 @@ class IBKRAdapter(BrokerAdapter):
         pos["sl_order_id"] = sl_order_id
         pos["tp_order_id"] = tp_order_id
 
-    async def close(self, slave_ticket: int) -> None:
+    async def close(self, slave_ticket: int) -> Optional[float]:
         ib_mod = self._require_ib()
         assert self.ib is not None, "adapter not connected"
         pos = self._positions.get(slave_ticket)
@@ -484,8 +504,47 @@ class IBKRAdapter(BrokerAdapter):
 
         closing_action = "SELL" if pos["direction"] == "BUY" else "BUY"
         closing_order = ib_mod.MarketOrder(closing_action, pos["size"])
-        self._place(pos["contract"], closing_order)
+        closing_order.tif = self.entry_tif
+        trade = self._place(pos["contract"], closing_order)
+        # Dropped before awaiting the fill, deliberately: the position is
+        # gone from IBKR's point of view the moment the closing order is
+        # accepted, and a second CLOSE arriving during the wait must not
+        # place a second closing order.
         del self._positions[slave_ticket]
+        fill_price, _ = await self._await_fill(trade, "close")
+        return fill_price
+
+    async def _await_fill(self, trade, label: str):
+        """Wait briefly for `trade` to fill, returning (price, size).
+
+        Returns (None, None) if it hasn't filled in time. That is not a
+        failure: the order is live at the broker, and the caller has already
+        recorded the position. It only means the registry stores no fill
+        price for this leg -- variance capture reads it as missing rather
+        than as zero.
+
+        Deliberately keyed on the fill rather than on a terminal order
+        status. IBKR's own preset handling cancels an order and re-creates it
+        (Error 10349), so the status passes through "Cancelled" on a
+        perfectly good order; waiting on status would either abort on that or
+        have to second-guess which cancels are real. A fill is unambiguous.
+        """
+        deadline = time.monotonic() + self.fill_timeout
+        while time.monotonic() < deadline:
+            status = trade.orderStatus
+            if trade.fills and status.avgFillPrice:
+                return float(status.avgFillPrice), float(status.filled)
+            # Yield to ib_async's reader so order/exec callbacks can land.
+            await asyncio.sleep(0.05)
+
+        logger.warning(
+            "IBKRAdapter[%s] %s order %s not filled within %.1fs (status=%s) -- "
+            "recording the trade without a fill price; the order is still live "
+            "at the broker",
+            self.slave_id, label, trade.order.orderId, self.fill_timeout,
+            trade.orderStatus.status,
+        )
+        return None, None
 
     async def get_status(self) -> bool:
         return self.ib is not None and self.ib.isConnected()
