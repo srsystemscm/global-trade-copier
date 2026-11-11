@@ -90,11 +90,17 @@ function toOrders(trades, { start, end }) {
     if (t.action === "MODIFY") o.modifies += 1;
     if (t.action === "CLOSE") o.closedAt = t.received_at;
 
-    // The latest levels the master asked for. A CLOSE repeats whatever was
-    // on the order, so it must not overwrite them with nothing.
+    // The latest levels the master asked for. Taken from OPEN and MODIFY
+    // only: a CLOSE carries whatever happened to be on the order and must
+    // not overwrite them.
+    //
+    // null from a MODIFY is meaningful and must be kept -- that is how the
+    // master says it REMOVED a level. Skipping nulls here left a removed
+    // take-profit still showing in the column, so the view claimed a target
+    // the position no longer had.
     if (t.action !== "CLOSE") {
-      if (t.sl !== null && t.sl !== undefined) o.sl = t.sl;
-      if (t.tp !== null && t.tp !== undefined) o.tp = t.tp;
+      o.sl = t.sl ?? null;
+      o.tp = t.tp ?? null;
     }
     if (t.slave_copies?.length) o.copies = t.slave_copies;
   }
