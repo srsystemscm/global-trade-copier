@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api_routes import router as api_router
 from app.config import settings
 from app.db import init_db
-from app.engine_manager import start_engine_for_slave, stop_engine
+from app.engine_manager import start_engines, stop_engine
 from app.events import EventBus
 from app.logging_config import setup_logging
 from app.notifier import Notifier
@@ -46,9 +46,7 @@ async def lifespan(app: FastAPI):
     )
     master_watchdog.start()
 
-    engines = [
-        await start_engine_for_slave(slave, bus, events, notifier) for slave in load_enabled_slaves()
-    ]
+    engines = await start_engines(load_enabled_slaves(), bus, events, notifier)
 
     app.state.bus = bus
     app.state.receiver = receiver

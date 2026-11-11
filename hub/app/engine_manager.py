@@ -95,6 +95,40 @@ async def start_engine_for_slave(slave: SlaveConfig, bus: SignalBus, events: Eve
     return engine
 
 
+async def start_engines(
+    slaves: List[SlaveConfig], bus: SignalBus, events: EventBus, notifier: Notifier
+) -> List[Engine]:
+    """Start every enabled slave, surviving the ones that cannot start.
+
+    One unreachable broker must not stop the hub. This ran as a bare list
+    comprehension, so a single adapter raising at connect -- IB Gateway not
+    up yet, an MT4 terminal not launched -- aborted startup entirely and
+    took every other slave's copying down with it, including ones whose
+    brokers were perfectly fine.
+
+    That is not a rare case on a VPS: the hub and IB Gateway both start at
+    boot and the hub routinely wins the race, and Gateway's forced daily
+    restart hands it the same situation every day.
+
+    A slave that fails here is loud rather than silent -- it keeps showing in
+    GET /status, because that reads the slave table rather than this list, so
+    it appears as present and disconnected rather than quietly vanishing.
+    """
+    engines: List[Engine] = []
+    for slave in slaves:
+        try:
+            engines.append(await start_engine_for_slave(slave, bus, events, notifier))
+        except Exception:
+            logger.exception("slave=%s failed to start; the hub is running WITHOUT it", slave.id)
+            await events.emit({"type": "slave_start_failed", "slave_id": slave.id})
+            await notifier.notify(
+                "slave_start_failed",
+                f"Slave {slave.id} did not start and is NOT copying -- check the hub log",
+                slave_id=slave.id,
+            )
+    return engines
+
+
 async def stop_engine(engine: Engine, bus: SignalBus) -> None:
     watchdog: Optional[SlaveWatchdog] = getattr(engine, "watchdog", None)
     if watchdog is not None:
