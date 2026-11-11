@@ -125,3 +125,30 @@ def test_override_can_supply_a_cycle():
         "GC": {"tick_size": 0.1, "tick_value": 10.0, "point_value": 100.0,
                "exchange": "COMEX", "liquid_months": [6, 12]}})
     assert tuple(spec.liquid_months) == (6, 12)
+
+
+def test_micro_ether_matches_cme():
+    """0.10 ether per contract, 0.50 index-point tick worth $0.05. Several
+    third-party fact cards quote $0.10 or $0.005 a tick; CME's own spec is
+    the one that decides what an order is worth."""
+    from app.contract_specs import get_contract_spec
+
+    met = get_contract_spec("MET")
+    assert met is not None, "MET is unroutable without a spec"
+    assert met.tick_size == 0.50
+    assert met.tick_value == 0.05
+    assert met.point_value == 0.10
+    assert met.exchange == "CME"
+    # 0.50 index points x $0.10 per point == $0.05 a tick. If these three
+    # ever stop agreeing, one of them has been edited in isolation.
+    assert met.tick_size * met.point_value == pytest.approx(met.tick_value)
+
+
+def test_crypto_has_no_dead_serial_months():
+    """Gold's cycle exists because its serial months are near-dead. Crypto
+    lists consecutive months, so constraining it would route a strategy
+    away from the front month rather than toward it."""
+    from app.contract_specs import get_contract_spec
+
+    assert get_contract_spec("MET").liquid_months == ()
+    assert get_contract_spec("MGC").liquid_months != ()

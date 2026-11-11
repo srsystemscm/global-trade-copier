@@ -35,6 +35,18 @@ MICRO_FUTURES_SPECS: Dict[str, ContractSpec] = {
     "MYM": ContractSpec("MYM", tick_size=1.00, tick_value=0.50, point_value=0.50, exchange="CBOT", liquid_months=(3, 6, 9, 12)),   # Micro E-mini Dow
     "M2K": ContractSpec("M2K", tick_size=0.10, tick_value=0.50, point_value=5.0, exchange="CME", liquid_months=(3, 6, 9, 12)),     # Micro E-mini Russell 2000
     "MCL": ContractSpec("MCL", tick_size=0.01, tick_value=1.00, point_value=100.0, exchange="NYMEX"), # Micro WTI Crude Oil
+    # Micro Ether: 0.10 ether per contract, 0.50 index-point tick worth
+    # 0.10 x 0.50 = $0.05, so a 1.00 move in ETH is $0.10. Verified against
+    # CME's own contract spec -- several third-party fact cards quote $0.10
+    # or $0.005 a tick and are wrong. Calendar spreads and BTIC tick finer
+    # (0.10 index points, $0.01), which this does not model: the copier only
+    # ever sends outrights.
+    #
+    # liquid_months is empty rather than a cycle. Crypto futures list
+    # consecutive months and the front one carries the volume, unlike gold
+    # where the serial months are near-dead and routing to "the next expiry"
+    # would park a strategy in one.
+    "MET": ContractSpec("MET", tick_size=0.50, tick_value=0.05, point_value=0.10, exchange="CME"),
 
     # Full-size. GC is 100 troy oz -- 10x MGC, so roughly $430k notional per
     # contract at $4,300 gold. Size it deliberately; dollar_notional will
