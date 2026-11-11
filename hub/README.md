@@ -110,6 +110,36 @@ is not a second login. When inspecting the hub's orders from a separate
 script, use `reqAllOpenOrdersAsync()`; `openTrades()` only shows the calling
 client's own orders, which makes a protected position look naked.
 
+### Several IBKR accounts behind one Gateway
+
+One Gateway login can hold several accounts, and that is the supported shape
+for a fleet of masters: one Gateway, one slave per account, each slave on its
+own `clientId`. Separate IBKR *logins* are a different matter and still need
+their own Gateway instance on its own port.
+
+Each such slave must say which account it trades:
+
+```json
+{ "id": "ibkr-strat-a", "broker_type": "ibkr",
+  "config": { "host": "127.0.0.1", "port": 4002, "client_id": 1,
+              "account": "DU1234567" } }
+```
+
+`connect()` refuses to start a slave that leaves `account` unset on a login
+holding more than one, because only the first of the three consequences is
+visible:
+
+- IBKR rejects an order that does not name an account.
+- `accountSummary()` returns every account's rows together, keyed by tag, so
+  the last one silently wins -- and that equity is what `max_risk_pct`
+  sizing and the drawdown watchdog read. Sizing off a sibling account's
+  equity produces perfectly plausible orders of the wrong size.
+- `positions()` likewise spans all accounts, so reconciliation reads a
+  sibling account's positions as untracked positions on this slave.
+
+A single-account login needs no `account` and gets pinned to the one it
+finds, so the reads name an account rather than relying on IBKR's default.
+
 ## Architecture (Phase 6 additions: deployment + IBKR)
 
 - `app/adapters/ibkr.py` -- `IBKRAdapter`, talking to Interactive Brokers

@@ -71,6 +71,7 @@ class IBKRAdapter(BrokerAdapter):
         market_data_type: Optional[int] = None,
         quote_timeout: float = 1.0,
         bracket_tif: str = "GTC",
+        account: Optional[str] = None,
     ) -> None:
         self.slave_id = slave_id
         self.host = host
@@ -92,6 +93,9 @@ class IBKRAdapter(BrokerAdapter):
         # a GUI preset the code can't see means a fresh Gateway install
         # regresses it without a trace.
         self.bracket_tif = bracket_tif
+        # Which of the login's accounts this slave trades. Empty means
+        # "work it out at connect time" -- see _resolve_account().
+        self.account = account or ""
         self.ib = None  # the client instance (ib_async.IB), created in connect()
         # (symbol, month_slot) -> qualified contract
         self._contracts: Dict[tuple, object] = {}
@@ -133,6 +137,7 @@ class IBKRAdapter(BrokerAdapter):
             raise AdapterConnectionError(
                 f"could not connect to IBKR TWS/Gateway at {self.host}:{self.port}: {exc}"
             ) from exc
+        await self._resolve_account()
         if self.market_data_type is not None:
             self.ib.reqMarketDataType(self.market_data_type)
             logger.info(
@@ -322,7 +327,7 @@ class IBKRAdapter(BrokerAdapter):
             )
 
         entry = ib_mod.MarketOrder(action, order.size)
-        trade = self.ib.placeOrder(contract, entry)
+        trade = self._place(contract, entry)
         slave_ticket = trade.order.orderId
 
         sl_order_id = tp_order_id = None
@@ -332,12 +337,12 @@ class IBKRAdapter(BrokerAdapter):
                 sl_order = self._protective(ib_mod.StopOrder(closing_action, order.size, sl_price))
                 sl_order.ocaGroup = oca_group
                 sl_order.ocaType = 1  # cancel the sibling order(s) once one fills
-                sl_order_id = self.ib.placeOrder(contract, sl_order).order.orderId
+                sl_order_id = self._place(contract, sl_order).order.orderId
             if tp_price is not None:
                 tp_order = self._protective(ib_mod.LimitOrder(closing_action, order.size, tp_price))
                 tp_order.ocaGroup = oca_group
                 tp_order.ocaType = 1
-                tp_order_id = self.ib.placeOrder(contract, tp_order).order.orderId
+                tp_order_id = self._place(contract, tp_order).order.orderId
 
         self._positions[slave_ticket] = {
             "contract": contract,
@@ -400,14 +405,14 @@ class IBKRAdapter(BrokerAdapter):
             )
             sl_order.ocaGroup = oca_group
             sl_order.ocaType = 1
-            sl_order_id = self.ib.placeOrder(pos["contract"], sl_order).order.orderId
+            sl_order_id = self._place(pos["contract"], sl_order).order.orderId
         if tp is not None:
             tp_order = self._protective(
                 ib_mod.LimitOrder(closing_action, pos["size"], self._round_to_tick(tp, pos["contract"].symbol))
             )
             tp_order.ocaGroup = oca_group
             tp_order.ocaType = 1
-            tp_order_id = self.ib.placeOrder(pos["contract"], tp_order).order.orderId
+            tp_order_id = self._place(pos["contract"], tp_order).order.orderId
 
         pos["sl_order_id"] = sl_order_id
         pos["tp_order_id"] = tp_order_id
@@ -424,7 +429,7 @@ class IBKRAdapter(BrokerAdapter):
 
         closing_action = "SELL" if pos["direction"] == "BUY" else "BUY"
         closing_order = ib_mod.MarketOrder(closing_action, pos["size"])
-        self.ib.placeOrder(pos["contract"], closing_order)
+        self._place(pos["contract"], closing_order)
         del self._positions[slave_ticket]
 
     async def get_status(self) -> bool:
@@ -436,7 +441,7 @@ class IBKRAdapter(BrokerAdapter):
         # back to self._run() when its cache is cold, which raises
         # "RuntimeError: This event loop is already running" inside the hub's
         # loop. Same trap as IB.sleep(). Verified against a live Gateway.
-        summary = {item.tag: item.value for item in await self.ib.accountSummaryAsync()}
+        summary = {item.tag: item.value for item in await self.ib.accountSummaryAsync(self.account)}
         try:
             balance = float(summary["TotalCashValue"])
             equity = float(summary["NetLiquidation"])
@@ -501,6 +506,68 @@ class IBKRAdapter(BrokerAdapter):
                 f"usually the instrument's session is closed. Otherwise: {hint}"
             )
         return float(price)
+
+    async def _resolve_account(self) -> None:
+        """Pin this adapter to exactly one IBKR account.
+
+        One Gateway login can hold several accounts, and leaving that
+        implicit breaks three things of which only the first is loud:
+
+        - IBKR rejects an order that does not name an account when the login
+          manages more than one.
+        - accountSummary() returns every account's rows blended together.
+          get_account_summary() keys them by tag, so with two accounts the
+          last row silently wins -- and that equity drives %-risk sizing and
+          the drawdown watchdog. Sizing off the wrong account's equity is
+          not a failure anyone sees happen.
+        - positions() likewise spans all accounts, so reconciliation would
+          read another account's positions as untracked ones here.
+
+        A single-account login gets pinned anyway, so the reads are explicit
+        rather than relying on IBKR's default.
+        """
+        assert self.ib is not None
+        available = list(self.ib.managedAccounts())
+
+        if not available:
+            # The handshake normally delivers these before connectAsync
+            # returns. If it hasn't, carry on unpinned rather than refuse to
+            # start -- a single-account login behaves correctly either way.
+            logger.warning(
+                "IBKRAdapter[%s] Gateway reported no managed accounts; continuing unpinned",
+                self.slave_id,
+            )
+            return
+
+        if self.account:
+            if self.account not in available:
+                raise AdapterConnectionError(
+                    f"slave {self.slave_id} is configured for IBKR account {self.account!r}, "
+                    f"but this login manages {available}"
+                )
+        elif len(available) == 1:
+            self.account = available[0]
+        else:
+            raise AdapterConnectionError(
+                f"IBKR login at {self.host}:{self.port} manages {len(available)} accounts "
+                f"({available}). Set \"account\" in this slave's config to say which one it "
+                f"trades -- unset, orders are rejected and account equity and positions come "
+                f"back blended across all of them."
+            )
+
+        logger.info("IBKRAdapter[%s] trading account %s", self.slave_id, self.account)
+
+    def _place(self, contract, order):
+        """Place an order, always naming the account it belongs to.
+
+        Every placement goes through here precisely so a new call site
+        cannot quietly omit the account and work fine on a single-account
+        login while being rejected on a multi-account one.
+        """
+        if self.account:
+            order.account = self.account
+        assert self.ib is not None
+        return self.ib.placeOrder(contract, order)
 
     def _protective(self, order):
         """Stamp a protective leg's time-in-force.
@@ -591,7 +658,7 @@ class IBKRAdapter(BrokerAdapter):
     async def get_open_positions(self, account_type: str) -> List[Position]:
         assert self.ib is not None, "adapter not connected"
         results = []
-        for pos in self.ib.positions():
+        for pos in self.ib.positions(self.account):
             if pos.position == 0:
                 continue
             results.append(
