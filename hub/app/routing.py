@@ -68,6 +68,12 @@ class Route:
     # where borrow is scarce and the position is the opposite of the one
     # intended.
     direction: Optional[str] = None
+    # Which way to trade the TARGET, when that differs from the signal.
+    # Inverse ETFs are long-only instruments: you express a short view by
+    # BUYING one. So a route matching direction "SELL" trades
+    # target_direction "BUY" on a different symbol. None follows the signal,
+    # which is right for a futures leg that simply shorts the same contract.
+    target_direction: Optional[str] = None
 
 
 def routing_is_strict(slave_config: Dict[str, Any]) -> bool:
@@ -122,6 +128,8 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                     limit_offset_pct=float(entry.get("limit_offset_pct", 0.0)),
                     direction=(None if entry.get("direction") is None
                                else str(entry["direction"]).upper()),
+                    target_direction=(None if entry.get("target_direction") is None
+                                      else str(entry["target_direction"]).upper()),
                 )
             )
     return matched

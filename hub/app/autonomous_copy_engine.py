@@ -255,7 +255,13 @@ class AutonomousCopyEngine(SessionGateMixin):
             return
 
         quote = await self.adapter.get_quote(target_symbol, month_slot=route.month_slot)
-        sign = 1 if signal.direction == "BUY" else -1
+        # The side actually traded on the target, which is not always the
+        # master's. An inverse ETF is a long-only instrument -- a short view
+        # is expressed by BUYING one -- so the stop, the limit price and the
+        # stored position all have to follow THIS, not the signal. Using the
+        # master's side here would put a long ETF's stop above its entry.
+        traded_direction = route.target_direction or signal.direction
+        sign = 1 if traded_direction == "BUY" else -1
         slave_sl = quote - sign * sl_mult * slave_atr if sl_mult is not None else None
         slave_tp = quote + sign * tp_mult * slave_atr if tp_mult is not None else None
 
@@ -304,13 +310,13 @@ class AutonomousCopyEngine(SessionGateMixin):
             # to the live quote rather than to the master's price -- the two
             # instruments are unrelated, and in an evening book the quote is
             # the only thing that says what is actually tradeable.
-            through = 1 + route.limit_offset_pct if signal.direction == "BUY" \
+            through = 1 + route.limit_offset_pct if traded_direction == "BUY" \
                 else 1 - route.limit_offset_pct
             limit_price = quote * through
 
         order = OrderRequest(
             symbol=target_symbol,
-            direction=signal.direction,
+            direction=traded_direction,
             size=sizing_result.size,
             sl=slave_sl,
             tp=slave_tp,
@@ -351,7 +357,7 @@ class AutonomousCopyEngine(SessionGateMixin):
         self._positions[key] = {
             "slave_ticket": result.slave_ticket,
             "entry_price": quote,
-            "direction": signal.direction,
+            "direction": traded_direction,
             "atr": slave_atr,
             "sl": slave_sl,
             "tp": slave_tp,
@@ -369,7 +375,7 @@ class AutonomousCopyEngine(SessionGateMixin):
             "tp_mult": tp_mult,
             "atr_period": atr_period,
             "bar_size": bar_size,
-            "direction": signal.direction,
+            "direction": traded_direction,
             "sl_order_id": result.sl_order_id,
             "tp_order_id": result.tp_order_id,
         }

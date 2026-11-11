@@ -120,3 +120,73 @@ def test_a_limit_order_with_no_price_is_refused_not_downgraded():
     with pytest.raises(AdapterRejectedError) as exc:
         asyncio.run(a.open(req))
     assert "limit price" in str(exc.value)
+
+
+# --- inverse ETFs: a short view, expressed long ---------------------------
+
+SHORT_ROUTE = {
+    "symbol": "ETHUSD", "target": "ETHD", "direction": "SELL",
+    "target_direction": "BUY",
+    "order_type": "limit", "outside_rth": True, "limit_offset_pct": 0.002,
+    "sizing": {"mode": "dollar_notional", "notional": 5000, "rounding": "floor"},
+}
+
+
+def test_a_short_signal_buys_the_inverse_etf():
+    """Inverse ETFs are long-only instruments: the short view is expressed
+    by BUYING one. Selling ETHD would be a leveraged LONG on ether."""
+    b = FakeBroker(quote=100.0)
+    asyncio.run(_engine(b, [SHORT_ROUTE])._handle_open(_sig(direction="SELL")))
+
+    (opened,) = b.opened
+    assert opened["symbol"] == "ETHD"
+    assert opened["direction"] == "BUY", "it shorted an inverse ETF"
+
+
+def test_the_inverse_legs_stop_sits_below_its_own_entry():
+    """The subtle one. The master is short with its stop ABOVE its entry;
+    this leg is long, so its stop belongs BELOW its own. Deriving the sign
+    from the master's direction instead of the traded one puts a long
+    position's stop above its entry -- an order that fills instantly for a
+    loss the moment it is accepted."""
+    b = FakeBroker(quote=100.0)
+    # master short at 2055.84 with its stop above, at 2218.41
+    asyncio.run(_engine(b, [SHORT_ROUTE])._handle_open(
+        _sig(direction="SELL", price=2055.84, sl=2218.41)))
+
+    (opened,) = b.opened
+    assert opened["direction"] == "BUY"
+    assert opened["sl"] < 100.0, "a long ETF leg was given a stop above its entry"
+
+
+def test_the_inverse_legs_limit_is_priced_up_not_down():
+    """Priced from the traded side too: this is a buy, so the limit has to
+    cross upward even though the master was selling."""
+    b = FakeBroker(quote=100.0)
+    asyncio.run(_engine(b, [SHORT_ROUTE])._handle_open(_sig(direction="SELL")))
+    assert b.opened[0]["limit_price"] == 100.0 * 1.002
+
+
+def test_the_stored_position_records_the_traded_side():
+    """The trailing monitor and the MODIFY follow both read pos["direction"].
+    Storing the master's side would have them manage a long position as if
+    it were short, moving its stop the wrong way on every pass."""
+    from app import position_store
+
+    b = FakeBroker(quote=100.0)
+    asyncio.run(_engine(b, [SHORT_ROUTE])._handle_open(_sig(direction="SELL")))
+
+    (_key, pos), = position_store.load_all(SLAVE)
+    assert pos["direction"] == "BUY"
+
+
+def test_a_futures_route_still_shorts_the_contract():
+    """target_direction is opt-in; omitting it must leave shorts alone."""
+    futures = {"symbol": "ETHUSD", "target": "MET",
+               "sizing": {"mode": "fixed_contracts", "contracts": 1}}
+    b = FakeBroker(quote=100.0)
+    asyncio.run(_engine(b, [futures])._handle_open(_sig(direction="SELL")))
+
+    (opened,) = b.opened
+    assert opened["direction"] == "SELL"
+    assert opened["sl"] > 100.0, "a short futures leg needs its stop above entry"
