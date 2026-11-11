@@ -231,19 +231,30 @@ def test_a_stop_that_never_moves_still_sends_nothing_extra():
 
 # --- CFD -> futures: the master's stop does NOT follow --------------------
 
-def test_the_futures_leg_ignores_every_master_modify():
-    """The whole point of autonomous mode. A master stop-walk reaches this
-    engine and is deliberately dropped: the futures leg's risk is managed by
-    its own ATR breakeven/trail, against its own instrument's ATR.
-
-    If this ever starts passing MODIFY through, a gold CFD stop price would
-    be applied to a GC futures contract -- a different instrument at a
-    different price scale."""
-    b = FakeBroker()
-    journey(_auto(b), ladder([3937.0, 4029.32, 4045.0, 4060.0]))
+def test_the_futures_leg_follows_a_master_modify_as_an_atr_multiple():
+    """A master stop-walk now reaches the futures leg, translated rather
+    than copied: the master's absolute price would be meaningless on a
+    different instrument, so what carries across is the ATR multiple."""
+    b = FakeBroker(quote=4050.0)
+    journey(_auto(b), ladder([3937.0, 4029.32, 4045.0]))
 
     assert len(b.opened) == 1, "the futures leg did not open"
-    assert modifies(b) == [], "a master MODIFY reached the futures leg"
+    assert len(modifies(b)) == 2, "the stop-walk did not reach the futures leg"
+
+
+def test_the_futures_stop_moves_in_the_masters_direction_not_just_its_distance():
+    """The sign matters. A master moving its stop from 92 points BELOW entry
+    to 16 points ABOVE it is protecting profit; read as a bare distance that
+    becomes a stop 16 points below entry, which moves this leg's stop the
+    wrong way at the worst possible moment."""
+    b = FakeBroker(quote=4050.0)
+    journey(_auto(b), ladder([3937.0, 4045.0]))   # master stop ends ABOVE entry
+
+    (_ticket, sl, _tp), = modifies(b)
+    # master: (4029.32 - 4045) / 18 = -0.871 ATR, i.e. above entry
+    # slave:  4050 - (-0.871 * 20) = 4067.42, likewise above its own entry
+    assert sl == pytest.approx(4067.42, abs=0.01)
+    assert sl > 4050.0, "the futures stop went DOWN while the master's went UP"
 
 
 def test_the_futures_stop_is_the_masters_atr_multiple_not_its_price():
@@ -275,19 +286,64 @@ def test_the_futures_leg_still_follows_a_master_close():
     assert b.closed, "the futures leg was left open after the master closed"
 
 
-def test_one_master_journey_two_slaves_only_the_mirror_follows():
+def test_one_master_journey_two_slaves_both_follow_in_their_own_terms():
     """The same ladder fanned to both slave types at once, which is the
     shape of the real fleet: an MT5 mirror and an IBKR futures leg hanging
-    off one master. Same input, deliberately different behaviour."""
-    mirror_b, auto_b = FakeBroker(), FakeBroker()
+    off one master. Both follow now; what differs is the arithmetic. The
+    mirror gets the master's own prices, the futures leg gets the same risk
+    distance expressed in its own instrument's ATR."""
+    mirror_b, auto_b = FakeBroker(), FakeBroker(quote=4050.0)
     stops = [3937.0, 4029.32, 4045.0, 4060.0]
 
     journey(_mirror(mirror_b), ladder(stops))
     journey(_auto(auto_b), ladder(stops))
 
     assert len(modifies(mirror_b)) == 3, "the mirror leg did not follow the stop"
-    assert modifies(auto_b) == [], "the futures leg followed the stop"
+    assert len(modifies(auto_b)) == 3, "the futures leg did not follow the stop"
     assert len(mirror_b.opened) == len(auto_b.opened) == 1
+
+    # Same instruction, deliberately different numbers.
+    assert [m[1] for m in modifies(mirror_b)] == [4029.32, 4045.0, 4060.0]
+    assert [m[1] for m in modifies(auto_b)] != [m[1] for m in modifies(mirror_b)]
+
+
+def test_turning_the_follow_off_restores_the_old_behaviour():
+    """It was a deliberate design decision before, so it stays available."""
+    b = FakeBroker(quote=4050.0)
+    journey(_auto(b, follow_master_modify=False), ladder([3937.0, 4029.32, 4045.0]))
+
+    assert len(b.opened) == 1
+    assert modifies(b) == []
+
+
+def test_a_master_that_sends_no_atr_cannot_be_followed():
+    """Without the master's ATR there is no multiple to carry across, and
+    guessing one would move a real stop on a real position."""
+    b = FakeBroker(quote=4050.0)
+    journey(_auto(b), [_sig(action="OPEN", sl=3937.0),
+                       _sig(action="MODIFY", sl=4045.0, atr=0.0)])
+
+    assert len(b.opened) == 1
+    assert modifies(b) == [], "a MODIFY with no ATR moved the stop anyway"
+
+
+def test_the_trailing_monitor_can_still_read_its_own_position_key():
+    """_check_risk() unpacks the position key, which gained the master
+    account. It is reached only from the monitor loop, whose handler logs
+    and continues -- so a bad unpack there is silent, and every position's
+    breakeven and trailing stop simply stops working."""
+    import asyncio as _asyncio
+
+    b = FakeBroker(quote=4050.0)
+    e = _auto(b)
+    key = ("", 5001, "GC")
+    pos = {"slave_ticket": 101, "direction": "BUY", "size": 1.0,
+           "entry_price": 4000.0, "atr": 20.0, "breakeven_done": False,
+           "month_slot": 0, "sl": 3960.0, "tp": None,
+           "sl_mult": 2.0, "tp_mult": None}
+    e._positions[key] = pos
+
+    _asyncio.run(e._check_risk(key, pos))   # must not raise ValueError
 
 
 # --- the registry's view of a journey -------------------------------------

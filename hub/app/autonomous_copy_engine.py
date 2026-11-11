@@ -38,9 +38,18 @@ class AutonomousCopyEngine(SessionGateMixin):
     4. Sizes the order via the sizing engine (fixed/lot-multiplier/%risk/
        $notional) using the adapter's own account balance/equity.
 
-    It ignores MODIFY signals entirely -- once open, a background monitor
-    loop manages its own breakeven + trailing stop per position. It still
-    follows CLOSE: when the master closes, all slave legs close too.
+    It follows MODIFY the only way it can: by re-deriving the ATR multiple
+    the master's new levels represent and reapplying it to this instrument,
+    the same translation OPEN uses. Copying the master's absolute price
+    would put a gold CFD level on a GC futures contract.
+
+    A background monitor loop also manages breakeven + trailing per
+    position, so the two can disagree: a master that widens its stop while
+    this leg has already moved to breakeven will see the monitor pull the
+    stop back in on its next pass, because the monitor only ever moves a
+    stop favourably. Last writer wins, as in mirror mode.
+
+    It still follows CLOSE: when the master closes, all slave legs close.
     """
 
     def __init__(
@@ -63,9 +72,13 @@ class AutonomousCopyEngine(SessionGateMixin):
         self.atr_period = slave_config.get("atr_period", 14)
         self.risk_config = slave_config.get("risk_management", {})
         self.roll_config = slave_config.get("contract_roll", {})
+        # Follow the master's MODIFY by re-deriving this leg's stops from the
+        # ATR multiple the master's new levels represent. Off means the leg
+        # is managed solely by the trailing monitor below, which is how this
+        # engine behaved before.
+        self.follow_master_modify = slave_config.get("follow_master_modify", True)
         self._last_roll_check = 0.0
 
-        # keyed by (master_ticket, slave_symbol)
         # Keyed (master_account, master_ticket, slave_symbol): ticket
         # numbers are per master account, so the account has to be in the key
         # or two masters' positions collide in here as well as in the tables.
@@ -139,10 +152,7 @@ class AutonomousCopyEngine(SessionGateMixin):
 
     async def _handle(self, signal: Signal) -> None:
         if signal.action == "MODIFY":
-            logger.debug(
-                "slave=%s ignoring MODIFY for ticket=%s (autonomous mode manages its own risk)",
-                self.slave_id, signal.ticket,
-            )
+            await self._handle_modify(signal)
             return
         if signal.action == "OPEN":
             await self._handle_open(signal)
@@ -312,6 +322,97 @@ class AutonomousCopyEngine(SessionGateMixin):
             sl=slave_sl,
             tp=slave_tp,
         )
+
+    async def _handle_modify(self, signal: Signal) -> None:
+        """Re-derive this leg's stops from the master's new levels.
+
+        Mirror mode copies the master's absolute SL/TP. This engine cannot:
+        the slave is a different instrument at a different price scale, so
+        a gold CFD stop of 3937 is meaningless on a GC contract. What does
+        carry across is the *risk distance* measured in ATR multiples --
+        exactly the translation _handle_open() performs -- so a master
+        widening its stop from 1.5 to 3.0 ATR widens this leg by the same
+        factor against this instrument's own ATR.
+
+        The multiples are recomputed from the master's own entry price and
+        ATR, both of which ride on every signal, rather than from the ones
+        captured at open. That way a master whose ATR has moved since entry
+        still describes its *current* intent.
+        """
+        if not self.follow_master_modify:
+            logger.debug(
+                "slave=%s ignoring MODIFY for ticket=%s (follow_master_modify is off)",
+                self.slave_id, signal.ticket,
+            )
+            return
+
+        if not signal.atr or signal.atr <= 0 or signal.price is None:
+            # Without the master's ATR there is no multiple to carry across,
+            # and guessing one would move a real stop on a real position.
+            logger.warning(
+                "slave=%s cannot follow MODIFY for ticket=%s: master sent atr=%s price=%s",
+                self.slave_id, signal.ticket, signal.atr, signal.price,
+            )
+            return
+
+        # SIGNED, unlike _handle_open(). At open a stop is always on the
+        # losing side so its absolute distance is unambiguous, but a MODIFY
+        # is usually the master moving its stop toward -- and then past --
+        # breakeven. Taking abs() there would read a stop 15 points ABOVE a
+        # long's entry as one 15 points below it, and push this leg's stop
+        # the wrong way at the exact moment the master was protecting profit.
+        m = 1 if signal.direction == "BUY" else -1
+        sl_mult = m * (signal.price - signal.sl) / signal.atr if signal.sl is not None else None
+        tp_mult = m * (signal.tp - signal.price) / signal.atr if signal.tp is not None else None
+
+        matched = [
+            (key, pos) for key, pos in self._positions.items()
+            if key[0] == signal.account and key[1] == signal.ticket
+        ]
+        if not matched:
+            logger.warning(
+                "slave=%s MODIFY for unknown master_ticket=%s (never opened here?)",
+                self.slave_id, signal.ticket,
+            )
+            return
+
+        for key, pos in matched:
+            target_symbol = key[2]
+            sign = 1 if pos["direction"] == "BUY" else -1
+            entry, slave_atr = pos["entry_price"], pos["atr"]
+
+            slave_sl = entry - sign * sl_mult * slave_atr if sl_mult is not None else None
+            slave_tp = entry + sign * tp_mult * slave_atr if tp_mult is not None else None
+
+            try:
+                await self.adapter.modify(pos["slave_ticket"], slave_sl, slave_tp)
+            except AdapterError as exc:
+                logger.error(
+                    "slave=%s could not follow MODIFY on %s slave_ticket=%s: %s",
+                    self.slave_id, target_symbol, pos["slave_ticket"], exc,
+                )
+                continue
+
+            pos.update({"sl": slave_sl, "tp": slave_tp,
+                        "sl_mult": sl_mult, "tp_mult": tp_mult})
+            position_store.save(
+                self.slave_id, signal.account, signal.ticket, target_symbol, pos
+            )
+
+            logger.info(
+                "slave=%s followed MODIFY on %s slave_ticket=%s -> sl=%s tp=%s "
+                "(%.4f/%.4f ATR of its own instrument)",
+                self.slave_id, target_symbol, pos["slave_ticket"], slave_sl, slave_tp,
+                sl_mult or 0.0, tp_mult or 0.0,
+            )
+            await self._emit(
+                "slave_modify",
+                master_ticket=signal.ticket,
+                slave_symbol=target_symbol,
+                slave_ticket=pos["slave_ticket"],
+                sl=slave_sl,
+                tp=slave_tp,
+            )
 
     async def _handle_close(self, signal: Signal) -> None:
         mappings = trade_registry.get_open_mappings(self.slave_id, signal.account, signal.ticket)
@@ -526,7 +627,7 @@ class AutonomousCopyEngine(SessionGateMixin):
             )
 
     async def _check_risk(self, key: Tuple[str, int, str], pos: dict) -> None:
-        _master_ticket, target_symbol = key
+        _master_account, _master_ticket, target_symbol = key
         quote = await self.adapter.get_quote(target_symbol, month_slot=pos.get("month_slot", 0))
         sign = 1 if pos["direction"] == "BUY" else -1
         favorable_move = sign * (quote - pos["entry_price"])
