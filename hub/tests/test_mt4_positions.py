@@ -78,3 +78,80 @@ def test_other_rejections_are_not_swallowed():
     """Only the unknown-command case degrades; a real rejection must surface."""
     with pytest.raises(AdapterRejectedError):
         _positions(raises=AdapterRejectedError("slave rejected command"))
+
+
+# --- protective levels (EA mq4 1.04 / mq5 1.01) ---------------------------
+
+def test_sl_and_tp_are_reported_per_leg():
+    """The only way to confirm a MODIFY actually landed. Nothing else reads a
+    leg's protective levels back off the account."""
+    got = _positions(reply={
+        "status": "ok",
+        "positions": [{"ticket": 1, "symbol": "XAUUSD", "quantity": 0.10,
+                       "average_price": 4029.32, "sl": 3947.42, "tp": 4200.0,
+                       "unrealized_pnl": 1.0}],
+    })
+    assert (got[0].sl, got[0].tp) == (3947.42, 4200.0)
+
+
+def test_a_zero_level_means_unprotected_not_a_stop_at_zero():
+    """MQL4's OrderStopLoss() and MQL5's POSITION_SL both return 0.0 when no
+    level is set, and the EAs format numbers rather than emitting JSON null.
+    Read literally, 0.0 is a stop at a price of zero -- the same trap the
+    Signal model guards on the way in."""
+    got = _positions(reply={
+        "status": "ok",
+        "positions": [{"ticket": 1, "symbol": "XAUUSD", "quantity": 0.10,
+                       "average_price": 4029.32, "sl": 0.0, "tp": 0.0,
+                       "unrealized_pnl": 1.0}],
+    })
+    assert got[0].sl is None
+    assert got[0].tp is None
+
+
+def test_an_ea_that_omits_the_levels_reports_none():
+    """mq4 1.03 and earlier answered POSITIONS without sl/tp. Absent must read
+    the same as unset, not raise."""
+    got = _positions(reply={
+        "status": "ok",
+        "positions": [{"ticket": 1, "symbol": "XAUUSD", "quantity": 0.10,
+                       "average_price": 4029.32, "unrealized_pnl": 1.0}],
+    })
+    assert (got[0].sl, got[0].tp) == (None, None)
+
+
+def test_the_simulator_answers_positions_the_way_the_eas_do():
+    """scripts/simulate_slave.py is only useful while it stays in step with
+    the real EAs -- it once accepted JSON whitespace the MQL4 parser did not,
+    which hid a bug until it reached a real terminal. This drives the
+    simulator's own handler through the adapter's parsing."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "_sim_slave", Path(__file__).resolve().parent.parent / "scripts" / "simulate_slave.py")
+    sim = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sim)
+
+    opened = sim.handle({"cmd": "OPEN", "master_ticket": 1, "symbol": "XAUUSD",
+                         "direction": "BUY", "lots": 0.1, "price": 4029.32,
+                         "sl": 3937.0, "tp": None})
+    ticket = opened["slave_ticket"]
+    sim.handle({"cmd": "MODIFY", "ticket": ticket, "sl": 4029.32, "tp": None})
+
+    a = MT4Adapter(slave_id="t", host="127.0.0.1", port=1)
+
+    async def fake_request(command, retries=None):
+        return sim.handle({"cmd": "POSITIONS"})
+
+    a._request = fake_request  # type: ignore[assignment]
+    got = asyncio.run(a.get_open_positions(None))
+
+    assert len(got) == 1
+    assert got[0].sl == 4029.32, "the stop-walk is not visible through POSITIONS"
+    assert got[0].tp is None, "an unset TP came back as a level"
+
+    # and the already-closed contract both EAs honour since mq4 1.02
+    sim.handle({"cmd": "CLOSE", "ticket": ticket})
+    assert sim.handle({"cmd": "MODIFY", "ticket": ticket, "sl": 1.0}) == {
+        "status": "ok", "already_closed": True, "slave_ticket": ticket}

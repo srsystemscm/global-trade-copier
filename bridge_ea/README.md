@@ -2,7 +2,8 @@
 
 **Versions:** each EA carries `#property version` and `BRIDGE_VERSION`
 (same value), printed in the Experts log on start-up, with a version history
-in its header comment. Current: `TradeCopierBridge` 1.02, `SlaveBridge` 1.03.
+in its header comment. Current: `TradeCopierBridge` 1.02, `SlaveBridge` 1.04 (.mq4) /
+1.01 (.mq5).
 Bump both lines in the EA with every change.
 
 Two EAs, one per role:
@@ -32,6 +33,13 @@ Two EAs, one per role:
   copier-placed ones, because reconciliation specifically needs to notice
   untracked positions so it can warn about them instead of assuming they're
   the copier's to touch.
+
+  Since mq4 1.04 / mq5 1.01, `POSITIONS` also reports each leg's **SL and
+  TP**. Nothing else reads a position's protective levels back off the
+  account, so this is what makes a MODIFY verifiable without opening the
+  terminal -- and it is the prerequisite for ever detecting stop drift
+  during reconciliation. `0` means "not set", as everywhere else in MQL, and
+  the hub turns it into `None` rather than a stop at a price of zero.
 
   `CLOSE` and `MODIFY` are idempotent against an already-closed ticket: if
   `OrderCloseTime()` is non-zero the EA replies

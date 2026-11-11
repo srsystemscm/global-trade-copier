@@ -89,6 +89,14 @@ class Position:
     average_price: float
     market_value: Optional[float] = None
     unrealized_pnl: Optional[float] = None
+    # The protective levels the broker is actually holding, which is the only
+    # way to confirm a MODIFY landed -- nothing else reads a leg's stop back.
+    # 0 from MT4/MT5 means "no level set" and arrives here as None, so None
+    # is "unprotected or unknown", never "a stop at zero". Left None by
+    # adapters that cannot report it (IBKR holds its stops as separate
+    # bracket orders rather than attributes of the position).
+    sl: Optional[float] = None
+    tp: Optional[float] = None
 
 
 class BrokerAdapter(abc.ABC):

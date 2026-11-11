@@ -25,9 +25,10 @@
 //|                                                                  |
 //| Versions (bump both lines below with every change):              |
 //|   1.00 2026-10-31 port of SlaveBridge.mq4 1.03                   |
+//|   1.01 2026-11-11 POSITIONS reports each leg's SL/TP            |
 //+------------------------------------------------------------------+
-#property version   "1.00"
-#define   BRIDGE_VERSION "1.00"
+#property version   "1.01"
+#define   BRIDGE_VERSION "1.01"
 
 #include <Zmq/Zmq.mqh>
 
@@ -406,6 +407,10 @@ string HandlePositions()
              + ",\"symbol\":\"" + symbol + "\""
              + ",\"quantity\":" + DoubleToString(qty, 2)
              + ",\"average_price\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN), digits)
+             // Reported so the hub can confirm a MODIFY landed; 0 means "not
+             // set", which the hub reads as None rather than a stop at zero.
+             + ",\"sl\":" + DoubleToString(PositionGetDouble(POSITION_SL), digits)
+             + ",\"tp\":" + DoubleToString(PositionGetDouble(POSITION_TP), digits)
              + ",\"unrealized_pnl\":" + DoubleToString(pnl, 2)
              + "}";
       n++;

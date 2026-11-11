@@ -23,6 +23,21 @@ from app.retry import retry_async
 logger = logging.getLogger(__name__)
 
 
+def _level(value) -> Optional[float]:
+    """A protective level as reported by the bridge EA.
+
+    MQL4's OrderStopLoss() and MQL5's POSITION_SL both return 0.0 when no
+    level is set, and the EAs format numbers rather than emitting JSON null.
+    Taken literally that is a stop at a price of zero -- the same trap the
+    Signal model already guards on the way in. Absent, null and 0.0 all mean
+    "no level", so they all become None.
+    """
+    if value is None:
+        return None
+    level = float(value)
+    return level if level != 0.0 else None
+
+
 class MT4Adapter(BrokerAdapter):
     """Talks to a slave MT4 bridge EA over a ZMQ REQ/REP pair, speaking
     OPEN / MODIFY / CLOSE / PING / POSITIONS.
@@ -198,6 +213,8 @@ class MT4Adapter(BrokerAdapter):
                     quantity=float(p["quantity"]),
                     average_price=float(p["average_price"]),
                     unrealized_pnl=p.get("unrealized_pnl"),
+                    sl=_level(p.get("sl")),
+                    tp=_level(p.get("tp")),
                 )
             )
         return positions

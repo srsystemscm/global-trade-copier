@@ -15,10 +15,11 @@
 //|   1.01 2026-09-10 fixes from the first real terminal shakeout      |
 //|   1.02 2026-09-10 an already-closed leg counts as success          |
 //|   1.03 2026-10-16 POSITIONS command (reconciliation, live P&L)     |
+//|   1.04 2026-11-11 POSITIONS reports each leg's SL/TP              |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.03"
-#define   BRIDGE_VERSION "1.03"
+#property version   "1.04"
+#define   BRIDGE_VERSION "1.04"
 
 #include <Zmq/Zmq.mqh>
 
@@ -193,9 +194,15 @@ string HandlePositions()
       // dashboard shows what the account would actually realise.
       double pnl = OrderProfit() + OrderSwap() + OrderCommission();
 
+      // SL/TP are reported so the hub can confirm a MODIFY actually landed:
+      // nothing else reads a leg's protective levels back off the account.
+      // 0 means "not set" here exactly as it does everywhere else in MQL4,
+      // and the hub turns it into None rather than a stop at price zero.
       items += StringFormat(
-         "{\"ticket\":%d,\"symbol\":\"%s\",\"quantity\":%.2f,\"average_price\":%.5f,\"unrealized_pnl\":%.2f}",
-         OrderTicket(), OrderSymbol(), qty, OrderOpenPrice(), pnl);
+         "{\"ticket\":%d,\"symbol\":\"%s\",\"quantity\":%.2f,\"average_price\":%.5f," +
+         "\"sl\":%.5f,\"tp\":%.5f,\"unrealized_pnl\":%.2f}",
+         OrderTicket(), OrderSymbol(), qty, OrderOpenPrice(),
+         OrderStopLoss(), OrderTakeProfit(), pnl);
       n++;
      }
 
@@ -220,7 +227,8 @@ int SkipWhitespace(string json, int i)
      {
       ushort c = StringGetCharacter(json, i);
       if(c == ' ' || c == '	' || c == '
-' || c == '')
+' || c == '
+')
          i++;
       else
          break;
