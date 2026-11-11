@@ -51,6 +51,9 @@ class OrderRequest:
 class OrderResult:
     slave_ticket: int
     price: Optional[float] = None
+    # What actually went on, after the broker's own volume rounding. None
+    # when the broker doesn't say, in which case the requested size stands.
+    lots: Optional[float] = None
     # Broker-side bracket legs, recorded so they survive a hub restart --
     # without them a restored position can't have its stop moved or cancelled.
     sl_order_id: Optional[int] = None
@@ -131,7 +134,7 @@ class BrokerAdapter(abc.ABC):
     async def modify(self, slave_ticket: int, sl: Optional[float], tp: Optional[float]) -> None: ...
 
     @abc.abstractmethod
-    async def close(self, slave_ticket: int) -> None: ...
+    async def close(self, slave_ticket: int) -> Optional[float]: ...
 
     @abc.abstractmethod
     async def get_status(self) -> bool: ...

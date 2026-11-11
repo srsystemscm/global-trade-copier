@@ -16,10 +16,11 @@
 //|   1.02 2026-09-10 an already-closed leg counts as success          |
 //|   1.03 2026-10-16 POSITIONS command (reconciliation, live P&L)     |
 //|   1.04 2026-11-11 POSITIONS reports each leg's SL/TP              |
+//|   1.05 2026-11-11 report actual fill price + lots on OPEN/CLOSE   |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.04"
-#define   BRIDGE_VERSION "1.04"
+#property version   "1.05"
+#define   BRIDGE_VERSION "1.05"
 
 #include <Zmq/Zmq.mqh>
 
@@ -109,7 +110,19 @@ string HandleOpen(string json)
    if(ticket < 0)
       return StringFormat("{\"status\":\"error\",\"message\":\"OrderSend failed: %d\"}", GetLastError());
 
-   return StringFormat("{\"status\":\"ok\",\"slave_ticket\":%d,\"price\":%.5f}", ticket, price);
+   // Report what actually filled, not what was asked for. The gap between
+   // the two IS the slippage this copy cost, and the broker states it once
+   // -- it cannot be reconstructed from anything the hub keeps.
+   double filled     = price;
+   double filledLots = lots;
+   if(OrderSelect(ticket, SELECT_BY_TICKET))
+     {
+      filled     = OrderOpenPrice();
+      filledLots = OrderLots();
+     }
+
+   return StringFormat("{\"status\":\"ok\",\"slave_ticket\":%d,\"price\":%.5f,\"lots\":%.2f}",
+                       ticket, filled, filledLots);
   }
 
 //+------------------------------------------------------------------+
@@ -159,7 +172,13 @@ string HandleClose(string json)
    if(!OrderClose(ticket, lots, price, Slippage, clrNONE))
       return StringFormat("{\"status\":\"error\",\"message\":\"OrderClose failed: %d\"}", GetLastError());
 
-   return "{\"status\":\"ok\"}";
+   // Same reasoning as OPEN: the exit fill is the other half of the round
+   // trip, and without it only half the copy's variance can be measured.
+   double closed = price;
+   if(OrderSelect(ticket, SELECT_BY_TICKET))
+      closed = OrderClosePrice();
+
+   return StringFormat("{\"status\":\"ok\",\"price\":%.5f}", closed);
   }
 
 //+------------------------------------------------------------------+

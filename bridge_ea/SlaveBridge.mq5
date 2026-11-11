@@ -26,9 +26,10 @@
 //| Versions (bump both lines below with every change):              |
 //|   1.00 2026-10-31 port of SlaveBridge.mq4 1.03                   |
 //|   1.01 2026-11-11 POSITIONS reports each leg's SL/TP            |
+//|   1.02 2026-11-11 CLOSE reports the fill price                  |
 //+------------------------------------------------------------------+
-#property version   "1.01"
-#define   BRIDGE_VERSION "1.01"
+#property version   "1.02"
+#define   BRIDGE_VERSION "1.02"
 
 #include <Zmq/Zmq.mqh>
 
@@ -360,7 +361,11 @@ string HandleClose(string json)
       return JsonError(StringFormat("close rejected: retcode=%d %s",
                                     (int)res.retcode, res.comment));
 
-   return "{\"status\":\"ok\"}";
+   // The deal price, not the price requested: the difference is the exit
+   // slippage, and it is reported once or not at all. OPEN already does
+   // this via res.price.
+   double closed = (res.price > 0.0) ? res.price : req.price;
+   return "{\"status\":\"ok\",\"price\":" + DoubleToString(closed, digits) + "}";
   }
 
 //+------------------------------------------------------------------+

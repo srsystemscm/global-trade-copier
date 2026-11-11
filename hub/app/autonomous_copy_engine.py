@@ -243,9 +243,21 @@ class AutonomousCopyEngine(SessionGateMixin):
             master_ticket=signal.ticket,
             month_slot=route.month_slot,
         )
+        requested_at = time.time()
         result = await self.adapter.open(order)
+        filled_at = time.time()
+        # master_price is the master's own entry on its own instrument, so
+        # for this engine it is context rather than a slippage reference:
+        # the slave is trading a different contract at a different price
+        # scale. The comparable figure is slave_price against `quote`, the
+        # level the stops were sized from, which is stored on the position.
         trade_registry.record_open(
-            self.slave_id, signal.account, signal.ticket, target_symbol, result.slave_ticket
+            self.slave_id, signal.account, signal.ticket, target_symbol, result.slave_ticket,
+            master_price=signal.price,
+            slave_price=result.price,
+            slave_lots=sizing_result.size,
+            requested_at=requested_at,
+            filled_at=filled_at,
         )
 
         # Pin the concrete contract. Slot numbers shift under you when the
@@ -309,9 +321,11 @@ class AutonomousCopyEngine(SessionGateMixin):
             )
             return
         for mapping in mappings:
-            await self.adapter.close(mapping.slave_ticket)
+            slave_close = await self.adapter.close(mapping.slave_ticket)
             trade_registry.record_close(
-                self.slave_id, signal.account, signal.ticket, mapping.slave_symbol
+                self.slave_id, signal.account, signal.ticket, mapping.slave_symbol,
+                master_close_price=signal.price,
+                slave_close_price=slave_close,
             )
             self._positions.pop((signal.account, signal.ticket, mapping.slave_symbol), None)
             position_store.delete(

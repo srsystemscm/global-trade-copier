@@ -130,9 +130,19 @@ class MT4Adapter(BrokerAdapter):
                 "tp": order.tp,
             }
         )
-        return OrderResult(slave_ticket=int(reply["slave_ticket"]), price=reply.get("price"))
+        return OrderResult(
+            slave_ticket=int(reply["slave_ticket"]),
+            price=_level(reply.get("price")),
+            lots=reply.get("lots"),
+        )
 
-    async def close(self, slave_ticket: int) -> None:
+    async def close(self, slave_ticket: int) -> Optional[float]:
+        """Returns the price the leg closed at, when the EA reports one.
+
+        An already-closed leg has no close price to give -- it was closed by
+        something outside the copier -- so that path returns None rather than
+        inventing one.
+        """
         reply = await self._request({"cmd": "CLOSE", "ticket": slave_ticket})
         if reply.get("already_closed"):
             # Not an error: the leg was closed by hand or by its own SL/TP
@@ -144,6 +154,8 @@ class MT4Adapter(BrokerAdapter):
                 "MT4Adapter[%s] slave_ticket=%s was already closed before the CLOSE arrived",
                 self.slave_id, slave_ticket,
             )
+            return None
+        return _level(reply.get("price"))
 
     async def modify(self, slave_ticket: int, sl: Optional[float], tp: Optional[float]) -> None:
         reply = await self._request({"cmd": "MODIFY", "ticket": slave_ticket, "sl": sl, "tp": tp})

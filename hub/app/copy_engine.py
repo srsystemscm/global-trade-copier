@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Optional
 
 from app import trade_registry
@@ -91,9 +92,21 @@ class CopyEngine(SessionGateMixin):
                 tp=signal.tp,
                 master_ticket=signal.ticket,
             )
+            # Timed either side of the adapter call so the two halves of
+            # copy latency stay separable: queue-and-hub time is
+            # requested_at - signal.ts, broker time is filled_at -
+            # requested_at. Blaming the wrong half is the usual way latency
+            # work goes nowhere.
+            requested_at = time.time()
             result = await self.adapter.open(order)
+            filled_at = time.time()
             trade_registry.record_open(
-                self.slave_id, signal.account, signal.ticket, signal.symbol, result.slave_ticket
+                self.slave_id, signal.account, signal.ticket, signal.symbol, result.slave_ticket,
+                master_price=signal.price,
+                slave_price=result.price,
+                slave_lots=result.lots if result.lots is not None else signal.lots,
+                requested_at=requested_at,
+                filled_at=filled_at,
             )
             logger.info(
                 "slave=%s opened master_ticket=%s as slave_ticket=%s",
@@ -131,9 +144,11 @@ class CopyEngine(SessionGateMixin):
                     tp=signal.tp,
                 )
             elif signal.action == "CLOSE":
-                await self.adapter.close(mapping.slave_ticket)
+                slave_close = await self.adapter.close(mapping.slave_ticket)
                 trade_registry.record_close(
-                    self.slave_id, signal.account, signal.ticket, mapping.slave_symbol
+                    self.slave_id, signal.account, signal.ticket, mapping.slave_symbol,
+                    master_close_price=signal.price,
+                    slave_close_price=slave_close,
                 )
                 logger.info("slave=%s closed slave_ticket=%s", self.slave_id, mapping.slave_ticket)
                 await self._emit(

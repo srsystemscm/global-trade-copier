@@ -522,3 +522,13 @@ code {
 .copier-daypick {
   flex-wrap: wrap;
 }
+
+/* Per-leg execution facts. Deliberately no day-level average: the column
+   mixes instruments, and a mean of XAUUSD points and XAGUSD points is not a
+   number that means anything. Aggregation belongs where the backtest join
+   happens. */
+.copier-slip,
+.copier-lat {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85em;
+}

@@ -53,7 +53,9 @@ def handle(cmd: dict) -> dict:
             f"OPEN  master_ticket={cmd['master_ticket']} -> slave_ticket={ticket} "
             f"{cmd['symbol']} {cmd['direction']} {cmd['lots']} sl={cmd['sl']} tp={cmd['tp']}"
         )
-        return {"status": "ok", "slave_ticket": ticket, "price": cmd.get("price", 0.0)}
+        # Fill price and lots, as the EAs report them since mq4 1.05.
+        return {"status": "ok", "slave_ticket": ticket,
+                "price": cmd.get("price", 0.0), "lots": cmd["lots"]}
 
     if action == "MODIFY":
         ticket = cmd["ticket"]
@@ -74,10 +76,11 @@ def handle(cmd: dict) -> dict:
             return _already_closed(ticket)
         if ticket not in open_orders:
             return {"status": "error", "message": f"ticket {ticket} not found"}
+        price = open_orders[ticket]["price"]
         del open_orders[ticket]
         closed_tickets.add(ticket)
-        print(f"CLOSE slave_ticket={ticket}")
-        return {"status": "ok"}
+        print(f"CLOSE slave_ticket={ticket} price={price}")
+        return {"status": "ok", "price": price}
 
     if action == "POSITIONS":
         positions = []

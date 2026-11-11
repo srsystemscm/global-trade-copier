@@ -59,6 +59,19 @@ CREATE TABLE IF NOT EXISTS slave_trades (
     status          TEXT NOT NULL DEFAULT 'OPEN',  -- OPEN | CLOSED
     opened_at       REAL,
     closed_at       REAL,
+    -- What this copy actually executed at. Captured because none of it can
+    -- be reconstructed afterwards: a fill price is reported once, in the
+    -- reply to the order, and is gone if it isn't written down here.
+    -- The point isn't any single row -- it's the distribution across many,
+    -- which is what says whether the wobble is spread, latency or sizing.
+    master_price        REAL,   -- master's own entry, denormalised so the
+                                -- delta survives independent of `trades`
+    slave_price         REAL,   -- what the slave actually filled at
+    slave_lots          REAL,   -- what went on after any rounding
+    requested_at        REAL,   -- engine handed the order to the adapter
+    filled_at           REAL,   -- adapter came back with a ticket
+    master_close_price  REAL,
+    slave_close_price   REAL,
     UNIQUE (slave_id, master_account, master_ticket, slave_symbol)
 );
 
@@ -162,11 +175,37 @@ def _migrate_to_account_keys(conn: sqlite3.Connection) -> None:
         logger.warning("  %s: %d row(s) carried over", table, moved)
 
 
+# Columns added after a table already existed. Unlike a key change these
+# need no rebuild -- SQLite can ALTER TABLE ADD COLUMN -- so they stay
+# separate from the account-key migration, which does.
+_ADDED_COLUMNS = {
+    "slave_trades": [
+        ("master_price", "REAL"),
+        ("slave_price", "REAL"),
+        ("slave_lots", "REAL"),
+        ("requested_at", "REAL"),
+        ("filled_at", "REAL"),
+        ("master_close_price", "REAL"),
+        ("slave_close_price", "REAL"),
+    ],
+}
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in _ADDED_COLUMNS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns:
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                logger.warning("added column %s.%s", table, name)
+
+
 def init_db() -> None:
     conn = get_connection()
     try:
         conn.executescript(SCHEMA)
         _migrate_to_account_keys(conn)
+        _add_missing_columns(conn)
         conn.commit()
     finally:
         conn.close()

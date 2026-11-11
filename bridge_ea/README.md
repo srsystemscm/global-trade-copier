@@ -2,8 +2,8 @@
 
 **Versions:** each EA carries `#property version` and `BRIDGE_VERSION`
 (same value), printed in the Experts log on start-up, with a version history
-in its header comment. Current: `TradeCopierBridge` 1.02, `SlaveBridge` 1.04 (.mq4) /
-1.01 (.mq5).
+in its header comment. Current: `TradeCopierBridge` 1.02, `SlaveBridge` 1.05 (.mq4) /
+1.02 (.mq5).
 Bump both lines in the EA with every change.
 
 Two EAs, one per role:
@@ -40,6 +40,13 @@ Two EAs, one per role:
   terminal -- and it is the prerequisite for ever detecting stop drift
   during reconciliation. `0` means "not set", as everywhere else in MQL, and
   the hub turns it into `None` rather than a stop at a price of zero.
+
+  Since mq4 1.05 / mq5 1.02, `OPEN` and `CLOSE` reply with the **actual
+  fill price** (and `OPEN` with the filled lots) rather than the price that
+  was requested. The gap between the two is the slippage that copy cost,
+  the broker states it once, and it cannot be reconstructed afterwards from
+  anything the hub keeps -- so it is recorded on the `slave_trades` row at
+  the moment of the fill.
 
   `CLOSE` and `MODIFY` are idempotent against an already-closed ticket: if
   `OrderCloseTime()` is non-zero the EA replies

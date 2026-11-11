@@ -15,12 +15,18 @@ from app.atr import Bar
 class FakeBroker:
     """Records what it was asked to do, in order."""
 
-    def __init__(self, quote=4050.0, bars=None, balance=1_000_000.0, volumes=None):
+    def __init__(self, quote=4050.0, bars=None, balance=1_000_000.0, volumes=None,
+                 fill_price=None, close_price=None):
         self.quote_price = quote
         self.bars = bars or [Bar(high=h, low=h - 20, close=h - 10)
                              for h in range(4100, 4130)]
         self.balance = balance
         self.volumes = volumes or {0: 30000.0, 1: 2000.0}
+        # What the broker reports back as the actual execution. None is
+        # the honest default: not every broker states a fill price
+        # synchronously, and None must not become a price of zero.
+        self.fill_price = fill_price
+        self.close_price = close_price
 
         self.calls: List[tuple] = []
         self.opened: List[dict] = []
@@ -61,11 +67,13 @@ class FakeBroker:
             "contract_id": order.contract_id, "ticket": self._next_ticket,
         })
         self.calls.append(("open", order.symbol, order.contract_id))
-        return OrderResult(slave_ticket=self._next_ticket, sl_order_id=self._next_ticket + 500)
+        return OrderResult(slave_ticket=self._next_ticket, price=self.fill_price,
+                           lots=order.size, sl_order_id=self._next_ticket + 500)
 
     async def close(self, slave_ticket):
         self.closed.append(slave_ticket)
         self.calls.append(("close", slave_ticket))
+        return self.close_price
 
     async def modify(self, slave_ticket, sl, tp):
         self.calls.append(("modify", slave_ticket, sl, tp))

@@ -104,6 +104,40 @@ function toOrders(trades, { start, end }) {
   );
 }
 
+/**
+ * What the copy cost, signed so that positive always means worse.
+ *
+ * A BUY filled above the master paid for the hop; a SELL filled below it
+ * did too. Without the sign flip a sample of these averages to roughly
+ * nothing and the cost disappears.
+ *
+ * Only meaningful when both sides traded the same instrument, so it is not
+ * shown for an autonomous leg -- a gold CFD price against a GC futures
+ * price is a difference between contracts, not slippage.
+ */
+function slip(order, copy) {
+  if (copy.master_price == null || copy.slave_price == null) return null;
+  if (copy.slave_symbol !== order.symbol) return null;
+  const raw = copy.slave_price - copy.master_price;
+  return order.direction === "SELL" ? -raw : raw;
+}
+
+/**
+ * Milliseconds is the right unit for a copy, which should land well inside
+ * a second. Anything past ten seconds is a different kind of event -- a
+ * stalled session, a retry storm -- and six digits of ms reads as noise
+ * exactly when it most needs to be legible.
+ */
+function fmtLatency(ms) {
+  return ms >= 10000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+}
+
+/** Signal received by the hub to broker fill, in ms. */
+function latency(order, copy) {
+  if (copy.filled_at == null || order.openedAt == null) return null;
+  return Math.round((copy.filled_at - order.openedAt) * 1000);
+}
+
 function OrderRow({ order }) {
   // An OPEN that produced no slave leg is the visible symptom of a refusal:
   // no route matched, the slave was paused, or its session was down. Worth
@@ -144,6 +178,20 @@ function OrderRow({ order }) {
                   <span className={c.status === "OPEN" ? "badge badge-ok" : "badge"}>
                     {c.status?.toLowerCase()}
                   </span>
+                  {slip(order, c) !== null && (
+                    <span
+                      className={slip(order, c) > 0 ? "copier-slip pnl-negative" : "copier-slip pnl-positive"}
+                      title="Fill vs the master's price, signed so positive means it cost you"
+                    >
+                      {slip(order, c) > 0 ? "+" : ""}
+                      {px(slip(order, c))}
+                    </span>
+                  )}
+                  {latency(order, c) !== null && (
+                    <span className="copier-lat muted" title="Hub received the signal to broker fill">
+                      {fmtLatency(latency(order, c))}
+                    </span>
+                  )}
                 </div>
               ))}
             </div>
