@@ -25,6 +25,10 @@ _FIELDS = (
     "direction", "size", "entry_price", "atr", "sl", "tp", "sl_mult", "tp_mult",
     "breakeven_done", "month_slot", "contract_id", "contract_local",
     "contract_expiry", "sl_order_id", "tp_order_id",
+    # Which ATR period measured this position. Restored so a roll after a
+    # restart re-derives stops the way the entry was measured rather than
+    # from whatever the slave default is by then.
+    "atr_period",
 )
 
 

@@ -40,6 +40,12 @@ class Route:
     account: Optional[str] = None
     sizing: Optional[Dict[str, Any]] = None
     risk_management: Optional[Dict[str, Any]] = None
+    # ATR is a property of the strategy that set the stop, not of the
+    # account the copy lands in. Two strategies on one slave can use
+    # different periods, and a slave-wide setting would silently apply one
+    # of them to both -- translating the other's stop against an ATR it
+    # never meant. None falls back to the slave's own default.
+    atr_period: Optional[int] = None
 
 
 def routing_is_strict(slave_config: Dict[str, Any]) -> bool:
@@ -83,6 +89,8 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                     account=None if account is None else str(account),
                     sizing=entry.get("sizing"),
                     risk_management=entry.get("risk_management"),
+                    atr_period=(None if entry.get("atr_period") is None
+                                else int(entry["atr_period"])),
                 )
             )
     return matched

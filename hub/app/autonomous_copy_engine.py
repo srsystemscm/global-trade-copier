@@ -212,11 +212,16 @@ class AutonomousCopyEngine(SessionGateMixin):
         # trades ~174 contracts/day. compute_atr() raises on insufficient
         # history and the open is skipped with a reason rather than sized off
         # a bad number.
+        # The route's period when the strategy declares one, this slave's
+        # otherwise. Pinned onto the position below so a roll re-derives the
+        # new contract's ATR the same way the entry was measured.
+        atr_period = route.atr_period or self.atr_period
+
         bars = await self.adapter.get_price_history(
-            target_symbol, self.atr_period, month_slot=route.month_slot
+            target_symbol, atr_period, month_slot=route.month_slot
         )
         try:
-            slave_atr = compute_atr(bars, self.atr_period)
+            slave_atr = compute_atr(bars, atr_period)
         except ValueError as exc:
             logger.error("slave=%s skipping %s: %s", self.slave_id, target_symbol, exc)
             return
@@ -300,6 +305,7 @@ class AutonomousCopyEngine(SessionGateMixin):
             # rather than carrying absolute prices across a calendar spread
             "sl_mult": sl_mult,
             "tp_mult": tp_mult,
+            "atr_period": atr_period,
             "direction": signal.direction,
             "sl_order_id": result.sl_order_id,
             "tp_order_id": result.tp_order_id,
@@ -553,11 +559,14 @@ class AutonomousCopyEngine(SessionGateMixin):
         # carried across. The calendar spread is real money (GCZ6 4051.6 vs
         # GCJ7 4118.5), so an absolute level transplanted between contracts is
         # simply wrong, and shift errors would compound over repeated rolls.
+        # Whatever period measured this position at entry, not whatever
+        # the slave's default happens to be now.
+        roll_atr_period = pos.get("atr_period") or self.atr_period
         bars = await self.adapter.get_price_history(
-            symbol, self.atr_period, contract_id=nxt.contract_id
+            symbol, roll_atr_period, contract_id=nxt.contract_id
         )
         try:
-            new_atr = compute_atr(bars, self.atr_period)
+            new_atr = compute_atr(bars, roll_atr_period)
         except ValueError as exc:
             logger.error("slave=%s not rolling %s: %s", self.slave_id, symbol, exc)
             return
