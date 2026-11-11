@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS engine_positions (
     sl_mult         REAL,                -- ATR multiples the position was opened
     tp_mult         REAL,                -- with; a roll re-derives stops from these
     atr_period      INTEGER,             -- and the period that measured them
+    bar_size        TEXT,                -- on these bars
     breakeven_done  INTEGER NOT NULL DEFAULT 0,
     month_slot      INTEGER NOT NULL DEFAULT 0,
     contract_id     INTEGER,             -- concrete futures contract, not a slot:
@@ -191,6 +192,7 @@ _ADDED_COLUMNS = {
     ],
     "engine_positions": [
         ("atr_period", "INTEGER"),
+        ("bar_size", "TEXT"),
     ],
 }
 

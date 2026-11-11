@@ -216,9 +216,10 @@ class AutonomousCopyEngine(SessionGateMixin):
         # otherwise. Pinned onto the position below so a roll re-derives the
         # new contract's ATR the same way the entry was measured.
         atr_period = route.atr_period or self.atr_period
+        bar_size = route.bar_size
 
         bars = await self.adapter.get_price_history(
-            target_symbol, atr_period, month_slot=route.month_slot
+            target_symbol, atr_period, month_slot=route.month_slot, bar_size=bar_size
         )
         try:
             slave_atr = compute_atr(bars, atr_period)
@@ -306,6 +307,7 @@ class AutonomousCopyEngine(SessionGateMixin):
             "sl_mult": sl_mult,
             "tp_mult": tp_mult,
             "atr_period": atr_period,
+            "bar_size": bar_size,
             "direction": signal.direction,
             "sl_order_id": result.sl_order_id,
             "tp_order_id": result.tp_order_id,
@@ -563,7 +565,8 @@ class AutonomousCopyEngine(SessionGateMixin):
         # the slave's default happens to be now.
         roll_atr_period = pos.get("atr_period") or self.atr_period
         bars = await self.adapter.get_price_history(
-            symbol, roll_atr_period, contract_id=nxt.contract_id
+            symbol, roll_atr_period, contract_id=nxt.contract_id,
+            bar_size=pos.get("bar_size"),
         )
         try:
             new_atr = compute_atr(bars, roll_atr_period)

@@ -29,6 +29,7 @@ class FakeBroker:
         self.close_price = close_price
 
         self.calls: List[tuple] = []
+        self.history_calls: List[dict] = []
         self.opened: List[dict] = []
         self.closed: List[int] = []
         self._next_ticket = 100
@@ -48,8 +49,15 @@ class FakeBroker:
     async def get_account_summary(self, account_type=None):
         return AccountSummary(balance=self.balance, equity=self.balance)
 
-    async def get_price_history(self, symbol, period, month_slot=0, contract_id=None):
+    async def get_price_history(self, symbol, period, month_slot=0, contract_id=None,
+                                bar_size=None):
+        # `calls` keeps its original shape -- tests assert on it by equality,
+        # and widening the tuple would break them for no reason. The extra
+        # detail goes in its own list.
         self.calls.append(("history", symbol, month_slot, contract_id))
+        self.history_calls.append(
+            {"symbol": symbol, "period": period, "month_slot": month_slot,
+             "contract_id": contract_id, "bar_size": bar_size})
         return self.bars
 
     async def get_quote(self, symbol, month_slot=0, contract_id=None):

@@ -129,3 +129,95 @@ def test_the_period_survives_a_restart():
 
     (_key, pos), = list(fresh._positions.items())
     assert pos["atr_period"] == 9
+
+
+# --- the bars that period counts ------------------------------------------
+
+def test_a_route_can_declare_its_bar_size():
+    """A strategy measuring ATR on H4 and a slave measuring the same multiple
+    on daily bars are comparing two different volatilities."""
+    cfg = {"routes": [{"symbol": "XAUUSD", "magic": 2389, "target": "GC",
+                       "bar_size": "4 hours"}]}
+    (route,) = resolve_routes(cfg, _sig())
+    assert route.bar_size == "4 hours"
+
+
+def test_the_open_requests_the_routes_bar_size():
+    b = FakeBroker()
+    e = _engine(b, [{"symbol": "XAUUSD", "magic": 2389, "target": "GC",
+                     "atr_period": 9, "bar_size": "4 hours",
+                     "sizing": {"mode": "fixed_contracts", "contracts": 1}}])
+    asyncio.run(e._handle_open(_sig()))
+
+    assert b.history_calls[0]["bar_size"] == "4 hours"
+    assert b.history_calls[0]["period"] == 9
+
+
+def test_no_bar_size_leaves_the_adapter_default():
+    """None, not a string -- the adapter owns the default, so that existing
+    configs keep asking for exactly what they asked for before."""
+    b = FakeBroker()
+    e = _engine(b, [{"symbol": "XAUUSD", "magic": 2389, "target": "GC",
+                     "sizing": {"mode": "fixed_contracts", "contracts": 1}}])
+    asyncio.run(e._handle_open(_sig()))
+
+    assert b.history_calls[0]["bar_size"] is None
+
+
+def test_a_roll_re_measures_on_the_same_bars_as_the_entry():
+    b = FakeBroker()
+    e = _engine(b, [{"symbol": "XAUUSD", "magic": 2389, "target": "GC",
+                     "atr_period": 9, "bar_size": "4 hours",
+                     "sizing": {"mode": "fixed_contracts", "contracts": 1}}])
+    asyncio.run(e._handle_open(_sig()))
+
+    (key, pos), = list(e._positions.items())
+    b.history_calls.clear()
+    asyncio.run(e._roll_one(key, pos, "test"))
+
+    assert b.history_calls[0]["bar_size"] == "4 hours"
+    assert b.history_calls[0]["period"] == 9
+
+
+def test_bar_size_survives_a_restart():
+    b = FakeBroker()
+    e = _engine(b, [{"symbol": "XAUUSD", "magic": 2389, "target": "GC",
+                     "atr_period": 9, "bar_size": "4 hours",
+                     "sizing": {"mode": "fixed_contracts", "contracts": 1}}])
+    asyncio.run(e._handle_open(_sig()))
+
+    fresh = _engine(FakeBroker(), [])
+    asyncio.run(fresh.restore())
+    (_key, pos), = list(fresh._positions.items())
+    assert pos["bar_size"] == "4 hours"
+
+
+# --- how much history to ask IBKR for -------------------------------------
+
+def test_duration_scales_with_the_bar_size():
+    """A fixed '30 D' was fine while every caller wanted daily bars. It is
+    wrong both ways once the size varies: 30 days of 1-minute bars is tens of
+    thousands and IBKR refuses outright, while 30 days of weekly bars is four
+    and compute_atr() would reject it."""
+    from app.adapters.ibkr import _duration_for
+
+    assert _duration_for(14, "1 day") == "30 D"        # unchanged default
+    assert _duration_for(60, "1 day") == "66 D"        # long period needs more
+
+    weekly = int(_duration_for(14, "1 week").split()[0])
+    assert weekly >= 133, "19 weekly bars need more than a month of history"
+
+    intraday = int(_duration_for(14, "15 mins").split()[0])
+    assert 1 <= intraday <= 5, "19 fifteen-minute bars is days, not a month"
+
+
+def test_an_unrecognised_bar_size_is_refused_not_guessed():
+    """Passing nonsense through would surface as an opaque IBKR error at the
+    moment an entry was being sized."""
+    import pytest as _pytest
+    from app.adapters.base import AdapterRejectedError
+    from app.adapters.ibkr import _duration_for
+
+    with _pytest.raises(AdapterRejectedError) as exc:
+        _duration_for(14, "1 fortnight")
+    assert "1 fortnight" in str(exc.value)

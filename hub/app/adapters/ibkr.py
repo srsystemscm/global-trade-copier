@@ -18,6 +18,43 @@ from app.contract_specs import get_contract_spec
 
 logger = logging.getLogger(__name__)
 
+# How long one bar of each IBKR size covers, in seconds.
+_BAR_SECONDS = {
+    "secs": 1, "sec": 1, "min": 60, "mins": 60, "hour": 3600, "hours": 3600,
+    "day": 86400, "week": 604800, "month": 2592000,
+}
+
+
+def _duration_for(period: int, bar_size: str) -> str:
+    """How much history to ask IBKR for to get `period` + 5 bars of this size.
+
+    A fixed "30 D" was fine while every caller wanted daily bars, but it
+    breaks both ways once the size varies: 30 days of 1-minute bars is tens
+    of thousands of bars and IBKR refuses the request outright, while 30
+    days of weekly bars is only four and compute_atr() would reject it.
+
+    The x3 covers the gap between calendar time and session time -- weekends
+    and the overnight break mean a day of wall clock is nothing like a day of
+    RTH bars, and asking for too little is the failure that costs an entry.
+    """
+    want = period + 5
+    parts = bar_size.split()
+    try:
+        count = int(parts[0])
+        seconds = _BAR_SECONDS[parts[1].lower()] * count
+    except (IndexError, ValueError, KeyError):
+        raise AdapterRejectedError(
+            f"unrecognised bar size {bar_size!r} -- expected something like "
+            f"'1 day', '4 hours' or '15 mins'"
+        )
+
+    if seconds >= 86400:
+        return f"{max(int(want * seconds / 86400) + 1, 30)} D"
+
+    # Sub-daily: ask in days, since IBKR caps the seconds form at 86400.
+    days = int((want * seconds * 3) / 86400) + 1
+    return f"{min(days, 365)} D"
+
 
 class IBKRAdapter(BrokerAdapter):
     """Talks to Interactive Brokers via TWS/IB Gateway's API, through
@@ -450,15 +487,17 @@ class IBKRAdapter(BrokerAdapter):
         return AccountSummary(balance=balance, equity=equity)
 
     async def get_price_history(
-        self, symbol: str, period: int, month_slot: int = 0, contract_id: Optional[int] = None
+        self, symbol: str, period: int, month_slot: int = 0,
+        contract_id: Optional[int] = None, bar_size: Optional[str] = None
     ) -> List[Bar]:
         assert self.ib is not None, "adapter not connected"
         contract = await self._contract_for_request(symbol, month_slot, contract_id)
+        size = bar_size or "1 day"
         bars = await self.ib.reqHistoricalDataAsync(
             contract,
             endDateTime="",
-            durationStr=f"{max(period + 5, 30)} D",
-            barSizeSetting="1 day",
+            durationStr=_duration_for(period, size),
+            barSizeSetting=size,
             whatToShow="TRADES",
             useRTH=True,
         )

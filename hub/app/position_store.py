@@ -28,7 +28,7 @@ _FIELDS = (
     # Which ATR period measured this position. Restored so a roll after a
     # restart re-derives stops the way the entry was measured rather than
     # from whatever the slave default is by then.
-    "atr_period",
+    "atr_period", "bar_size",
 )
 
 

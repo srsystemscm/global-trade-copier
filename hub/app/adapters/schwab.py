@@ -359,7 +359,8 @@ class SchwabAdapter(BrokerAdapter):
         return AccountSummary(balance=float(balance), equity=float(equity))
 
     async def get_price_history(
-        self, symbol: str, period: int, month_slot: int = 0, contract_id: Optional[int] = None
+        self, symbol: str, period: int, month_slot: int = 0,
+        contract_id: Optional[int] = None, bar_size: Optional[str] = None
     ) -> List[Bar]:
         is_future = get_contract_spec(symbol) is not None
         schwab_symbol = self._futures_symbol(symbol) if is_future else symbol

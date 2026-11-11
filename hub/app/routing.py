@@ -46,6 +46,11 @@ class Route:
     # of them to both -- translating the other's stop against an ATR it
     # never meant. None falls back to the slave's own default.
     atr_period: Optional[int] = None
+    # The bars that period counts. Same reasoning: a strategy measuring its
+    # ATR on H4 and a slave measuring the same multiple on daily bars are
+    # comparing two different volatilities, and nothing in the numbers would
+    # say so. None means the adapter's own default (daily).
+    bar_size: Optional[str] = None
 
 
 def routing_is_strict(slave_config: Dict[str, Any]) -> bool:
@@ -91,6 +96,7 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                     risk_management=entry.get("risk_management"),
                     atr_period=(None if entry.get("atr_period") is None
                                 else int(entry["atr_period"])),
+                    bar_size=entry.get("bar_size"),
                 )
             )
     return matched

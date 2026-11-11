@@ -176,7 +176,8 @@ class MT4Adapter(BrokerAdapter):
         raise NotImplementedError("MT4Adapter (mirror mode) does not support account summaries")
 
     async def get_price_history(
-        self, symbol: str, period: int, month_slot: int = 0, contract_id: Optional[int] = None
+        self, symbol: str, period: int, month_slot: int = 0,
+        contract_id: Optional[int] = None, bar_size: Optional[str] = None
     ) -> List[Bar]:
         raise NotImplementedError("MT4Adapter (mirror mode) does not support price history / ATR")
 
