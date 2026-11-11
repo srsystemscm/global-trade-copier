@@ -73,6 +73,8 @@ class FakeBroker:
             "symbol": order.symbol, "direction": order.direction, "size": order.size,
             "sl": order.sl, "tp": order.tp, "month_slot": order.month_slot,
             "contract_id": order.contract_id, "ticket": self._next_ticket,
+            "order_type": order.order_type, "limit_price": order.limit_price,
+            "outside_rth": order.outside_rth,
         })
         self.calls.append(("open", order.symbol, order.contract_id))
         return OrderResult(slave_ticket=self._next_ticket, price=self.fill_price,

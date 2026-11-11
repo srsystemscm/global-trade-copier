@@ -351,6 +351,16 @@ class IBKRAdapter(BrokerAdapter):
     async def open(self, order: OrderRequest) -> OrderResult:
         ib_mod = self._require_ib()
         assert self.ib is not None, "adapter not connected"
+
+        # Checked before any network work: a request that cannot become a
+        # valid order should fail here, not after qualifying a contract and
+        # certainly not by quietly becoming a market order -- which outside
+        # regular hours is rejected anyway, and inside them fills at any
+        # price at all.
+        if order.order_type == "limit" and order.limit_price is None:
+            raise AdapterRejectedError(
+                f"limit order for {order.symbol} has no limit price"
+            )
         contract = await self._contract_for_request(order.symbol, order.month_slot, order.contract_id)
         action = "BUY" if order.direction == "BUY" else "SELL"
         closing_action = "SELL" if action == "BUY" else "BUY"
@@ -364,12 +374,6 @@ class IBKRAdapter(BrokerAdapter):
             )
 
         if order.order_type == "limit":
-            if order.limit_price is None:
-                raise AdapterRejectedError(
-                    f"limit order for {order.symbol} has no limit price -- refusing "
-                    f"rather than sending it as a market order, which outside "
-                    f"regular hours would be rejected anyway"
-                )
             entry = ib_mod.LimitOrder(
                 action, order.size, self._round_to_tick(order.limit_price, order.symbol)
             )

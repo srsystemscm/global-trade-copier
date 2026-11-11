@@ -61,6 +61,13 @@ class Route:
     # the spread is the point -- a limit sitting at the bid in a thin
     # evening book is a signal that quietly never becomes a position.
     limit_offset_pct: float = 0.0
+    # Which way this route trades. None takes both, which is right for a
+    # futures leg that can be short as easily as long. An ETF leg usually
+    # cannot: the long-side proxies here have no inverse twin, so without
+    # this a SELL on the master would SHORT a leveraged ETF -- overnight,
+    # where borrow is scarce and the position is the opposite of the one
+    # intended.
+    direction: Optional[str] = None
 
 
 def routing_is_strict(slave_config: Dict[str, Any]) -> bool:
@@ -87,6 +94,9 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
         account = entry.get("account")
         if account is not None and signal.account != str(account):
             continue
+        direction = entry.get("direction")
+        if direction is not None and signal.direction != str(direction).upper():
+            continue
 
         targets = entry.get("targets")
         if targets is None:
@@ -110,6 +120,8 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                     order_type=entry.get("order_type", "market"),
                     outside_rth=bool(entry.get("outside_rth", False)),
                     limit_offset_pct=float(entry.get("limit_offset_pct", 0.0)),
+                    direction=(None if entry.get("direction") is None
+                               else str(entry["direction"]).upper()),
                 )
             )
     return matched
@@ -120,7 +132,7 @@ def describe_refusal(slave_config: Dict[str, Any], signal: Signal) -> str:
     if routing_is_strict(slave_config):
         known = sorted(
             {
-                (e.get("symbol"), e.get("magic"), e.get("account"))
+                (e.get("symbol"), e.get("magic"), e.get("account"), e.get("direction"))
                 for e in slave_config.get("routes", [])
             }
         )
@@ -128,6 +140,6 @@ def describe_refusal(slave_config: Dict[str, Any], signal: Signal) -> str:
             f"no route for symbol={signal.symbol} magic={signal.magic} "
             f"account={signal.account!r} -- unrouted signals are "
             f"refused so an unknown strategy can't land on another strategy's contract. "
-            f"Configured routes (symbol, magic, account): {known}"
+            f"Configured routes (symbol, magic, account, direction): {known}"
         )
     return f"no symbol_map entry for master symbol={signal.symbol}"
