@@ -47,6 +47,15 @@ MICRO_FUTURES_SPECS: Dict[str, ContractSpec] = {
     # where the serial months are near-dead and routing to "the next expiry"
     # would park a strategy in one.
     "MET": ContractSpec("MET", tick_size=0.50, tick_value=0.05, point_value=0.10, exchange="CME"),
+    # Micro Bitcoin: 0.10 BTC, $5-per-bitcoin tick worth $0.50 a contract,
+    # so a $1 move in BTC is $0.10. Spreads tick at $1/bitcoin ($0.10); not
+    # modelled, the copier only sends outrights.
+    "MBT": ContractSpec("MBT", tick_size=5.00, tick_value=0.50, point_value=0.10, exchange="CME"),
+    # Micro Henry Hub Natural Gas: 1,000 MMBtu -- a tenth of full-size NG,
+    # not the quarter it looks like next to the other micros. 0.001 tick on
+    # 1,000 MMBtu is $1.00, so a 1.00 move is $1,000. NYMEX, like MCL:
+    # IBKR's qualifyContracts() fails outright on the wrong exchange.
+    "MNG": ContractSpec("MNG", tick_size=0.001, tick_value=1.00, point_value=1000.0, exchange="NYMEX"),
 
     # Full-size. GC is 100 troy oz -- 10x MGC, so roughly $430k notional per
     # contract at $4,300 gold. Size it deliberately; dollar_notional will

@@ -77,6 +77,21 @@ class AutonomousCopyEngine(SessionGateMixin):
         # is managed solely by the trailing monitor below, which is how this
         # engine behaved before.
         self.follow_master_modify = slave_config.get("follow_master_modify", True)
+        # An open the broker cannot accept yet is held and retried rather
+        # than dropped. CME halts its whole complex 17:00-18:00 ET, and an
+        # MT4 server on GMT+2/+3 opens its daily bar right on that boundary
+        # -- so a D1 strategy's entry lands inside the halt roughly once a
+        # day. Dropped, it fills on the CFD legs and silently does not exist
+        # on the futures one, with no registry row for reconciliation to
+        # catch.
+        defer = slave_config.get("defer_unavailable", {})
+        self.defer_enabled = defer.get("enabled", True)
+        self.defer_retry_seconds = defer.get("retry_seconds", 30)
+        # 90 minutes covers the 60-minute halt with room for a late reopen.
+        self.defer_max_seconds = defer.get("max_seconds", 5400)
+        self.defer_poll_seconds = defer.get("poll_seconds", 5)
+        # keyed (master_account, master_ticket, target, month_slot)
+        self._deferred: Dict[tuple, dict] = {}
         self._last_roll_check = 0.0
 
         # Keyed (master_account, master_ticket, slave_symbol): ticket
@@ -85,6 +100,7 @@ class AutonomousCopyEngine(SessionGateMixin):
         self._positions: Dict[Tuple[str, int, str], dict] = {}
         self._consume_task: Optional[asyncio.Task] = None
         self._monitor_task: Optional[asyncio.Task] = None
+        self._deferred_task: Optional[asyncio.Task] = None
 
     async def restore(self) -> None:
         """Reload positions that were open when the hub last stopped.
@@ -117,9 +133,11 @@ class AutonomousCopyEngine(SessionGateMixin):
     def start(self) -> None:
         self._consume_task = asyncio.create_task(self._run(), name=f"autonomous-engine-{self.slave_id}")
         self._monitor_task = asyncio.create_task(self._monitor_loop(), name=f"autonomous-monitor-{self.slave_id}")
+        self._deferred_task = asyncio.create_task(
+            self._deferred_loop(), name=f"autonomous-deferred-{self.slave_id}")
 
     async def stop(self) -> None:
-        for task in (self._consume_task, self._monitor_task):
+        for task in (self._consume_task, self._monitor_task, self._deferred_task):
             if task is not None:
                 task.cancel()
                 try:
@@ -195,7 +213,16 @@ class AutonomousCopyEngine(SessionGateMixin):
         tp_mult = abs(signal.tp - signal.price) / signal.atr if signal.tp is not None else None
 
         for route in routes:
-            await self._open_one(signal, route, sl_mult, tp_mult)
+            try:
+                await self._open_one(signal, route, sl_mult, tp_mult)
+            except AdapterError as exc:
+                # Deliberately not classified by error text. IBKR's wording
+                # for a closed market is not something to pin behaviour on,
+                # and the alternative -- dropping anything unrecognised --
+                # is the failure this exists to prevent. A genuinely bad
+                # order retries until the ceiling and then says so, which is
+                # noisier than dropping it and far easier to notice.
+                await self._defer_open(signal, route, sl_mult, tp_mult, exc)
 
     async def _open_one(
         self, signal: Signal, route: Route, sl_mult: Optional[float], tp_mult: Optional[float]
@@ -422,7 +449,129 @@ class AutonomousCopyEngine(SessionGateMixin):
                 tp=slave_tp,
             )
 
+    async def _defer_open(self, signal, route, sl_mult, tp_mult, exc) -> None:
+        """Hold an open the broker refused, to try again shortly."""
+        if not self.defer_enabled:
+            logger.error(
+                "slave=%s could not open %s for master_ticket=%s: %s",
+                self.slave_id, route.target, signal.ticket, exc,
+            )
+            await self._emit("slave_error", master_ticket=signal.ticket,
+                             action="OPEN", message=str(exc))
+            return
+
+        key = (signal.account, signal.ticket, route.target, route.month_slot)
+        if key in self._deferred:
+            return
+
+        now = time.time()
+        self._deferred[key] = {
+            "signal": signal, "route": route, "sl_mult": sl_mult, "tp_mult": tp_mult,
+            "first_at": now, "next_at": now + self.defer_retry_seconds,
+            "attempts": 1, "last_error": str(exc),
+        }
+        logger.warning(
+            "slave=%s deferring %s for master_ticket=%s, retrying every %ss for up "
+            "to %ss: %s",
+            self.slave_id, route.target, signal.ticket,
+            self.defer_retry_seconds, self.defer_max_seconds, exc,
+        )
+        await self._emit("open_deferred", master_ticket=signal.ticket,
+                         slave_symbol=route.target, reason=str(exc))
+
+    async def _deferred_loop(self) -> None:
+        """Retry held opens until the broker takes them, or time runs out.
+
+        Each retry re-runs the whole of _open_one(), so the contract is
+        re-priced and re-sized against live data at the moment it actually
+        fills -- not against whatever could be read during the halt. What
+        carries over from the original signal is the master's intent: the
+        ATR multiple its stop represented.
+
+        These live in memory. A hub restart mid-halt loses them, which is
+        the honest limit of this: it narrows a daily certainty to a rare
+        coincidence rather than removing the failure outright.
+        """
+        while True:
+            await asyncio.sleep(self.defer_poll_seconds)
+            if not self._deferred:
+                continue
+            if not self.session_up:
+                # Nothing to gain from retrying into a dead session; the
+                # watchdog is rebuilding it and the ceiling still applies.
+                continue
+
+            now = time.time()
+            for key, item in list(self._deferred.items()):
+                if now < item["next_at"]:
+                    continue
+
+                if now - item["first_at"] > self.defer_max_seconds:
+                    del self._deferred[key]
+                    await self._abandon_deferred(key, item)
+                    continue
+
+                item["attempts"] += 1
+                try:
+                    await self._open_one(item["signal"], item["route"],
+                                         item["sl_mult"], item["tp_mult"])
+                except AdapterError as exc:
+                    item["last_error"] = str(exc)
+                    item["next_at"] = now + self.defer_retry_seconds
+                    continue
+
+                del self._deferred[key]
+                waited = now - item["first_at"]
+                logger.info(
+                    "slave=%s opened deferred %s for master_ticket=%s after %.0fs "
+                    "and %d attempt(s)",
+                    self.slave_id, key[2], key[1], waited, item["attempts"],
+                )
+                await self._emit("deferred_open_filled", master_ticket=key[1],
+                                 slave_symbol=key[2], waited_seconds=round(waited))
+
+    async def _abandon_deferred(self, key, item) -> None:
+        """Give up, loudly. The master is in this trade and this leg is not."""
+        msg = (
+            f"Slave {self.slave_id} never opened {key[2]} for master_ticket={key[1]} "
+            f"after {self.defer_max_seconds}s and {item['attempts']} attempts. The "
+            f"master IS in this trade and this leg is NOT -- check it by hand. "
+            f"Last error: {item['last_error']}"
+        )
+        logger.error(msg)
+        await self._emit("deferred_open_abandoned", master_ticket=key[1],
+                         slave_symbol=key[2], attempts=item["attempts"],
+                         message=item["last_error"])
+        if self.notifier:
+            await self.notifier.notify(
+                "deferred_open_abandoned", msg, slave_id=self.slave_id,
+                master_ticket=key[1], slave_symbol=key[2],
+            )
+
+    def _cancel_deferred(self, account: str, master_ticket: int) -> int:
+        """Drop held opens for a ticket the master has already closed.
+
+        Without this a deferred entry outlives the trade it belongs to and
+        opens a position the master is no longer in -- the copier putting on
+        risk entirely by itself, which is worse than the missed fill it was
+        trying to avoid.
+        """
+        stale = [k for k in self._deferred if k[0] == account and k[1] == master_ticket]
+        for k in stale:
+            del self._deferred[k]
+        return len(stale)
+
     async def _handle_close(self, signal: Signal) -> None:
+        dropped = self._cancel_deferred(signal.account, signal.ticket)
+        if dropped:
+            logger.warning(
+                "slave=%s master closed ticket=%s before %d deferred open(s) could "
+                "fill; dropping them rather than opening into a closed trade",
+                self.slave_id, signal.ticket, dropped,
+            )
+            await self._emit("deferred_open_cancelled", master_ticket=signal.ticket,
+                             dropped=dropped)
+
         mappings = trade_registry.get_open_mappings(self.slave_id, signal.account, signal.ticket)
         if not mappings:
             logger.warning(

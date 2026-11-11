@@ -152,3 +152,36 @@ def test_crypto_has_no_dead_serial_months():
 
     assert get_contract_spec("MET").liquid_months == ()
     assert get_contract_spec("MGC").liquid_months != ()
+
+
+def test_the_cfd_to_futures_launch_set_is_all_routable():
+    """MCL, MNG, MBT and MET are the initial launch set. A missing spec is
+    not a soft failure -- the symbol has no tick to round to and no point
+    value to size with, so the route simply cannot resolve."""
+    from app.contract_specs import get_contract_spec
+
+    for symbol in ("MCL", "MNG", "MBT", "MET"):
+        assert get_contract_spec(symbol) is not None, f"{symbol} is unroutable"
+
+
+def test_every_spec_is_internally_consistent():
+    """tick_size x point_value must equal tick_value. The three are edited
+    by hand from exchange tables and are easy to update one at a time; this
+    is what catches that, for every contract at once rather than one by one.
+    """
+    from app.contract_specs import MICRO_FUTURES_SPECS
+
+    for symbol, spec in MICRO_FUTURES_SPECS.items():
+        assert spec.tick_size * spec.point_value == pytest.approx(spec.tick_value), (
+            f"{symbol}: {spec.tick_size} x {spec.point_value} != {spec.tick_value}"
+        )
+
+
+def test_the_energy_micros_are_on_nymex_not_cme():
+    """IBKR's qualifyContracts() fails outright on the wrong exchange -- it
+    is part of the contract's identity, not a hint."""
+    from app.contract_specs import get_contract_spec
+
+    assert get_contract_spec("MNG").exchange == "NYMEX"
+    assert get_contract_spec("MCL").exchange == "NYMEX"
+    assert get_contract_spec("MBT").exchange == "CME"
