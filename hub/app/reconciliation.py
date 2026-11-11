@@ -45,12 +45,16 @@ async def reconcile_slave(
     for row in open_rows:
         if row.slave_symbol in live_symbols:
             continue
-        trade_registry.record_close(slave_id, row.master_ticket, row.slave_symbol)
+        trade_registry.record_close(
+            slave_id, row.master_account, row.master_ticket, row.slave_symbol
+        )
         # Drop the durable engine state too. Leaving it would restore the
         # position on the next start, and the trailing monitor would then
         # place a stop for something the broker doesn't hold -- on a flat
         # account that opens a position rather than protecting one.
-        position_store.delete(slave_id, row.master_ticket, row.slave_symbol)
+        position_store.delete(
+            slave_id, row.master_account, row.master_ticket, row.slave_symbol
+        )
         logger.warning(
             "slave=%s reconciliation: %s (master_ticket=%s, slave_ticket=%s) was OPEN in the "
             "registry but the broker doesn't have it open -- marked CLOSED",

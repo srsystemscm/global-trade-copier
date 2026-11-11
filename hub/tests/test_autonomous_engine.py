@@ -138,8 +138,8 @@ def test_the_position_is_recorded_everywhere_it_needs_to_be():
     e = _engine(b)
     asyncio.run(e._handle_open(_sig(ticket=55)))
 
-    assert (55, "GC") in e._positions
-    assert trade_registry.get_open_mappings(SLAVE, 55)
+    assert ("", 55, "GC") in e._positions
+    assert trade_registry.get_open_mappings(SLAVE, "", 55)
     (_, stored), = position_store.load_all(SLAVE)
     assert stored["contract_local"] == "GCZ6"
     assert stored["sl_mult"] is not None, "a roll could not re-derive stops without this"
@@ -152,9 +152,9 @@ def test_closing_clears_memory_registry_and_store():
     asyncio.run(e._handle_close(_sig(ticket=55, action="CLOSE")))
 
     assert b.closed, "the broker position must actually be closed"
-    assert (55, "GC") not in e._positions
+    assert ("", 55, "GC") not in e._positions
     assert position_store.load_all(SLAVE) == []
-    assert not trade_registry.get_open_mappings(SLAVE, 55)
+    assert not trade_registry.get_open_mappings(SLAVE, "", 55)
 
 
 def test_close_for_an_unknown_ticket_places_no_orders():
@@ -172,5 +172,5 @@ def test_restore_brings_a_position_back_after_a_restart():
     fresh = _engine(b)                      # a new process would start empty
     assert fresh._positions == {}
     asyncio.run(fresh.restore())
-    assert (55, "GC") in fresh._positions
-    assert fresh._positions[(55, "GC")]["contract_local"] == "GCZ6"
+    assert ("", 55, "GC") in fresh._positions
+    assert fresh._positions[("", 55, "GC")]["contract_local"] == "GCZ6"

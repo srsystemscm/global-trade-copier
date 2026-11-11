@@ -1,14 +1,17 @@
+import logging
 import sqlite3
 from contextlib import contextmanager
-from typing import Iterator, Optional
+from typing import Iterator, List, Optional
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS trades (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     master_ticket   INTEGER NOT NULL,
-    master_account  TEXT,
+    master_account  TEXT NOT NULL DEFAULT '',
     symbol          TEXT NOT NULL,
     action          TEXT NOT NULL,      -- OPEN | MODIFY | CLOSE
     direction       TEXT,               -- BUY | SELL
@@ -19,7 +22,16 @@ CREATE TABLE IF NOT EXISTS trades (
     signal_ts       REAL NOT NULL,      -- timestamp assigned by the master EA
     received_at     REAL NOT NULL,      -- timestamp assigned by the hub
     raw_json        TEXT NOT NULL,
-    UNIQUE (master_ticket, signal_ts)
+    -- Matches SignalBus._dedup_key() exactly, and has to.
+    -- master_account, because MT4 ticket numbers are per-account: two masters
+    -- can send the same ticket number in the same second for different
+    -- trades, and without it the second is silently discarded by the
+    -- INSERT OR IGNORE in _persist().
+    -- action, because the EA's TimeGMT() has whole-second resolution while it
+    -- polls every 500ms, so an OPEN and the MODIFY that follows it share a
+    -- signal_ts routinely -- and that MODIFY was being dropped from the
+    -- signal history even though it was still fanned out to the slaves.
+    UNIQUE (master_account, master_ticket, action, signal_ts)
 );
 
 CREATE TABLE IF NOT EXISTS slaves (
@@ -40,17 +52,19 @@ CREATE TABLE IF NOT EXISTS config (
 CREATE TABLE IF NOT EXISTS slave_trades (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     slave_id        TEXT NOT NULL,
+    master_account  TEXT NOT NULL DEFAULT '',   -- which master; '' = unknown/legacy
     master_ticket   INTEGER NOT NULL,
     slave_symbol    TEXT NOT NULL,      -- the mapped slave-side symbol (e.g. MGC, GLD)
     slave_ticket    INTEGER,
     status          TEXT NOT NULL DEFAULT 'OPEN',  -- OPEN | CLOSED
     opened_at       REAL,
     closed_at       REAL,
-    UNIQUE (slave_id, master_ticket, slave_symbol)
+    UNIQUE (slave_id, master_account, master_ticket, slave_symbol)
 );
 
 CREATE TABLE IF NOT EXISTS engine_positions (
     slave_id        TEXT    NOT NULL,
+    master_account  TEXT    NOT NULL DEFAULT '',
     master_ticket   INTEGER NOT NULL,
     slave_symbol    TEXT    NOT NULL,
     slave_ticket    INTEGER NOT NULL,
@@ -70,7 +84,7 @@ CREATE TABLE IF NOT EXISTS engine_positions (
     sl_order_id     INTEGER,             -- broker-side bracket legs, so they can
     tp_order_id     INTEGER,             -- be cancelled/replaced after a restart
     updated_at      REAL    NOT NULL,
-    PRIMARY KEY (slave_id, master_ticket, slave_symbol)
+    PRIMARY KEY (slave_id, master_account, master_ticket, slave_symbol)
 );
 
 CREATE TABLE IF NOT EXISTS logs (
@@ -92,10 +106,67 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+# Tables whose keys gained master_account, and how to tell an old one.
+# `trades` already had the column -- what it lacked was the column in its
+# UNIQUE constraint, so the column test alone would miss it.
+_ACCOUNT_KEYED = {
+    "slave_trades": "master_account",
+    "engine_positions": "master_account",
+    "trades": "UNIQUE (master_account, master_ticket, action",
+}
+
+
+def _tables_predating_account_keys(conn: sqlite3.Connection) -> List[str]:
+    stale = []
+    for table, marker in _ACCOUNT_KEYED.items():
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        if row is not None and marker not in (row["sql"] or ""):
+            stale.append(table)
+    return stale
+
+
+def _migrate_to_account_keys(conn: sqlite3.Connection) -> None:
+    """Rebuild the tables whose keys assumed a single master.
+
+    SQLite cannot alter a UNIQUE constraint or a PRIMARY KEY, so each stale
+    table is renamed aside, recreated from SCHEMA, refilled, and dropped.
+
+    Every existing row came from a single-master setup, so '' is the correct
+    value for them rather than a guess -- and it is what a bridge EA that
+    sends no account still produces, which keeps those rows reachable.
+    """
+    stale = _tables_predating_account_keys(conn)
+    if not stale:
+        return
+
+    logger.warning("migrating %s to account-aware keys", ", ".join(sorted(stale)))
+    for table in stale:
+        conn.execute(f"ALTER TABLE {table} RENAME TO {table}__pre_account")
+
+    conn.executescript(SCHEMA)  # recreates them with the new keys
+
+    for table in stale:
+        old_cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table}__pre_account)")]
+        new_cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        shared = [c for c in old_cols if c in new_cols]
+        # trades carried a nullable master_account; the column is NOT NULL now.
+        selects = ["COALESCE(master_account, '')" if c == "master_account" else c for c in shared]
+        conn.execute(
+            f"INSERT INTO {table} ({', '.join(shared)}) "
+            f"SELECT {', '.join(selects)} FROM {table}__pre_account"
+        )
+        moved = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+        conn.execute(f"DROP TABLE {table}__pre_account")
+        logger.warning("  %s: %d row(s) carried over", table, moved)
+
+
 def init_db() -> None:
     conn = get_connection()
     try:
         conn.executescript(SCHEMA)
+        _migrate_to_account_keys(conn)
         conn.commit()
     finally:
         conn.close()

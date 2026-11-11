@@ -43,7 +43,12 @@ class SignalBus:
         # by the broker setting SL/TP), silently dropping the second one.
         # Including the action still deduplicates a genuinely replayed
         # message, which is all this is meant to catch.
-        return f"{signal.ticket}:{signal.action}:{signal.ts}"
+        #
+        # The account leads the key because MT4 ticket numbers are per
+        # account: with several masters feeding one hub, two of them can
+        # legitimately send the same ticket number for different trades, and
+        # keyed without the account the second is silently dropped as a dupe.
+        return f"{signal.account}:{signal.ticket}:{signal.action}:{signal.ts}"
 
     def _is_duplicate(self, signal: Signal) -> bool:
         self._evict_expired()

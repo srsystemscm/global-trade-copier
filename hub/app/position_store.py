@@ -28,7 +28,8 @@ _FIELDS = (
 )
 
 
-def save(slave_id: str, master_ticket: int, slave_symbol: str, pos: Dict[str, Any]) -> None:
+def save(slave_id: str, master_account: str, master_ticket: int, slave_symbol: str,
+         pos: Dict[str, Any]) -> None:
     """Upsert one position's state. Called whenever it changes -- open, roll,
     trailing stop move -- so a restart never loses more than the last tick."""
     values = {f: pos.get(f) for f in _FIELDS}
@@ -40,27 +41,30 @@ def save(slave_id: str, master_ticket: int, slave_symbol: str, pos: Dict[str, An
         cur.execute(
             f"""
             INSERT INTO engine_positions
-                (slave_id, master_ticket, slave_symbol, slave_ticket, {cols}, updated_at)
-            VALUES (?, ?, ?, ?, {placeholders}, ?)
-            ON CONFLICT (slave_id, master_ticket, slave_symbol) DO UPDATE SET
+                (slave_id, master_account, master_ticket, slave_symbol, slave_ticket, {cols}, updated_at)
+            VALUES (?, ?, ?, ?, ?, {placeholders}, ?)
+            ON CONFLICT (slave_id, master_account, master_ticket, slave_symbol) DO UPDATE SET
                 slave_ticket = excluded.slave_ticket,
                 {updates},
                 updated_at = excluded.updated_at
             """,
-            (slave_id, master_ticket, slave_symbol, pos["slave_ticket"],
+            (slave_id, master_account, master_ticket, slave_symbol, pos["slave_ticket"],
              *[values[f] for f in _FIELDS], time.time()),
         )
 
 
-def delete(slave_id: str, master_ticket: int, slave_symbol: str) -> None:
+def delete(slave_id: str, master_account: str, master_ticket: int, slave_symbol: str) -> None:
     with db_cursor() as cur:
         cur.execute(
-            "DELETE FROM engine_positions WHERE slave_id = ? AND master_ticket = ? AND slave_symbol = ?",
-            (slave_id, master_ticket, slave_symbol),
+            """
+            DELETE FROM engine_positions
+            WHERE slave_id = ? AND master_account = ? AND master_ticket = ? AND slave_symbol = ?
+            """,
+            (slave_id, master_account, master_ticket, slave_symbol),
         )
 
 
-def load_all(slave_id: str) -> List[Tuple[Tuple[int, str], Dict[str, Any]]]:
+def load_all(slave_id: str) -> List[Tuple[Tuple[str, int, str], Dict[str, Any]]]:
     """Every stored position for a slave, shaped like the engine's own
     in-memory dict so it can be restored directly."""
     with db_cursor() as cur:
@@ -74,5 +78,5 @@ def load_all(slave_id: str) -> List[Tuple[Tuple[int, str], Dict[str, Any]]]:
         pos: Dict[str, Any] = {f: d[f] for f in _FIELDS}
         pos["slave_ticket"] = d["slave_ticket"]
         pos["breakeven_done"] = bool(d["breakeven_done"])
-        out.append(((d["master_ticket"], d["slave_symbol"]), pos))
+        out.append(((d["master_account"], d["master_ticket"], d["slave_symbol"]), pos))
     return out

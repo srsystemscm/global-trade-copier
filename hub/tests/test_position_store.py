@@ -36,49 +36,49 @@ def _pos(**kw):
 
 
 def test_a_saved_position_comes_back_intact():
-    position_store.save("test-1", 379792233, "GC", _pos())
+    position_store.save("test-1", "", 379792233, "GC", _pos())
     (key, got), = position_store.load_all("test-1")
-    assert key == (379792233, "GC")
+    assert key == ("", 379792233, "GC")
     assert got["slave_ticket"] == 18
     assert got["contract_local"] == "GCZ6"
     assert got["contract_id"] == 462941472
 
 
 def test_atr_multiples_survive_so_a_roll_can_rederive_stops():
-    position_store.save("test-1", 1, "GC", _pos(sl_mult=4.7, tp_mult=2.5))
+    position_store.save("test-1", "", 1, "GC", _pos(sl_mult=4.7, tp_mult=2.5))
     (_, got), = position_store.load_all("test-1")
     assert (got["sl_mult"], got["tp_mult"]) == (4.7, 2.5)
 
 
 def test_bracket_order_ids_survive_so_the_stop_can_be_replaced():
-    position_store.save("test-1", 1, "GC", _pos(sl_order_id=19, tp_order_id=20))
+    position_store.save("test-1", "", 1, "GC", _pos(sl_order_id=19, tp_order_id=20))
     (_, got), = position_store.load_all("test-1")
     assert (got["sl_order_id"], got["tp_order_id"]) == (19, 20)
 
 
 def test_breakeven_flag_round_trips_as_a_bool():
     """Stored as an int; a truthy 0 would silently re-arm breakeven."""
-    position_store.save("test-1", 1, "GC", _pos(breakeven_done=True))
+    position_store.save("test-1", "", 1, "GC", _pos(breakeven_done=True))
     (_, got), = position_store.load_all("test-1")
     assert got["breakeven_done"] is True
 
-    position_store.save("test-1", 2, "GC", _pos(breakeven_done=False))
-    got2 = dict(position_store.load_all("test-1"))[(2, "GC")]
+    position_store.save("test-1", "", 2, "GC", _pos(breakeven_done=False))
+    got2 = dict(position_store.load_all("test-1"))[("", 2, "GC")]
     assert got2["breakeven_done"] is False
 
 
 def test_saving_again_updates_rather_than_duplicates():
     """The trailing monitor saves on every stop move."""
-    position_store.save("test-1", 1, "GC", _pos(sl=3953.6))
-    position_store.save("test-1", 1, "GC", _pos(sl=3990.0, breakeven_done=True))
+    position_store.save("test-1", "", 1, "GC", _pos(sl=3953.6))
+    position_store.save("test-1", "", 1, "GC", _pos(sl=3990.0, breakeven_done=True))
     rows = position_store.load_all("test-1")
     assert len(rows) == 1
     assert rows[0][1]["sl"] == 3990.0
 
 
 def test_a_roll_updates_the_contract_in_place():
-    position_store.save("test-1", 1, "GC", _pos())
-    position_store.save("test-1", 1, "GC",
+    position_store.save("test-1", "", 1, "GC", _pos())
+    position_store.save("test-1", "", 1, "GC",
                         _pos(slave_ticket=31, contract_id=765079322, contract_local="GCG7",
                              contract_expiry="20270224"))
     (_, got), = position_store.load_all("test-1")
@@ -86,14 +86,14 @@ def test_a_roll_updates_the_contract_in_place():
 
 
 def test_closing_forgets_it():
-    position_store.save("test-1", 1, "GC", _pos())
-    position_store.delete("test-1", 1, "GC")
+    position_store.save("test-1", "", 1, "GC", _pos())
+    position_store.delete("test-1", "", 1, "GC")
     assert position_store.load_all("test-1") == []
 
 
 def test_slaves_do_not_see_each_others_positions():
-    position_store.save("test-1", 1, "GC", _pos())
-    position_store.save("test-2", 1, "GC", _pos())
+    position_store.save("test-1", "", 1, "GC", _pos())
+    position_store.save("test-2", "", 1, "GC", _pos())
     assert len(position_store.load_all("test-1")) == 1
     assert len(position_store.load_all("test-2")) == 1
 
@@ -101,11 +101,11 @@ def test_slaves_do_not_see_each_others_positions():
 def test_two_strategies_on_one_symbol_are_separate_rows():
     """Different master tickets, different contract months -- the whole point
     of the multi-strategy design."""
-    position_store.save("test-1", 111, "GC", _pos(month_slot=0, contract_local="GCZ6"))
-    position_store.save("test-1", 222, "GC", _pos(month_slot=1, contract_local="GCG7"))
+    position_store.save("test-1", "", 111, "GC", _pos(month_slot=0, contract_local="GCZ6"))
+    position_store.save("test-1", "", 222, "GC", _pos(month_slot=1, contract_local="GCG7"))
     rows = dict(position_store.load_all("test-1"))
-    assert rows[(111, "GC")]["contract_local"] == "GCZ6"
-    assert rows[(222, "GC")]["contract_local"] == "GCG7"
+    assert rows[("", 111, "GC")]["contract_local"] == "GCZ6"
+    assert rows[("", 222, "GC")]["contract_local"] == "GCG7"
 
 
 def test_nothing_stored_means_nothing_restored():
@@ -127,8 +127,8 @@ def test_reconciliation_clears_the_stored_position():
     src = inspect.getsource(reconciliation.reconcile_slave)
     assert "position_store.delete" in src, "stale engine state would survive reconciliation"
 
-    position_store.save("test-recon", 555, "GC", _pos())
-    trade_registry.record_open("test-recon", 555, "GC", 18)
+    position_store.save("test-recon", "", 555, "GC", _pos())
+    trade_registry.record_open("test-recon", "", 555, "GC", 18)
 
     class _FlatBroker:
         async def get_open_positions(self, account_type):

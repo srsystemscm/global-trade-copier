@@ -34,6 +34,10 @@ class Route:
     target: str
     month_slot: int = 0
     magic: Optional[int] = None
+    # Which master this route accepts signals from. None matches any, which
+    # is the right default for a single-master hub; with several masters,
+    # magic alone cannot tell two of them apart when they run the same EA.
+    account: Optional[str] = None
     sizing: Optional[Dict[str, Any]] = None
     risk_management: Optional[Dict[str, Any]] = None
 
@@ -59,6 +63,9 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
         magic = entry.get("magic")
         if magic is not None and signal.magic != int(magic):
             continue
+        account = entry.get("account")
+        if account is not None and signal.account != str(account):
+            continue
 
         targets = entry.get("targets")
         if targets is None:
@@ -73,6 +80,7 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                     target=target,
                     month_slot=int(entry.get("month_slot", 0)),
                     magic=None if magic is None else int(magic),
+                    account=None if account is None else str(account),
                     sizing=entry.get("sizing"),
                     risk_management=entry.get("risk_management"),
                 )
@@ -85,13 +93,14 @@ def describe_refusal(slave_config: Dict[str, Any], signal: Signal) -> str:
     if routing_is_strict(slave_config):
         known = sorted(
             {
-                (e.get("symbol"), e.get("magic"))
+                (e.get("symbol"), e.get("magic"), e.get("account"))
                 for e in slave_config.get("routes", [])
             }
         )
         return (
-            f"no route for symbol={signal.symbol} magic={signal.magic} -- unrouted signals are "
+            f"no route for symbol={signal.symbol} magic={signal.magic} "
+            f"account={signal.account!r} -- unrouted signals are "
             f"refused so an unknown strategy can't land on another strategy's contract. "
-            f"Configured routes (symbol, magic): {known}"
+            f"Configured routes (symbol, magic, account): {known}"
         )
     return f"no symbol_map entry for master symbol={signal.symbol}"

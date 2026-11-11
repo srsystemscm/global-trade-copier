@@ -298,6 +298,6 @@ def test_the_registry_holds_one_open_row_through_a_whole_ladder():
     b = FakeBroker()
     journey(_mirror(b), ladder([3937.0, 4029.32, 4045.0]))
 
-    rows = trade_registry.get_open_mappings(MIRROR, 5001)
+    rows = trade_registry.get_open_mappings(MIRROR, "", 5001)
     assert len(rows) == 1
     assert rows[0].slave_ticket == b.opened[0]["ticket"]

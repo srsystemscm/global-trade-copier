@@ -92,7 +92,9 @@ class CopyEngine(SessionGateMixin):
                 master_ticket=signal.ticket,
             )
             result = await self.adapter.open(order)
-            trade_registry.record_open(self.slave_id, signal.ticket, signal.symbol, result.slave_ticket)
+            trade_registry.record_open(
+                self.slave_id, signal.account, signal.ticket, signal.symbol, result.slave_ticket
+            )
             logger.info(
                 "slave=%s opened master_ticket=%s as slave_ticket=%s",
                 self.slave_id, signal.ticket, result.slave_ticket,
@@ -108,7 +110,7 @@ class CopyEngine(SessionGateMixin):
             )
             return
 
-        mappings = trade_registry.get_open_mappings(self.slave_id, signal.ticket)
+        mappings = trade_registry.get_open_mappings(self.slave_id, signal.account, signal.ticket)
         if not mappings:
             logger.warning(
                 "slave=%s %s for unknown master_ticket=%s (never opened here?)",
@@ -130,7 +132,9 @@ class CopyEngine(SessionGateMixin):
                 )
             elif signal.action == "CLOSE":
                 await self.adapter.close(mapping.slave_ticket)
-                trade_registry.record_close(self.slave_id, signal.ticket, mapping.slave_symbol)
+                trade_registry.record_close(
+                    self.slave_id, signal.account, signal.ticket, mapping.slave_symbol
+                )
                 logger.info("slave=%s closed slave_ticket=%s", self.slave_id, mapping.slave_ticket)
                 await self._emit(
                     "slave_close",

@@ -66,7 +66,10 @@ class AutonomousCopyEngine(SessionGateMixin):
         self._last_roll_check = 0.0
 
         # keyed by (master_ticket, slave_symbol)
-        self._positions: Dict[Tuple[int, str], dict] = {}
+        # Keyed (master_account, master_ticket, slave_symbol): ticket
+        # numbers are per master account, so the account has to be in the key
+        # or two masters' positions collide in here as well as in the tables.
+        self._positions: Dict[Tuple[str, int, str], dict] = {}
         self._consume_task: Optional[asyncio.Task] = None
         self._monitor_task: Optional[asyncio.Task] = None
 
@@ -79,7 +82,7 @@ class AutonomousCopyEngine(SessionGateMixin):
         """
         restored = 0
         for key, pos in position_store.load_all(self.slave_id):
-            master_ticket, slave_symbol = key
+            _master_account, master_ticket, slave_symbol = key
             try:
                 await self.adapter.restore_position(
                     pos["slave_ticket"], {**pos, "slave_symbol": slave_symbol}
@@ -241,7 +244,9 @@ class AutonomousCopyEngine(SessionGateMixin):
             month_slot=route.month_slot,
         )
         result = await self.adapter.open(order)
-        trade_registry.record_open(self.slave_id, signal.ticket, target_symbol, result.slave_ticket)
+        trade_registry.record_open(
+            self.slave_id, signal.account, signal.ticket, target_symbol, result.slave_ticket
+        )
 
         # Pin the concrete contract. Slot numbers shift under you when the
         # front month rolls; an expiry doesn't, and the roll needs to know
@@ -253,7 +258,8 @@ class AutonomousCopyEngine(SessionGateMixin):
         except NotImplementedError:
             contract_id = contract_local = contract_expiry = None
 
-        self._positions[(signal.ticket, target_symbol)] = {
+        key = (signal.account, signal.ticket, target_symbol)
+        self._positions[key] = {
             "slave_ticket": result.slave_ticket,
             "entry_price": quote,
             "direction": signal.direction,
@@ -277,7 +283,7 @@ class AutonomousCopyEngine(SessionGateMixin):
             "tp_order_id": result.tp_order_id,
         }
         position_store.save(
-            self.slave_id, signal.ticket, target_symbol, self._positions[(signal.ticket, target_symbol)]
+            self.slave_id, signal.account, signal.ticket, target_symbol, self._positions[key]
         )
         logger.info(
             "slave=%s opened %s master_ticket=%s -> slave_ticket=%s size=%s sl=%s tp=%s",
@@ -296,7 +302,7 @@ class AutonomousCopyEngine(SessionGateMixin):
         )
 
     async def _handle_close(self, signal: Signal) -> None:
-        mappings = trade_registry.get_open_mappings(self.slave_id, signal.ticket)
+        mappings = trade_registry.get_open_mappings(self.slave_id, signal.account, signal.ticket)
         if not mappings:
             logger.warning(
                 "slave=%s CLOSE for unknown master_ticket=%s (never opened here?)", self.slave_id, signal.ticket
@@ -304,9 +310,13 @@ class AutonomousCopyEngine(SessionGateMixin):
             return
         for mapping in mappings:
             await self.adapter.close(mapping.slave_ticket)
-            trade_registry.record_close(self.slave_id, signal.ticket, mapping.slave_symbol)
-            self._positions.pop((signal.ticket, mapping.slave_symbol), None)
-            position_store.delete(self.slave_id, signal.ticket, mapping.slave_symbol)
+            trade_registry.record_close(
+                self.slave_id, signal.account, signal.ticket, mapping.slave_symbol
+            )
+            self._positions.pop((signal.account, signal.ticket, mapping.slave_symbol), None)
+            position_store.delete(
+                self.slave_id, signal.account, signal.ticket, mapping.slave_symbol
+            )
             logger.info(
                 "slave=%s closed %s slave_ticket=%s (master closed)",
                 self.slave_id, mapping.slave_symbol, mapping.slave_ticket,
@@ -381,7 +391,7 @@ class AutonomousCopyEngine(SessionGateMixin):
         by_symbol: Dict[str, list] = {}
         for key, pos in self._positions.items():
             if pos.get("contract_id") is not None:
-                by_symbol.setdefault(key[1], []).append((key, pos))
+                by_symbol.setdefault(key[2], []).append((key, pos))
 
         min_ratio = float(self.roll_config.get("min_volume_ratio", 1.0))
         for symbol, items in by_symbol.items():
@@ -409,8 +419,8 @@ class AutonomousCopyEngine(SessionGateMixin):
                     )
                     break
 
-    async def _roll_one(self, key: Tuple[int, str], pos: dict, reason: str) -> None:
-        master_ticket, symbol = key
+    async def _roll_one(self, key: Tuple[str, int, str], pos: dict, reason: str) -> None:
+        master_account, master_ticket, symbol = key
         nxt = await self.adapter.next_contract_after(symbol, pos["contract_id"])
         if nxt is None:
             logger.error(
@@ -457,7 +467,9 @@ class AutonomousCopyEngine(SessionGateMixin):
         )
         result = await self.adapter.open(order)
 
-        trade_registry.record_open(self.slave_id, master_ticket, symbol, result.slave_ticket)
+        trade_registry.record_open(
+            self.slave_id, master_account, master_ticket, symbol, result.slave_ticket
+        )
         pos.update({
             "slave_ticket": result.slave_ticket,
             "entry_price": quote,
@@ -470,7 +482,7 @@ class AutonomousCopyEngine(SessionGateMixin):
             "sl_order_id": result.sl_order_id,
             "tp_order_id": result.tp_order_id,
         })
-        position_store.save(self.slave_id, master_ticket, symbol, pos)
+        position_store.save(self.slave_id, master_account, master_ticket, symbol, pos)
 
         logger.info(
             "slave=%s rolled %s %s -> %s: slave_ticket %s -> %s, sl=%s tp=%s (%s)",
@@ -497,7 +509,7 @@ class AutonomousCopyEngine(SessionGateMixin):
                 to_contract=nxt.local_symbol,
             )
 
-    async def _check_risk(self, key: Tuple[int, str], pos: dict) -> None:
+    async def _check_risk(self, key: Tuple[str, int, str], pos: dict) -> None:
         _master_ticket, target_symbol = key
         quote = await self.adapter.get_quote(target_symbol, month_slot=pos.get("month_slot", 0))
         sign = 1 if pos["direction"] == "BUY" else -1
@@ -522,14 +534,14 @@ class AutonomousCopyEngine(SessionGateMixin):
         if new_sl is not None and new_sl != pos["sl"]:
             await self.adapter.modify(pos["slave_ticket"], new_sl, pos["tp"])
             pos["sl"] = new_sl
-            position_store.save(self.slave_id, key[0], target_symbol, pos)
+            position_store.save(self.slave_id, key[0], key[1], target_symbol, pos)
             logger.info(
                 "slave=%s trailing %s slave_ticket=%s -> sl=%s",
                 self.slave_id, target_symbol, pos["slave_ticket"], new_sl,
             )
             await self._emit(
                 "slave_modify",
-                master_ticket=key[0],
+                master_ticket=key[1],
                 slave_symbol=target_symbol,
                 slave_ticket=pos["slave_ticket"],
                 sl=new_sl,

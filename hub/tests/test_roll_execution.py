@@ -53,8 +53,8 @@ def _seed(engine, **over):
         "sl_order_id": 19, "tp_order_id": None,
     }
     pos.update(over)
-    engine._positions[(379792233, "GC")] = pos
-    trade_registry.record_open(SLAVE, 379792233, "GC", pos["slave_ticket"])
+    engine._positions[("", 379792233, "GC")] = pos
+    trade_registry.record_open(SLAVE, "", 379792233, "GC", pos["slave_ticket"])
     return pos
 
 
@@ -64,7 +64,7 @@ def test_roll_closes_the_old_contract_and_opens_the_next():
     b = FakeBroker()
     e = _engine(b)
     pos = _seed(e)
-    asyncio.run(e._roll_one((379792233, "GC"), pos, "test"))
+    asyncio.run(e._roll_one(("", 379792233, "GC"), pos, "test"))
 
     assert b.closed == [18], "the expiring contract must be closed"
     assert len(b.opened) == 1
@@ -74,7 +74,7 @@ def test_roll_closes_the_old_contract_and_opens_the_next():
 def test_roll_preserves_direction_and_size():
     b = FakeBroker()
     e = _engine(b)
-    asyncio.run(e._roll_one((379792233, "GC"), _seed(e, direction="SELL", size=3.0), "t"))
+    asyncio.run(e._roll_one(("", 379792233, "GC"), _seed(e, direction="SELL", size=3.0), "t"))
     assert b.opened[0]["direction"] == "SELL"
     assert b.opened[0]["size"] == 3.0
 
@@ -86,7 +86,7 @@ def test_stop_is_rederived_not_transplanted():
     b = FakeBroker(quote=4120.0)
     e = _engine(b)
     pos = _seed(e, sl=3953.6, sl_mult=4.8)
-    asyncio.run(e._roll_one((379792233, "GC"), pos, "t"))
+    asyncio.run(e._roll_one(("", 379792233, "GC"), pos, "t"))
 
     new_sl = b.opened[0]["sl"]
     assert new_sl != 3953.6, "stop was transplanted instead of re-derived"
@@ -97,7 +97,7 @@ def test_stop_is_rederived_not_transplanted():
 def test_history_and_quote_come_from_the_new_contract():
     b = FakeBroker()
     e = _engine(b)
-    asyncio.run(e._roll_one((379792233, "GC"), _seed(e), "t"))
+    asyncio.run(e._roll_one(("", 379792233, "GC"), _seed(e), "t"))
     assert ("history", "GC", 0, 765079322) in b.calls
     assert ("quote", "GC", 0, 765079322) in b.calls
 
@@ -108,7 +108,7 @@ def test_breakeven_survives_as_the_new_entry():
     b = FakeBroker(quote=4120.0)
     e = _engine(b)
     pos = _seed(e, breakeven_done=True)
-    asyncio.run(e._roll_one((379792233, "GC"), pos, "t"))
+    asyncio.run(e._roll_one(("", 379792233, "GC"), pos, "t"))
     assert b.opened[0]["sl"] == 4120.0
 
 
@@ -116,7 +116,7 @@ def test_registry_and_stored_state_follow_the_roll():
     b = FakeBroker()
     e = _engine(b)
     pos = _seed(e)
-    asyncio.run(e._roll_one((379792233, "GC"), pos, "t"))
+    asyncio.run(e._roll_one(("", 379792233, "GC"), pos, "t"))
 
     assert pos["contract_local"] == "GCG7"
     assert pos["slave_ticket"] == b.opened[0]["ticket"]
@@ -124,7 +124,7 @@ def test_registry_and_stored_state_follow_the_roll():
     assert stored["contract_local"] == "GCG7"
     assert stored["slave_ticket"] == b.opened[0]["ticket"]
 
-    mappings = trade_registry.get_open_mappings(SLAVE, 379792233)
+    mappings = trade_registry.get_open_mappings(SLAVE, "", 379792233)
     assert mappings[0].slave_ticket == b.opened[0]["ticket"]
 
 
@@ -132,7 +132,7 @@ def test_roll_stops_at_the_end_of_the_chain():
     b = FakeBroker()
     e = _engine(b)
     pos = _seed(e, contract_id=776689881, contract_local="GCJ7")  # last in chain
-    asyncio.run(e._roll_one((379792233, "GC"), pos, "t"))
+    asyncio.run(e._roll_one(("", 379792233, "GC"), pos, "t"))
     assert b.closed == [], "must not close a position it can't reopen"
     assert b.opened == []
 
@@ -168,13 +168,13 @@ def test_outermost_contract_rolls_first():
     still holds, and on a netting account they would merge."""
     b = FakeBroker(volumes={0: 2000.0, 1: 30000.0})
     e = _engine(b)
-    e._positions[(111, "GC")] = {**_seed(e), "slave_ticket": 18,
+    e._positions[("", 111, "GC")] = {**_seed(e), "slave_ticket": 18,
                                  "contract_id": 462941472, "contract_local": "GCZ6",
                                  "contract_expiry": "20261229"}
-    e._positions[(222, "GC")] = {**_seed(e), "slave_ticket": 28,
+    e._positions[("", 222, "GC")] = {**_seed(e), "slave_ticket": 28,
                                  "contract_id": 765079322, "contract_local": "GCG7",
                                  "contract_expiry": "20270224"}
-    e._positions.pop((379792233, "GC"), None)
+    e._positions.pop(("", 379792233, "GC"), None)
     asyncio.run(e._check_rolls())
     assert b.closed[0] == 28, "the outer position (GCG7) must vacate first"
 
@@ -185,13 +185,13 @@ def test_a_failed_leg_halts_that_symbol_sweep():
     b = FakeBroker(volumes={0: 2000.0, 1: 30000.0})
     b.fail_open_on = 0
     e = _engine(b)
-    e._positions[(111, "GC")] = {**_seed(e), "slave_ticket": 18,
+    e._positions[("", 111, "GC")] = {**_seed(e), "slave_ticket": 18,
                                  "contract_id": 462941472, "contract_local": "GCZ6",
                                  "contract_expiry": "20261229"}
-    e._positions[(222, "GC")] = {**_seed(e), "slave_ticket": 28,
+    e._positions[("", 222, "GC")] = {**_seed(e), "slave_ticket": 28,
                                  "contract_id": 765079322, "contract_local": "GCG7",
                                  "contract_expiry": "20270224"}
-    e._positions.pop((379792233, "GC"), None)
+    e._positions.pop(("", 379792233, "GC"), None)
     asyncio.run(e._check_rolls())
     assert len(b.opened) == 0
     assert len(b.closed) == 1, "swept on after a failure instead of halting"

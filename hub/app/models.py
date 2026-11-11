@@ -22,8 +22,20 @@ class Signal(BaseModel):
     # keep working -- their signals simply fall through to the default route.
     magic: Optional[int] = None
     comment: Optional[str] = None
-    account: Optional[str] = None
+    # Which master account sent this, and part of the key that separates
+    # masters. MT4 ticket numbers are per-account, so two masters can
+    # legitimately issue the same ticket number for different trades --
+    # keyed without the account, one master's CLOSE can close another's leg.
+    # Never None: in SQLite two NULLs never compare equal, so a NULL here
+    # would silently disable the uniqueness it exists to provide.
+    account: str = ""
     ts: float = Field(default_factory=lambda: time.time())
+
+    @field_validator("account", mode="before")
+    @classmethod
+    def _account_is_never_null(cls, v):
+        """Bridge EAs predating the account field send nothing at all."""
+        return v or ""
 
     @field_validator("sl", "tp", mode="after")
     @classmethod
