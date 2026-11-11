@@ -16,7 +16,8 @@ export const api = {
   createSlave: (payload) => request("/slaves", { method: "POST", body: JSON.stringify(payload) }),
   patchSlave: (id, payload) => request(`/slaves/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   deleteSlave: (id) => request(`/slaves/${id}`, { method: "DELETE" }),
-  getTrades: (limit = 200) => request(`/trades?limit=${limit}`),
+  getTrades: (limit = 200, since = null) =>
+    request(`/trades?limit=${limit}` + (since === null ? "" : `&since=${since}`)),
   getStatus: () => request("/status"),
   getConfig: () => request("/config"),
   patchConfig: (payload) => request("/config", { method: "PATCH", body: JSON.stringify(payload) }),

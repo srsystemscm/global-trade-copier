@@ -189,8 +189,8 @@ async def remove_slave(slave_id: str, request: Request):
 
 
 @router.get("/trades")
-async def get_trades(limit: int = 200):
-    return {"trades": trade_registry.list_trades_with_copies(limit)}
+async def get_trades(limit: int = 200, since: float | None = None):
+    return {"trades": trade_registry.list_trades_with_copies(limit, since)}
 
 
 @router.get("/config")

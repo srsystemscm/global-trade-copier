@@ -438,3 +438,87 @@ code {
   border-radius: 4px;
   font-size: 0.85em;
 }
+
+/* --- Copier tab ------------------------------------------------------- */
+
+.copier-daypick {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.copier-daypick input[type="date"] {
+  padding: 0.35rem 0.5rem;
+}
+
+.copier-summary {
+  display: flex;
+  gap: 2.5rem;
+  flex-wrap: wrap;
+}
+
+.copier-stat-n {
+  display: block;
+  font-size: 1.6rem;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.copier-table th.num,
+.copier-table td.num {
+  text-align: right;
+}
+
+.copier-table .mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.copier-table td {
+  vertical-align: top;
+}
+
+/* An OPEN with no slave leg behind it: a refused route, a paused slave, or
+   a dead broker session. Nothing else in this view would show it. */
+.copier-row-uncopied td {
+  background: rgba(220, 80, 80, 0.07);
+}
+
+.copier-legs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.copier-leg {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  white-space: nowrap;
+}
+
+.copier-leg-slave {
+  font-weight: 600;
+}
+
+.copier-leg-sym,
+.copier-leg-ticket {
+  color: var(--muted, #8a8f98);
+}
+
+/* The table is genuinely wide -- eleven columns including the slave legs --
+   so at phone width it scrolls inside its panel rather than pushing the page
+   sideways, which would leave the legs column unreachable. */
+.copier-table-wrap {
+  overflow-x: auto;
+}
+
+/* The day picker sits beside the title and needs somewhere to go when the
+   two no longer fit on one line. */
+.dashboard-header {
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.copier-daypick {
+  flex-wrap: wrap;
+}

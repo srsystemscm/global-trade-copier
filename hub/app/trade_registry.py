@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.db import db_cursor
 
@@ -95,18 +95,25 @@ def record_close(
         )
 
 
-def list_trades_with_copies(limit: int = 200) -> List[Dict[str, Any]]:
+def list_trades_with_copies(limit: int = 200, since: Optional[float] = None) -> List[Dict[str, Any]]:
     """Recent master signals (the activity feed's history), each with the
     slave-side copies that resulted from it, if any.
+
+    `since` is an epoch second: the copier view asks for a whole day, which
+    is a span rather than a count, and guessing a limit large enough to cover
+    a busy day across several masters would silently truncate the quiet end
+    of it.
     """
     with db_cursor() as cur:
         trades = cur.execute(
             """
             SELECT id, master_ticket, master_account, symbol, action, direction,
                    lots, price, sl, tp, signal_ts, received_at
-            FROM trades ORDER BY id DESC LIMIT ?
+            FROM trades
+            WHERE (? IS NULL OR received_at >= ?)
+            ORDER BY id DESC LIMIT ?
             """,
-            (limit,),
+            (since, since, limit),
         ).fetchall()
 
         results = []

@@ -1,4 +1,5 @@
 import { NavLink, Navigate, Route, Routes } from "react-router-dom";
+import Copier from "./pages/Copier.jsx";
 import Dashboard from "./pages/Dashboard.jsx";
 import Settings from "./pages/Settings.jsx";
 
@@ -11,6 +12,9 @@ export default function App() {
           <NavLink to="/dashboard" className={({ isActive }) => (isActive ? "active" : "")}>
             Dashboard
           </NavLink>
+          <NavLink to="/copier" className={({ isActive }) => (isActive ? "active" : "")}>
+            Copier
+          </NavLink>
           <NavLink to="/settings" className={({ isActive }) => (isActive ? "active" : "")}>
             Settings
           </NavLink>
@@ -20,6 +24,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
           <Route path="/dashboard" element={<Dashboard />} />
+          <Route path="/copier" element={<Copier />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>
       </main>
