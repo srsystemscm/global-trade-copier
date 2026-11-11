@@ -152,6 +152,12 @@ class IBKRAdapter(BrokerAdapter):
         # (symbol, month_slot) -> qualified contract
         self._contracts: Dict[tuple, object] = {}
         self._positions: Dict[int, dict] = {}
+        # slave_ticket -> the ib_async Trade, kept only until its fill has
+        # been collected. Fills are collected out of band: see
+        # await_entry_fill(). Popped on collection, so a long-resting order
+        # holds one entry and nothing accumulates.
+        self._entry_trades: Dict[int, object] = {}
+        self._exit_trades: Dict[int, object] = {}
 
     @staticmethod
     def _require_ib():
@@ -432,26 +438,31 @@ class IBKRAdapter(BrokerAdapter):
         for label, order_id in (("stop", sl_order_id), ("target", tp_order_id)):
             if order_id is None:
                 continue
-            trade = next((t for t in self.ib.trades() if t.order.orderId == order_id), None)
-            status = trade.orderStatus.status if trade is not None else "unknown"
+            # Named leg_trade, NOT trade: this loop used to shadow the
+            # entry's own Trade, and anything added below that reached for
+            # `trade` silently got the last bracket leg instead.
+            leg_trade = next((t for t in self.ib.trades() if t.order.orderId == order_id), None)
+            status = leg_trade.orderStatus.status if leg_trade is not None else "unknown"
             if status in ("Cancelled", "Inactive", "ApiCancelled", "unknown"):
                 why = ""
-                if trade is not None and trade.log:
-                    why = trade.log[-1].message or ""
+                if leg_trade is not None and leg_trade.log:
+                    why = leg_trade.log[-1].message or ""
                 logger.error(
                     "IBKRAdapter[%s] %s leg for slave_ticket=%s was %s -- THE POSITION IS "
                     "UNPROTECTED on that side. %s",
                     self.slave_id, label, slave_ticket, status, why,
                 )
-        fill_price, fill_size = await self._await_fill(trade, "entry")
+        self._entry_trades[slave_ticket] = trade
         logger.info(
-            "IBKRAdapter[%s] opened %s %s x%s -> ticket=%s%s",
-            self.slave_id, action, order.symbol, order.size, slave_ticket,
-            "" if fill_price is None else " filled %s @ %s" % (fill_size, fill_price),
+            "IBKRAdapter[%s] opened %s %s x%s -> ticket=%s", self.slave_id, action, order.symbol, order.size, slave_ticket
         )
+        # No fill price here, deliberately. Waiting for one would hold up
+        # every later signal for this slave -- the MODIFY and CLOSE of this
+        # very ticket queue behind it -- and an ETF limit resting in a thin
+        # evening book may not fill for minutes. The caller collects it via
+        # await_entry_fill() and records it then.
         return OrderResult(
-            slave_ticket=slave_ticket, price=fill_price, lots=fill_size,
-            sl_order_id=sl_order_id, tp_order_id=tp_order_id,
+            slave_ticket=slave_ticket, sl_order_id=sl_order_id, tp_order_id=tp_order_id
         )
 
     def _cancel_tracked_order(self, order_id: Optional[int]) -> None:
@@ -511,8 +522,9 @@ class IBKRAdapter(BrokerAdapter):
         # accepted, and a second CLOSE arriving during the wait must not
         # place a second closing order.
         del self._positions[slave_ticket]
-        fill_price, _ = await self._await_fill(trade, "close")
-        return fill_price
+        # Collected out of band too, for the same reason as the entry.
+        self._exit_trades[slave_ticket] = trade
+        return None
 
     async def _await_fill(self, trade, label: str):
         """Wait briefly for `trade` to fill, returning (price, size).
@@ -545,6 +557,25 @@ class IBKRAdapter(BrokerAdapter):
             trade.orderStatus.status,
         )
         return None, None
+
+    async def await_entry_fill(self, slave_ticket: int):
+        """Wait for the entry's fill, returning (price, size).
+
+        Separate from open() so that nothing in the signal path waits on a
+        broker. The caller runs this in the background and records the fill
+        when it lands.
+        """
+        trade = self._entry_trades.pop(slave_ticket, None)
+        if trade is None:
+            return None, None
+        return await self._await_fill(trade, "entry")
+
+    async def await_exit_fill(self, slave_ticket: int):
+        """Wait for the closing order's fill, returning (price, size)."""
+        trade = self._exit_trades.pop(slave_ticket, None)
+        if trade is None:
+            return None, None
+        return await self._await_fill(trade, "close")
 
     async def get_status(self) -> bool:
         return self.ib is not None and self.ib.isConnected()

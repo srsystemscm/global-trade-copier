@@ -106,6 +106,39 @@ def get_all_open_for_slave(slave_id: str) -> List[OpenSlaveTrade]:
     ]
 
 
+def record_fill(
+    slave_id: str,
+    master_account: str,
+    master_ticket: int,
+    slave_symbol: str,
+    *,
+    slave_price: Optional[float] = None,
+    slave_lots: Optional[float] = None,
+    filled_at: Optional[float] = None,
+) -> None:
+    """Write in an execution that arrived after the row was created.
+
+    For brokers that fill asynchronously the row is inserted the moment the
+    order is accepted, with no price; this fills that in once the broker
+    reports it.
+
+    COALESCE on every field, so a later NULL cannot erase a captured value,
+    and so this is safe to call when the fill never arrived.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE slave_trades SET
+                slave_price = COALESCE(?, slave_price),
+                slave_lots  = COALESCE(?, slave_lots),
+                filled_at   = COALESCE(?, filled_at)
+            WHERE slave_id = ? AND master_account = ? AND master_ticket = ? AND slave_symbol = ?
+            """,
+            (slave_price, slave_lots, filled_at,
+             slave_id, master_account, master_ticket, slave_symbol),
+        )
+
+
 def record_close(
     slave_id: str,
     master_account: str,

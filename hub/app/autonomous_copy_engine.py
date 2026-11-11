@@ -92,6 +92,9 @@ class AutonomousCopyEngine(SessionGateMixin):
         self.defer_poll_seconds = defer.get("poll_seconds", 5)
         # keyed (master_account, master_ticket, target, month_slot)
         self._deferred: Dict[tuple, dict] = {}
+        # background fill collectors; held so they aren't garbage collected
+        # mid-flight and so stop() can cancel them
+        self._fill_tasks: set = set()
         self._last_roll_check = 0.0
 
         # Keyed (master_account, master_ticket, slave_symbol): ticket
@@ -144,6 +147,12 @@ class AutonomousCopyEngine(SessionGateMixin):
                     await task
                 except asyncio.CancelledError:
                     pass
+        for task in list(self._fill_tasks):
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     async def _emit(self, event_type: str, **fields) -> None:
         if self.events:
@@ -342,6 +351,12 @@ class AutonomousCopyEngine(SessionGateMixin):
             requested_at=requested_at,
             filled_at=filled_at,
         )
+        if result.price is None:
+            # The broker hasn't reported a fill yet. Collect it in the
+            # background: this is the leg variance capture exists to
+            # measure, so a NULL here is the measurement being lost.
+            self._capture_fill("entry", signal.account, signal.ticket,
+                               target_symbol, result.slave_ticket)
 
         # Pin the concrete contract. Slot numbers shift under you when the
         # front month rolls; an expiry doesn't, and the roll needs to know
@@ -601,6 +616,53 @@ class AutonomousCopyEngine(SessionGateMixin):
             del self._deferred[k]
         return len(stale)
 
+    def _capture_fill(self, which: str, account: str, master_ticket: int,
+                      slave_symbol: str, slave_ticket: int) -> None:
+        """Collect a fill in the background and write it into the registry.
+
+        Runs off the signal path on purpose. The alternative -- waiting for
+        the fill inside open()/close() -- delays every later signal for this
+        slave behind the broker, including the MODIFY and CLOSE of the very
+        ticket being opened.
+
+        A fill that never arrives simply leaves the column NULL, which the
+        registry already treats as "not captured".
+        """
+        awaiter = getattr(self.adapter, f"await_{which}_fill", None)
+        if awaiter is None:
+            return  # adapter reports fills synchronously; nothing to collect
+
+        async def run() -> None:
+            try:
+                price, size = await awaiter(slave_ticket)
+            except Exception:
+                logger.exception(
+                    "slave=%s failed collecting the %s fill for slave_ticket=%s",
+                    self.slave_id, which, slave_ticket,
+                )
+                return
+            if price is None:
+                return
+            if which == "entry":
+                trade_registry.record_fill(
+                    self.slave_id, account, master_ticket, slave_symbol,
+                    slave_price=price, slave_lots=size, filled_at=time.time(),
+                )
+            else:
+                trade_registry.record_close(
+                    self.slave_id, account, master_ticket, slave_symbol,
+                    slave_close_price=price,
+                )
+            logger.info(
+                "slave=%s %s fill for %s slave_ticket=%s: %s @ %s",
+                self.slave_id, which, slave_symbol, slave_ticket, size, price,
+            )
+
+        task = asyncio.create_task(
+            run(), name=f"fill-{which}-{self.slave_id}-{slave_ticket}")
+        self._fill_tasks.add(task)
+        task.add_done_callback(self._fill_tasks.discard)
+
     async def _handle_close(self, signal: Signal) -> None:
         dropped = self._cancel_deferred(signal.account, signal.ticket)
         if dropped:
@@ -627,6 +689,9 @@ class AutonomousCopyEngine(SessionGateMixin):
                 master_close_price=signal.price or None,
                 slave_close_price=slave_close,
             )
+            if slave_close is None:
+                self._capture_fill("exit", signal.account, signal.ticket,
+                                   mapping.slave_symbol, mapping.slave_ticket)
             self._positions.pop((signal.account, signal.ticket, mapping.slave_symbol), None)
             position_store.delete(
                 self.slave_id, signal.account, signal.ticket, mapping.slave_symbol

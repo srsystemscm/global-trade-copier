@@ -258,3 +258,100 @@ def test_a_real_master_exit_is_still_recorded():
     broker = FakeBroker(fill_price=4029.57, close_price=4055.10)
     _journey(broker, [_open(), _open(action="CLOSE", price=4055.00)])
     assert _row()["master_close_price"] == 4055.00
+
+
+# --- asynchronously reported fills ---------------------------------------
+#
+# IBKR accepts the order and fills it a second or two later, so the fill
+# price cannot be returned from open(). Waiting for it there was tried and
+# reverted: it stalls the signal queue, and the MODIFY and CLOSE of the very
+# ticket being opened end up queued behind the broker. So the row is written
+# without a price and a background collector fills it in.
+
+def test_a_late_fill_is_written_into_the_row():
+    from app.autonomous_copy_engine import AutonomousCopyEngine
+
+    engine = object.__new__(AutonomousCopyEngine)
+    engine.slave_id = SLAVE
+    engine._fill_tasks = set()
+
+    class _Adapter:
+        async def await_entry_fill(self, slave_ticket):
+            return 3988.4, 1.0
+
+    engine.adapter = _Adapter()
+
+    trade_registry.record_open(SLAVE, ACCT, 7001, "MGC", 47,
+                               master_price=3982.48, slave_lots=1.0)
+    assert _row(7001, "MGC")["slave_price"] is None
+
+    async def go():
+        engine._capture_fill("entry", ACCT, 7001, "MGC", 47)
+        await asyncio.gather(*engine._fill_tasks)
+
+    asyncio.run(go())
+
+    row = _row(7001, "MGC")
+    assert row["slave_price"] == 3988.4
+    assert row["filled_at"] is not None
+
+
+def test_a_fill_that_never_arrives_leaves_the_row_alone():
+    """A timeout means 'not captured', and must not overwrite the row with
+    zero -- a 0.00 fill price would quietly poison the distribution."""
+    from app.autonomous_copy_engine import AutonomousCopyEngine
+
+    engine = object.__new__(AutonomousCopyEngine)
+    engine.slave_id = SLAVE
+    engine._fill_tasks = set()
+
+    class _Adapter:
+        async def await_entry_fill(self, slave_ticket):
+            return None, None
+
+    engine.adapter = _Adapter()
+
+    trade_registry.record_open(SLAVE, ACCT, 7002, "MGC", 48, master_price=3982.48)
+
+    async def go():
+        engine._capture_fill("entry", ACCT, 7002, "MGC", 48)
+        await asyncio.gather(*engine._fill_tasks)
+
+    asyncio.run(go())
+    assert _row(7002, "MGC")["slave_price"] is None
+
+
+def test_a_collector_that_raises_does_not_take_the_engine_down():
+    from app.autonomous_copy_engine import AutonomousCopyEngine
+
+    engine = object.__new__(AutonomousCopyEngine)
+    engine.slave_id = SLAVE
+    engine._fill_tasks = set()
+
+    class _Adapter:
+        async def await_entry_fill(self, slave_ticket):
+            raise RuntimeError("gateway went away mid-collection")
+
+    engine.adapter = _Adapter()
+    trade_registry.record_open(SLAVE, ACCT, 7003, "MGC", 49)
+
+    async def go():
+        engine._capture_fill("entry", ACCT, 7003, "MGC", 49)
+        await asyncio.gather(*engine._fill_tasks)
+
+    asyncio.run(go())
+    assert _row(7003, "MGC")["slave_price"] is None
+
+
+def test_a_synchronous_adapter_needs_no_collector():
+    """MT4/MT5 report the fill in the reply, so there is nothing to collect
+    and no task should be spawned."""
+    from app.autonomous_copy_engine import AutonomousCopyEngine
+
+    engine = object.__new__(AutonomousCopyEngine)
+    engine.slave_id = SLAVE
+    engine._fill_tasks = set()
+    engine.adapter = object()  # no await_entry_fill attribute
+
+    engine._capture_fill("entry", ACCT, 7004, "XAUUSD", 1)
+    assert engine._fill_tasks == set()

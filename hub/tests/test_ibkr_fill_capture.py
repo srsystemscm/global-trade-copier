@@ -163,77 +163,128 @@ def test_brackets_keep_their_own_tif():
 # ---------------- open()/close() surface it ------------------------------
 
 class _FakeIB:
+    """Hands out one Trade per placeOrder, numbered the way IBKR numbers."""
+
     def __init__(self, trades):
-        self._trades = list(trades)
+        self._queue = list(trades)
         self.placed = []
+        self._all = []
 
     def placeOrder(self, contract, order):
         self.placed.append(order)
-        t = self._trades.pop(0) if self._trades else _Trade(fills_after=1)
+        order.orderId = 46 + len(self.placed)  # entry 47, then the legs
+        t = self._queue.pop(0) if self._queue else _NeverFills()
         t.order = order
-        if not hasattr(order, "orderId") or order.orderId is None:
-            order.orderId = len(self.placed)
+        self._all.append(t)
         return t
 
     def cancelOrder(self, order):
         pass
 
     def trades(self):
-        return []
+        return list(self._all)
 
     def isConnected(self):
         return True
 
 
-def _prepared(adapter, trade):
+def _prepared(adapter, *trades):
     """Give the adapter just enough to run open()/close() offline."""
-    adapter.ib = _FakeIB([trade])
-    adapter._contracts[("MGC", 0)] = object()
+    adapter.ib = _FakeIB(trades)
+    adapter.bracket_check_delay = 0
+    contract = object()
+    adapter._contracts[("MGC", 0)] = contract
 
     async def _contract(symbol, month_slot, contract_id=None):
-        return adapter._contracts[("MGC", 0)]
+        return contract
 
     adapter._contract_for_request = _contract
+    adapter._round_to_tick = lambda p, s: p
     return adapter
 
 
-def test_open_reports_the_fill_into_order_result():
-    a = _prepared(_adapter(), _Trade(price=3988.4, size=1.0, fills_after=2))
-    trade = a.ib._trades[0]
+def test_open_does_not_wait_for_the_fill():
+    """The MODIFY and CLOSE of this very ticket queue behind open(), so it
+    must not hold the signal path while the broker works."""
+    import time as _time
+
+    a = _prepared(_adapter(fill_timeout=30), _NeverFills(), _NeverFills())
     req = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=None, tp=None,
                        master_ticket=382160920)
-    res = _drive(a, trade, a.open(req))
-    assert res.price == 3988.4
-    assert res.lots == 1.0
+    asyncio.run(a.open(req))  # warm the imports, so the timing below is open()
+
+    started = _time.monotonic()
+    res = asyncio.run(a.open(req))
+    elapsed = _time.monotonic() - started
+    # Generous against a loaded CI box, yet nowhere near fill_timeout: the
+    # failure this guards is a wait of tens of seconds, not milliseconds.
+    assert elapsed < 2.0, "open() waited %.1fs with fill_timeout=30" % elapsed
+    assert res.price is None  # not captured *yet*, which is not a failure
     assert a.ib.placed[0].tif == "DAY"
 
 
-def test_close_returns_the_exit_price():
+def test_entry_fill_is_collected_after_open_returns():
+    a = _prepared(_adapter(), _Trade(price=3988.4, size=1.0, fills_after=2))
+    req = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=None, tp=None,
+                       master_ticket=382160920)
+    res = asyncio.run(a.open(req))
+    trade = a.ib._all[0]
+    price, size = _drive(a, trade, a.await_entry_fill(res.slave_ticket))
+    assert (price, size) == (3988.4, 1.0)
+
+
+def test_await_entry_fill_watches_the_entry_not_a_bracket_leg():
+    """Regression: the bracket-verification loop rebound `trade`, so the wait
+    watched the stop leg -- which never fills while the position is open, so
+    it timed out every single time while the entry had filled in a second."""
+    entry = _Trade(price=3988.4, size=1.0, fills_after=2)
+    a = _prepared(_adapter(), entry, _NeverFills())  # entry, then the stop
+    req = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=3876.5,
+                       tp=None, master_ticket=382160920)
+    res = asyncio.run(a.open(req))
+    assert len(a.ib.placed) == 2, "expected an entry and a stop"
+    assert a._entry_trades[res.slave_ticket] is entry
+    price, _ = _drive(a, entry, a.await_entry_fill(res.slave_ticket))
+    assert price == 3988.4
+
+
+def test_close_defers_the_exit_price_too():
     a = _prepared(_adapter(), _Trade(price=3988.2, size=1.0, fills_after=2))
-    trade = a.ib._trades[0]
     a._positions[35] = {"direction": "BUY", "size": 1.0,
                         "contract": object(), "sl_order_id": None,
                         "tp_order_id": None}
-    price = _drive(a, trade, a.close(35))
+    assert asyncio.run(a.close(35)) is None
+    trade = a.ib._all[0]
+    price, _ = _drive(a, trade, a.await_exit_fill(35))
     assert price == 3988.2
     assert a.ib.placed[0].tif == "DAY"
 
 
-def test_close_drops_the_position_before_waiting():
-    """A second CLOSE arriving during the fill wait must not place a second
-    closing order -- that would open an unintended short."""
-    a = _prepared(_adapter(fill_timeout=0.3), _NeverFills())
-    trade = a.ib._trades[0]
+def test_collected_trades_are_not_retained():
+    """A long-resting order holds one entry; nothing accumulates."""
+    a = _prepared(_adapter(), _Trade(price=1.0, fills_after=1))
+    req = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=None, tp=None,
+                       master_ticket=1)
+    res = asyncio.run(a.open(req))
+    assert res.slave_ticket in a._entry_trades
+    _drive(a, a.ib._all[0], a.await_entry_fill(res.slave_ticket))
+    assert a._entry_trades == {}
+    # Collecting twice is harmless -- reconciliation may ask again.
+    assert asyncio.run(a.await_entry_fill(res.slave_ticket)) == (None, None)
+
+
+def test_a_second_close_places_no_second_order():
+    """Closing twice must not send another closing order -- that would open
+    an unintended short on a flat account."""
+    a = _prepared(_adapter(), _Trade(price=1.0, fills_after=1))
     a._positions[35] = {"direction": "BUY", "size": 1.0,
                         "contract": object(), "sl_order_id": None,
                         "tp_order_id": None}
 
     async def two_closes():
-        first = asyncio.create_task(a.close(35))
-        await asyncio.sleep(0.05)
+        await a.close(35)
         with pytest.raises(Exception):
             await a.close(35)
-        await first
 
-    _drive(a, trade, two_closes())
+    asyncio.run(two_closes())
     assert len(a.ib.placed) == 1
