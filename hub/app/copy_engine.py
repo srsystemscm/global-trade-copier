@@ -84,6 +84,28 @@ class CopyEngine(SessionGateMixin):
                 await self._emit("trading_hours_blocked", master_ticket=signal.ticket)
                 return
 
+            # Already copied. The dedup in SignalBus keys on the EA's
+            # timestamp, which has whole-second resolution -- so two copies
+            # of one signal published milliseconds apart can land either
+            # side of a second boundary and both get through. Seen live: a
+            # second TradeCopierBridge instance on another chart produced
+            # exactly that. A duplicate CLOSE is harmless because the
+            # mapping is already gone, but a duplicate OPEN would put on a
+            # second position and record_open() would upsert over the first,
+            # leaving a live position nothing is tracking.
+            existing = trade_registry.get_open_mappings(
+                self.slave_id, signal.account, signal.ticket
+            )
+            if existing:
+                logger.warning(
+                    "slave=%s already holding master_ticket=%s as slave_ticket=%s, "
+                    "ignoring a repeat OPEN",
+                    self.slave_id, signal.ticket, existing[0].slave_ticket,
+                )
+                await self._emit("duplicate_open_ignored", master_ticket=signal.ticket,
+                                 slave_ticket=existing[0].slave_ticket)
+                return
+
             order = OrderRequest(
                 symbol=signal.symbol,
                 direction=signal.direction,

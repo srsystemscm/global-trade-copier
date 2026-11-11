@@ -51,6 +51,16 @@ class Route:
     # comparing two different volatilities, and nothing in the numbers would
     # say so. None means the adapter's own default (daily).
     bar_size: Optional[str] = None
+    # ETF legs fill in the evening session, where IBKR refuses market
+    # orders outright. Both of these are needed: a limit order without
+    # outside_rth waits for the open, and outside_rth on a market order is
+    # rejected.
+    order_type: str = "market"
+    outside_rth: bool = False
+    # How far through the quote to place the limit, as a fraction. Crossing
+    # the spread is the point -- a limit sitting at the bid in a thin
+    # evening book is a signal that quietly never becomes a position.
+    limit_offset_pct: float = 0.0
 
 
 def routing_is_strict(slave_config: Dict[str, Any]) -> bool:
@@ -97,6 +107,9 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                     atr_period=(None if entry.get("atr_period") is None
                                 else int(entry["atr_period"])),
                     bar_size=entry.get("bar_size"),
+                    order_type=entry.get("order_type", "market"),
+                    outside_rth=bool(entry.get("outside_rth", False)),
+                    limit_offset_pct=float(entry.get("limit_offset_pct", 0.0)),
                 )
             )
     return matched

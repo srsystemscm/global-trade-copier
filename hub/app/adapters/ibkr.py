@@ -363,7 +363,19 @@ class IBKRAdapter(BrokerAdapter):
                 self.slave_id, order.symbol, order.sl, sl_price, order.tp, tp_price,
             )
 
-        entry = ib_mod.MarketOrder(action, order.size)
+        if order.order_type == "limit":
+            if order.limit_price is None:
+                raise AdapterRejectedError(
+                    f"limit order for {order.symbol} has no limit price -- refusing "
+                    f"rather than sending it as a market order, which outside "
+                    f"regular hours would be rejected anyway"
+                )
+            entry = ib_mod.LimitOrder(
+                action, order.size, self._round_to_tick(order.limit_price, order.symbol)
+            )
+        else:
+            entry = ib_mod.MarketOrder(action, order.size)
+        entry.outsideRth = order.outside_rth
         trade = self._place(contract, entry)
         slave_ticket = trade.order.orderId
 
@@ -371,12 +383,14 @@ class IBKRAdapter(BrokerAdapter):
         if sl_price is not None or tp_price is not None:
             oca_group = f"tc-{self.slave_id}-{slave_ticket}"
             if sl_price is not None:
-                sl_order = self._protective(ib_mod.StopOrder(closing_action, order.size, sl_price))
+                sl_order = self._protective(
+                    ib_mod.StopOrder(closing_action, order.size, sl_price), order.outside_rth)
                 sl_order.ocaGroup = oca_group
                 sl_order.ocaType = 1  # cancel the sibling order(s) once one fills
                 sl_order_id = self._place(contract, sl_order).order.orderId
             if tp_price is not None:
-                tp_order = self._protective(ib_mod.LimitOrder(closing_action, order.size, tp_price))
+                tp_order = self._protective(
+                    ib_mod.LimitOrder(closing_action, order.size, tp_price), order.outside_rth)
                 tp_order.ocaGroup = oca_group
                 tp_order.ocaType = 1
                 tp_order_id = self._place(contract, tp_order).order.orderId
@@ -608,13 +622,18 @@ class IBKRAdapter(BrokerAdapter):
         assert self.ib is not None
         return self.ib.placeOrder(contract, order)
 
-    def _protective(self, order):
-        """Stamp a protective leg's time-in-force.
+    def _protective(self, order, outside_rth: bool = False):
+        """Stamp a protective leg's time-in-force and session.
 
         Deliberately not applied to the entry: a market order that can't fill
         is better off expiring than resting indefinitely as GTC.
+
+        outsideRth matches the entry. A stop that only arms during regular
+        hours on a position opened in the evening session leaves it unguarded
+        for the part of the session it was deliberately opened in.
         """
         order.tif = self.bracket_tif
+        order.outsideRth = outside_rth
         return order
 
     @staticmethod

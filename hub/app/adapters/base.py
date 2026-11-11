@@ -38,6 +38,12 @@ class OrderRequest:
     sl: Optional[float] = None
     tp: Optional[float] = None
     master_ticket: Optional[int] = None
+    # "market" or "limit". Outside regular hours a market order is simply
+    # refused by IBKR, so an ETF leg meant to fill in the evening session
+    # has to be a limit with `outside_rth` set -- both, not either.
+    order_type: str = "market"
+    limit_price: Optional[float] = None
+    outside_rth: bool = False
     # Futures contract month: 0 = front, 1 = next liquid month, etc. Used to
     # keep strategies on one netting account from merging into one position.
     # Ignored by brokers/instruments that have no contract months.

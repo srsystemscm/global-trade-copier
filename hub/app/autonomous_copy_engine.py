@@ -277,6 +277,37 @@ class AutonomousCopyEngine(SessionGateMixin):
             logger.warning("slave=%s skipping %s: %s", self.slave_id, target_symbol, sizing_result.reason)
             return
 
+        # Per target rather than per signal: one master signal can fan out
+        # to several instruments on this slave, and a repeat must re-open
+        # none of the ones that already exist without blocking any that
+        # genuinely did not open. See the note in CopyEngine for why a
+        # repeat reaches the engines at all.
+        already = [
+            m for m in trade_registry.get_open_mappings(
+                self.slave_id, signal.account, signal.ticket)
+            if m.slave_symbol == target_symbol
+        ]
+        if already:
+            logger.warning(
+                "slave=%s already holding %s for master_ticket=%s as slave_ticket=%s, "
+                "ignoring a repeat OPEN",
+                self.slave_id, target_symbol, signal.ticket, already[0].slave_ticket,
+            )
+            await self._emit("duplicate_open_ignored", master_ticket=signal.ticket,
+                             slave_symbol=target_symbol, slave_ticket=already[0].slave_ticket)
+            return
+
+        limit_price = None
+        if route.order_type == "limit":
+            # Price through the quote in the direction that gets filled: up
+            # for a buy, down for a sell. The offset is deliberately applied
+            # to the live quote rather than to the master's price -- the two
+            # instruments are unrelated, and in an evening book the quote is
+            # the only thing that says what is actually tradeable.
+            through = 1 + route.limit_offset_pct if signal.direction == "BUY" \
+                else 1 - route.limit_offset_pct
+            limit_price = quote * through
+
         order = OrderRequest(
             symbol=target_symbol,
             direction=signal.direction,
@@ -285,6 +316,9 @@ class AutonomousCopyEngine(SessionGateMixin):
             tp=slave_tp,
             master_ticket=signal.ticket,
             month_slot=route.month_slot,
+            order_type=route.order_type,
+            limit_price=limit_price,
+            outside_rth=route.outside_rth,
         )
         requested_at = time.time()
         result = await self.adapter.open(order)

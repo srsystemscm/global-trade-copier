@@ -42,10 +42,16 @@ def test_entry_orders_are_left_alone():
     """A market order that can't fill is better expiring than resting as GTC,
     so only the protective legs are stamped."""
     import inspect
-    src = inspect.getsource(IBKRAdapter.open)
-    assert "_protective(ib_mod.StopOrder" in src
-    assert "_protective(ib_mod.LimitOrder" in src
+    import re
+
+    # Whitespace-normalised: this reads the source, so without it the test
+    # fails whenever a call is wrapped across lines, which says nothing
+    # about whether entries are stamped.
+    src = re.sub(r"\s+", " ", inspect.getsource(IBKRAdapter.open))
+    assert "_protective( ib_mod.StopOrder" in src or "_protective(ib_mod.StopOrder" in src
+    assert "_protective( ib_mod.LimitOrder" in src or "_protective(ib_mod.LimitOrder" in src
     assert "_protective(ib_mod.MarketOrder" not in src
+    assert "_protective( ib_mod.MarketOrder" not in src
 
 
 def test_modify_rounds_and_stamps_too():

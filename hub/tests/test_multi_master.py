@@ -287,3 +287,56 @@ def test_a_fresh_database_is_not_migrated(caplog):
     with caplog.at_level("WARNING"):
         init_db()
     assert "migrating" not in caplog.text.lower()
+
+
+# --- a repeated signal must not open twice --------------------------------
+
+def test_a_repeat_open_does_not_put_on_a_second_position():
+    """SignalBus dedup keys on the EA's timestamp, which has whole-second
+    resolution -- so two copies of one signal published milliseconds apart
+    can land either side of a second boundary and both get through. Seen
+    live: a second TradeCopierBridge instance on another chart did exactly
+    that, 76ms apart with timestamps one second different.
+
+    A duplicate CLOSE is harmless, the mapping is already gone. A duplicate
+    OPEN would put on a second position, and record_open() upserts, so the
+    first would be left live with nothing tracking it."""
+    broker = FakeBroker()
+    queue: asyncio.Queue = asyncio.Queue()
+    engine = CopyEngine(SLAVE, broker, queue)
+
+    def _open(ts):
+        return Signal(ticket=5001, symbol="XAUUSD", action="OPEN", direction="BUY",
+                      lots=0.1, price=4029.32, account=A, ts=ts)
+
+    async def go():
+        engine.start()
+        await queue.put(_open(1700000000.0))
+        await asyncio.sleep(0.06)
+        await queue.put(_open(1700000001.0))   # same trade, a second later
+        await asyncio.sleep(0.08)
+        await engine.stop()
+
+    asyncio.run(go())
+
+    assert len(broker.opened) == 1, "a repeated signal opened a second position"
+    assert len(trade_registry.get_open_mappings(SLAVE, A, 5001)) == 1
+
+
+def test_a_genuinely_new_ticket_still_opens():
+    """The guard keys on the master ticket, so it must not block the next
+    trade just because the previous one is still open."""
+    broker = FakeBroker()
+    queue: asyncio.Queue = asyncio.Queue()
+    engine = CopyEngine(SLAVE, broker, queue)
+
+    async def go():
+        engine.start()
+        for ticket in (5001, 5002):
+            await queue.put(Signal(ticket=ticket, symbol="XAUUSD", action="OPEN",
+                                   direction="BUY", lots=0.1, price=4029.32, account=A))
+            await asyncio.sleep(0.05)
+        await engine.stop()
+
+    asyncio.run(go())
+    assert len(broker.opened) == 2
