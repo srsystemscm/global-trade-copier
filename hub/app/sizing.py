@@ -39,6 +39,19 @@ def capital_base_amount(
     raise ValueError(f"unknown capital_base {capital_base!r}")
 
 
+def resolve_risk_scale(slave_config: Dict[str, Any], route_scale: Optional[float]) -> float:
+    """How much of the configured risk this leg carries.
+
+    The route (strategy) wins over the slave, so a slave can run at half
+    size overall while one strategy on it runs at a quarter. 1.0 means
+    unchanged, which is the default everywhere -- an absent setting must
+    never quietly resize anything.
+    """
+    if route_scale is not None:
+        return float(route_scale)
+    return float(slave_config.get("risk_scale", 1.0))
+
+
 def compute_size(
     *,
     sizing_config: Dict[str, Any],
@@ -48,6 +61,7 @@ def compute_size(
     account_balance: float,
     account_equity: float,
     contract_spec: Optional[ContractSpec],
+    risk_scale: float = 1.0,
 ) -> SizingResult:
     """Computes the slave order size (contracts for futures, shares for
     equities/ETFs).
@@ -63,6 +77,13 @@ def compute_size(
     *final* size: when even the minimum tradeable size risks more than that
     fraction of the capital base, the trade is skipped rather than taken at
     the wrong size. Requires a stop price to measure risk against.
+
+    `risk_scale` scales the size the mode asked for: 1.0 carries the
+    configured risk unchanged, 0.5 halves the position. It is applied before
+    rounding, so the rounding and minimum-size rules still have the last
+    word, and before the max_risk_pct ceiling, so scaling down can bring an
+    otherwise-refused trade under it. Since stops come from ATR multiples
+    and never from size, dollar risk scales linearly with it.
     """
     mode = sizing_config.get("mode")
 
@@ -106,6 +127,17 @@ def compute_size(
 
     else:
         raise ValueError(f"unknown sizing mode {mode!r}")
+
+    # Applied here, after the mode has decided a size and before any
+    # rounding, so that a scaled size is still subject to the broker's
+    # minimum and to max_risk_pct below.
+    if risk_scale <= 0:
+        return SizingResult(
+            size=0, skipped=True,
+            reason=f"risk_scale is {risk_scale}, which is not a tradeable fraction "
+                   f"-- refusing rather than sending a zero or inverted size",
+        )
+    size = size * risk_scale
 
     min_size = contract_spec.min_size if contract_spec else 1.0
     # round before the rounding rule: tick sizes like 0.10 aren't exact in

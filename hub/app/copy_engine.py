@@ -1,7 +1,8 @@
 import asyncio
 import logging
+import math
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from app import trade_registry
 from app.adapters.base import AdapterError, BrokerAdapter, OrderRequest
@@ -28,6 +29,7 @@ class CopyEngine(SessionGateMixin):
         slave_id: str,
         adapter: BrokerAdapter,
         queue: "asyncio.Queue[Signal]",
+        slave_config: Optional[Dict[str, Any]] = None,
         paused: bool = False,
         events: Optional[EventBus] = None,
         notifier: Optional[Notifier] = None,
@@ -35,10 +37,55 @@ class CopyEngine(SessionGateMixin):
         self.slave_id = slave_id
         self.adapter = adapter
         self.queue = queue
+        # Mirror mode needs little of this, but naming it slave_config means
+        # PATCH /slaves/{id} live-updates mirror engines too: it refreshes
+        # engine.slave_config wherever that attribute exists.
+        self.slave_config = slave_config or {}
         self.paused = paused
         self.events = events
         self.notifier = notifier
         self._task: Optional[asyncio.Task] = None
+
+    def _scaled_lots(self, lots: float):
+        """The master's lots, scaled by risk_scale. None means "don't trade".
+
+        Mirror mode has no sizing model to lean on, so the rounding is done
+        here: MT4/MT5 volumes are quoted to 0.01, and a scaled lot that
+        doesn't land on that grid is rejected by the terminal rather than
+        clamped. The slave bridge still has the last word -- it knows the
+        broker's own min/max/step -- but sending 0.0075 and letting it refuse
+        would turn a configuration mistake into a missed trade with a
+        confusing error.
+        """
+        scale = float(self.slave_config.get("risk_scale", 1.0))
+        if scale == 1.0:
+            return lots
+        if scale <= 0:
+            logger.error(
+                "slave=%s risk_scale is %s, which is not a tradeable fraction; "
+                "refusing the trade rather than sending a zero or inverted size",
+                self.slave_id, scale,
+            )
+            return None
+        # Floored to the 0.01 grid, not rounded. This dial's job is to
+        # carry LESS risk than the master, so it must never hand back more
+        # than was asked for. round() would also be erratic here: 0.075 is
+        # not exactly representable in binary, so round(0.075, 2) is 0.07
+        # while round(0.125, 2) is 0.12 by banker's rounding -- the same
+        # input shape giving different answers for invisible reasons.
+        scaled = math.floor(lots * scale * 100) / 100
+        if scaled < 0.01:
+            logger.warning(
+                "slave=%s risk_scale %s takes %s lots down to %s, below the 0.01 "
+                "minimum volume; skipping rather than sending an order the "
+                "terminal will reject",
+                self.slave_id, scale, lots, scaled,
+            )
+            return None
+        logger.info(
+            "slave=%s risk_scale %s: %s lots -> %s", self.slave_id, scale, lots, scaled,
+        )
+        return scaled
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name=f"copy-engine-{self.slave_id}")
@@ -106,10 +153,18 @@ class CopyEngine(SessionGateMixin):
                                  slave_ticket=existing[0].slave_ticket)
                 return
 
+            lots = self._scaled_lots(signal.lots)
+            if lots is None:
+                await self._emit("slave_error", master_ticket=signal.ticket,
+                                 action="OPEN",
+                                 message=f"risk_scale left no tradeable volume for "
+                                         f"{signal.lots} lots")
+                return
+
             order = OrderRequest(
                 symbol=signal.symbol,
                 direction=signal.direction,
-                size=signal.lots,
+                size=lots,
                 sl=signal.sl,
                 tp=signal.tp,
                 master_ticket=signal.ticket,
@@ -126,7 +181,7 @@ class CopyEngine(SessionGateMixin):
                 self.slave_id, signal.account, signal.ticket, signal.symbol, result.slave_ticket,
                 master_price=signal.price,
                 slave_price=result.price,
-                slave_lots=result.lots if result.lots is not None else signal.lots,
+                slave_lots=result.lots if result.lots is not None else lots,
                 requested_at=requested_at,
                 filled_at=filled_at,
             )
@@ -139,7 +194,7 @@ class CopyEngine(SessionGateMixin):
                 master_ticket=signal.ticket,
                 slave_symbol=signal.symbol,
                 slave_ticket=result.slave_ticket,
-                size=signal.lots,
+                size=lots,
                 sl=signal.sl,
                 tp=signal.tp,
             )

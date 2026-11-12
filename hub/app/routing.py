@@ -74,6 +74,9 @@ class Route:
     # target_direction "BUY" on a different symbol. None follows the signal,
     # which is right for a futures leg that simply shorts the same contract.
     target_direction: Optional[str] = None
+    # How much of the configured risk this strategy carries on this slave.
+    # None falls back to the slave's own risk_scale, then to 1.0.
+    risk_scale: Optional[float] = None
 
 
 def routing_is_strict(slave_config: Dict[str, Any]) -> bool:
@@ -130,6 +133,8 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                                else str(entry["direction"]).upper()),
                     target_direction=(None if entry.get("target_direction") is None
                                       else str(entry["target_direction"]).upper()),
+                    risk_scale=(None if entry.get("risk_scale") is None
+                                else float(entry["risk_scale"])),
                 )
             )
     return matched

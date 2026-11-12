@@ -45,7 +45,8 @@ async def start_engine_for_slave(slave: SlaveConfig, bus: SignalBus, events: Eve
             slave.id, adapter, queue, slave.config, paused=slave.paused, events=events, notifier=notifier
         )
     else:
-        engine = CopyEngine(slave.id, adapter, queue, paused=slave.paused, events=events, notifier=notifier)
+        engine = CopyEngine(slave.id, adapter, queue, slave.config,
+                            paused=slave.paused, events=events, notifier=notifier)
 
     async def recover_session() -> None:
         """Re-run this slave's startup path after its broker session died.
