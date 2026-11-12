@@ -108,6 +108,44 @@ class AccountSummary:
 
 
 @dataclass
+class BrokerSymbolSpec:
+    """What an instrument IS at the broker, as the broker states it.
+
+    Deliberately not an abstract method on BrokerAdapter: only the MT
+    bridges can answer it today, through SlaveBridge.mq5 1.03's SYMBOLS
+    command, and a caller checks for the method rather than every adapter
+    growing a stub that raises.
+
+    `point_value` is derived rather than reported because brokers do not
+    agree on how to express it. On Darwinex's futures CFDs contract_size is
+    1.0 and the whole multiplier lives in the tick figures, so
+    tick_value / tick_size is the only trustworthy way to ask what a
+    one-point move on one lot is worth.
+    """
+
+    symbol: str
+    digits: int
+    tick_size: float
+    tick_value: float
+    volume_step: float
+    volume_min: float
+    volume_max: float
+    bid: float = 0.0
+    ask: float = 0.0
+    trade_mode: str = ""
+    contract_size: float = 0.0
+    expiry: str = ""
+
+    @property
+    def point_value(self) -> float:
+        return (self.tick_value / self.tick_size) if self.tick_size else 0.0
+
+    def price_for(self, direction: str) -> float:
+        """The side this order would have to cross."""
+        return self.ask if direction == "BUY" else self.bid
+
+
+@dataclass
 class ContractInfo:
     """One dated futures contract, identified concretely rather than by slot.
 

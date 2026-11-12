@@ -41,6 +41,9 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+from app.contract_specs import ContractSpec
+from app.sizing import compute_size, resolve_balance_adjustment
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_STEP = 0.01
@@ -109,10 +112,53 @@ def _lot_ratio(spec: Dict[str, Any], symbol: str) -> Tuple[Optional[float], Opti
     return master_pv / target_pv, None
 
 
+def resolve_symbol(
+    slave_config: Dict[str, Any], master_symbol: str
+) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
+    """Which instrument this signal becomes on this slave.
+
+    Separate from the sizing so that risk-based sizing can use it without
+    the lot arithmetic -- which would otherwise refuse a 0.1-lot master
+    signal for being below a futures contract's minimum, before the risk
+    model ever got a chance to say how many contracts 2% actually buys.
+
+    Returns (symbol, spec, None) or (None, {}, reason).
+    """
+    mirror_map = slave_config.get("mirror_map") or {}
+    entry = mirror_map.get(master_symbol)
+
+    if entry is None:
+        if mirror_map and not slave_config.get("mirror_map_passthrough", False):
+            # A configured map IS the route list. Passing an unmapped symbol
+            # through to a broker that does not carry it only produces
+            # "symbol not offered" from the far end, one round trip later.
+            return None, {}, (
+                f"no mirror_map entry for {master_symbol}; this slave only mirrors "
+                f"the {len(mirror_map)} mapped symbol(s). Set "
+                f"mirror_map_passthrough to send unmapped symbols through unchanged."
+            )
+        return master_symbol, {}, None
+
+    if isinstance(entry, str):
+        return entry, {}, None
+
+    if isinstance(entry, dict):
+        return str(entry.get("target") or master_symbol), entry, None
+
+    return None, {}, (
+        f"mirror_map[{master_symbol}] should be a target symbol or an object, "
+        f"got {type(entry).__name__}"
+    )
+
+
 def resolve_target(
     slave_config: Dict[str, Any], master_symbol: str, master_lots: float
 ) -> Tuple[Optional[MirrorTarget], Optional[str]]:
-    """Which instrument this signal becomes on this slave, and how many lots.
+    """Which instrument this signal becomes, and how many lots of it.
+
+    Lot mirroring: the master's size, converted by the instruments' point
+    values. Used when the slave has no `sizing` block -- with one, the size
+    comes from the slave's own capital instead; see plan_by_risk.
 
     Returns (target, None) to proceed, or (None, reason) to refuse. The reason
     is written for whoever reads the log at the time, so it names the figures.
@@ -124,32 +170,9 @@ def resolve_target(
             f"rather than sending a zero or inverted size"
         )
 
-    mirror_map = slave_config.get("mirror_map") or {}
-    entry = mirror_map.get(master_symbol)
-
-    if entry is None:
-        if mirror_map and not slave_config.get("mirror_map_passthrough", False):
-            # A configured map IS the route list. Passing an unmapped symbol
-            # through to a broker that does not carry it only produces
-            # "symbol not offered" from the far end, one round trip later.
-            return None, (
-                f"no mirror_map entry for {master_symbol}; this slave only mirrors "
-                f"the {len(mirror_map)} mapped symbol(s). Set "
-                f"mirror_map_passthrough to send unmapped symbols through unchanged."
-            )
-        spec: Dict[str, Any] = {}
-        symbol = master_symbol
-    elif isinstance(entry, str):
-        spec = {}
-        symbol = entry
-    elif isinstance(entry, dict):
-        spec = entry
-        symbol = str(spec.get("target") or master_symbol)
-    else:
-        return None, (
-            f"mirror_map[{master_symbol}] should be a target symbol or an object, "
-            f"got {type(entry).__name__}"
-        )
+    symbol, spec, reason = resolve_symbol(slave_config, master_symbol)
+    if symbol is None:
+        return None, reason
 
     ratio, reason = _lot_ratio(spec, master_symbol)
     if ratio is None:
@@ -178,6 +201,159 @@ def resolve_target(
         )
 
     return MirrorTarget(symbol=symbol, lots=lots, how=how), None
+
+
+@dataclass
+class MirrorPlan:
+    """A fully priced order for the slave's own instrument."""
+
+    symbol: str
+    lots: float
+    sl: Optional[float]
+    tp: Optional[float]
+    how: str
+
+
+def _on_tick_grid(level: float, tick_size: float, digits: int) -> float:
+    if tick_size <= 0:
+        return round(level, digits)
+    return round(round(level / tick_size) * tick_size, digits)
+
+
+def plan_by_risk(
+    slave_config: Dict[str, Any],
+    target_symbol: str,
+    direction: str,
+    master_price: float,
+    master_sl: Optional[float],
+    master_tp: Optional[float],
+    spec: Any,
+    balance: float,
+    equity: float,
+) -> Tuple[Optional[MirrorPlan], Optional[str]]:
+    """Size this signal as a percentage of the SLAVE's own capital.
+
+    This is how risk has been porting on every other slave: ibkr-paper-1
+    sizes 2% of its own equity per signal, and the master's lot count never
+    enters into it. A mirror slave could not do that until the bridge could
+    report its balance, so it only had risk_scale -- a multiple of a lot
+    count, which means nothing once the slave's instrument is not the
+    master's.
+
+    The stop travels as a FRACTION of price, not as a level. A level is
+    meaningless across instruments: US500 quoting 7594 and ES_Z quoting its
+    own index would make the master's 7500 stop either absurd or already
+    triggered. A fraction is scale-free, survives the two feeds disagreeing
+    by a few points, and is what an ATR multiple effectively is anyway.
+
+    Returns (plan, None) or (None, reason).
+    """
+    sizing = slave_config.get("sizing") or {}
+    if not sizing.get("mode"):
+        return None, "sizing has no mode, so there is no sizing model to apply"
+
+    if not master_sl or master_price <= 0:
+        return None, (
+            f"no stop on the master signal (price={master_price}, sl={master_sl}), "
+            f"so a risk-based size cannot be computed. Risk is distance times "
+            f"point value; without a stop there is no distance."
+        )
+
+    stop_fraction = abs(master_price - master_sl) / master_price
+    if stop_fraction <= 0:
+        return None, "the master's stop is at its entry price, which is no distance"
+
+    price = spec.price_for(direction)
+    if price <= 0:
+        return None, (
+            f"{target_symbol} has no price yet (bid={spec.bid}, ask={spec.ask}); "
+            f"it may have only just been added to Market Watch"
+        )
+
+    point_value = spec.point_value
+    if point_value <= 0:
+        return None, (
+            f"{target_symbol} reports tick_size={spec.tick_size} and "
+            f"tick_value={spec.tick_value}, which gives no point value to size on"
+        )
+
+    stop_distance = price * stop_fraction
+    sign = 1.0 if direction == "BUY" else -1.0
+    sl = _on_tick_grid(price - sign * stop_distance, spec.tick_size, spec.digits)
+    tp = None
+    if master_tp:
+        # Carried across the same way, so the reward-to-risk the master chose
+        # survives the translation.
+        tp_fraction = abs(master_tp - master_price) / master_price
+        tp = _on_tick_grid(
+            price + sign * price * tp_fraction, spec.tick_size, spec.digits
+        )
+
+    # The broker's own figures, in the shape the shared sizing model expects.
+    # min_size is the coarser of the step and the minimum: the step alone
+    # would let a size through below what the broker will accept.
+    contract_spec = ContractSpec(
+        symbol=target_symbol,
+        tick_size=spec.tick_size,
+        tick_value=spec.tick_value,
+        point_value=point_value,
+        min_size=max(spec.volume_min or 0.0, spec.volume_step or DEFAULT_STEP),
+    )
+
+    # The standing portfolio-level correction, applied for the same reason
+    # the autonomous engine applies it: it is a fact about the account, not
+    # about one strategy's sizing mode. Added to both figures so it lands
+    # whichever capital_base is in force.
+    adjustment = resolve_balance_adjustment(slave_config)
+
+    # compute_size, not arithmetic of our own. This is the same function
+    # ibkr-paper-1 sizes through, so "port the risk the way it ports
+    # everywhere else" is true by construction rather than by resemblance --
+    # including rounding (nearest_min1 keeps a small signal at one contract
+    # instead of refusing it) and the max_risk_pct ceiling that stops that
+    # minimum contract carrying more than the account agreed to.
+    result = compute_size(
+        sizing_config=sizing,
+        master_lots=0.0,
+        entry_price=price,
+        stop_price=sl,
+        account_balance=balance + adjustment,
+        account_equity=equity + adjustment,
+        contract_spec=contract_spec,
+        risk_scale=float(slave_config.get("risk_scale", 1.0) or 0.0),
+    )
+    if result.skipped or result.size <= 0:
+        return None, (
+            f"{target_symbol}: {result.reason or 'sizing produced nothing'} "
+            f"(price {price}, stop {sl}, {stop_fraction:.3%} away, point value "
+            f"{point_value:g})"
+        )
+
+    lots = float(result.size)
+    # Measured off the rounded stop, which is the one compute_size sized
+    # against and the one the order will carry -- quoting the unrounded
+    # distance here would print a risk per lot nobody can reproduce.
+    placed_distance = abs(price - sl)
+    how = (
+        f"{sizing.get('mode')} on {target_symbol}: a {stop_fraction:.3%} stop "
+        f"({placed_distance:.{spec.digits}f} away at {price}) risks "
+        f"{placed_distance * point_value:.2f}/lot of "
+        f"{balance + adjustment:.2f} -> {lots:g} lots"
+    )
+    if result.reason:
+        how += f" ({result.reason})"
+
+    if spec.volume_max and lots > spec.volume_max:
+        # Not a refusal: SlaveBridge.mq5 1.04 opens this as a position group
+        # of several deals. Worth saying out loud, because it is the only
+        # place a reader can see that one signal became ten orders.
+        how += (
+            f" -- above {target_symbol}'s maximum of {spec.volume_max:g}, so the "
+            f"bridge will open it as {math.ceil(lots / spec.volume_max)} deals "
+            f"held together as one group"
+        )
+
+    return MirrorPlan(symbol=target_symbol, lots=lots, sl=sl, tp=tp, how=how), None
 
 
 def netting_refusal(

@@ -12,6 +12,7 @@ from app.adapters.base import (
     AdapterRejectedError,
     AdapterTimeoutError,
     BrokerAdapter,
+    BrokerSymbolSpec,
     OrderRequest,
     OrderResult,
     Position,
@@ -173,7 +174,78 @@ class MT4Adapter(BrokerAdapter):
             return False
 
     async def get_account_summary(self, account_type: str) -> AccountSummary:
-        raise NotImplementedError("MT4Adapter (mirror mode) does not support account summaries")
+        """Balance and equity, via the EA's ACCOUNT command.
+
+        `account_type` is accepted for interface parity and ignored: an MT
+        terminal is logged into exactly one account.
+
+        This is what lets a mirror slave size by a percentage of its own
+        capital instead of by a multiple of the master's lots. Before
+        ACCOUNT existed it could not -- the bridge had no way to say what the
+        account was worth, which is the whole reason mirror mode only ever
+        had risk_scale.
+        """
+        reply = await self._ask_tolerating_old_ea({"cmd": "ACCOUNT"}, "ACCOUNT")
+        return AccountSummary(
+            balance=float(reply["balance"]), equity=float(reply["equity"])
+        )
+
+    async def get_symbol_spec(self, symbol: str) -> BrokerSymbolSpec:
+        """One symbol's specification and current price, via SYMBOLS.
+
+        Not part of the BrokerAdapter interface -- see BrokerSymbolSpec.
+        Callers check for the method, because only the MT bridges answer it.
+        """
+        reply = await self._ask_tolerating_old_ea(
+            {"cmd": "SYMBOLS", "symbols": [symbol]}, "SYMBOLS"
+        )
+        rows = reply.get("symbols") or []
+        if not rows or not rows[0].get("exists"):
+            raise AdapterRejectedError(
+                f"{symbol} is not carried by this slave's server"
+            )
+        row = rows[0]
+        return BrokerSymbolSpec(
+            symbol=row["symbol"],
+            digits=int(row["digits"]),
+            tick_size=float(row["tick_size"]) or float(row.get("point") or 0.0),
+            tick_value=float(row["tick_value"]),
+            volume_step=float(row["volume_step"]),
+            volume_min=float(row["volume_min"]),
+            volume_max=float(row["volume_max"]),
+            bid=float(row.get("bid") or 0.0),
+            ask=float(row.get("ask") or 0.0),
+            trade_mode=str(row.get("trade_mode") or ""),
+            contract_size=float(row.get("contract_size") or 0.0),
+            expiry=str(row.get("expiry") or ""),
+        )
+
+    async def _ask_tolerating_old_ea(self, command: dict, name: str) -> dict:
+        """A read whose command may postdate the EA on the chart.
+
+        An EA compiled before these commands answers "unknown cmd", which is
+        a configuration state rather than a fault -- a hub upgraded ahead of
+        the EAs on someone's desktop is perfectly ordinary. Turned into
+        NotImplementedError so callers can degrade, with the recompile named
+        once here rather than at every call site.
+
+        retries=0: these are reads taken on the signal path, and a dead slave
+        needs to say so quickly rather than spend the retry budget.
+        """
+        try:
+            return await self._request(command, retries=0)
+        except AdapterRejectedError as exc:
+            if "unknown cmd" in str(exc).lower():
+                logger.warning(
+                    "slave=%s EA predates the %s command -- recompile "
+                    "bridge_ea/SlaveBridge.mq5 (1.03 or later) in this terminal "
+                    "to enable account-based sizing for this slave",
+                    self.slave_id, name,
+                )
+                raise NotImplementedError(
+                    f"slave EA predates the {name} command"
+                ) from exc
+            raise
 
     async def get_price_history(
         self, symbol: str, period: int, month_slot: int = 0,

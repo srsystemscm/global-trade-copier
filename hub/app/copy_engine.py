@@ -62,6 +62,62 @@ class CopyEngine(SessionGateMixin):
             return None
         return target.lots
 
+    async def _plan(self, signal):
+        """Which instrument, how many lots, and where the stop goes.
+
+        Two sizing models, chosen by whether the slave has a `sizing` block:
+
+        With one, the size comes from a percentage of the SLAVE's own
+        capital, which is how risk has ported to every other slave --
+        ibkr-paper-1 risks 2% of its own equity per signal and the master's
+        lot count never enters into it. It needs the slave's balance and the
+        target's specification, so it only works against an EA that answers
+        ACCOUNT and SYMBOLS (SlaveBridge.mq5 1.03+).
+
+        Without one, the master's lots are converted by the instruments'
+        point values and the master's own SL/TP are passed through. That is
+        what mirror mode has always done, and slaves configured that way
+        keep behaving exactly as before.
+        """
+        if not self.slave_config.get("sizing"):
+            target, reason = mirror.resolve_target(
+                self.slave_config, signal.symbol, signal.lots
+            )
+            if target is None:
+                return None, reason
+            return mirror.MirrorPlan(
+                symbol=target.symbol, lots=target.lots,
+                sl=signal.sl, tp=signal.tp, how=target.how,
+            ), None
+
+        symbol, _spec, reason = mirror.resolve_symbol(self.slave_config, signal.symbol)
+        if symbol is None:
+            return None, reason
+
+        read_spec = getattr(self.adapter, "get_symbol_spec", None)
+        if read_spec is None:
+            return None, (
+                f"{type(self.adapter).__name__} cannot report a symbol "
+                f"specification, so this slave cannot size by risk"
+            )
+        try:
+            spec = await read_spec(symbol)
+            account = await self.adapter.get_account_summary("")
+        except NotImplementedError as exc:
+            # Refused, not sized some other way. Falling back to lot
+            # mirroring here would put on a position sized by a model nobody
+            # configured, which is worse than not trading.
+            return None, (
+                f"this slave is configured to size by risk, which needs the EA's "
+                f"ACCOUNT and SYMBOLS commands: {exc}"
+            )
+
+        return mirror.plan_by_risk(
+            self.slave_config, symbol, signal.direction,
+            master_price=signal.price, master_sl=signal.sl, master_tp=signal.tp,
+            spec=spec, balance=account.balance, equity=account.equity,
+        )
+
     async def _slave_positions(self):
         """The slave's open positions, or None when it cannot say.
 
@@ -152,10 +208,8 @@ class CopyEngine(SessionGateMixin):
                                  slave_ticket=existing[0].slave_ticket)
                 return
 
-            target, reason = mirror.resolve_target(
-                self.slave_config, signal.symbol, signal.lots
-            )
-            if target is None:
+            plan, reason = await self._plan(signal)
+            if plan is None:
                 logger.warning(
                     "slave=%s refusing OPEN ticket=%s: %s",
                     self.slave_id, signal.ticket, reason,
@@ -163,7 +217,7 @@ class CopyEngine(SessionGateMixin):
                 await self._emit("slave_error", master_ticket=signal.ticket,
                                  action="OPEN", message=reason)
                 return
-            lots = target.lots
+            target, lots = plan, plan.lots
 
             # Checked against what the account actually holds, not against what
             # this copier opened. A slave that runs its own strategies can
@@ -205,8 +259,12 @@ class CopyEngine(SessionGateMixin):
                 symbol=target.symbol,
                 direction=signal.direction,
                 size=lots,
-                sl=signal.sl,
-                tp=signal.tp,
+                # plan.sl/tp, not signal.sl/tp. Where the slave trades a
+                # different instrument these are the master's levels
+                # translated onto the target's own price scale; where it
+                # trades the same one they are the master's levels unchanged.
+                sl=plan.sl,
+                tp=plan.tp,
                 master_ticket=signal.ticket,
             )
             # Timed either side of the adapter call so the two halves of
