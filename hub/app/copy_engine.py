@@ -1,10 +1,9 @@
 import asyncio
 import logging
-import math
 import time
 from typing import Any, Dict, Optional
 
-from app import trade_registry
+from app import mirror, trade_registry
 from app.adapters.base import AdapterError, BrokerAdapter, OrderRequest
 from app.events import EventBus
 from app.models import Signal
@@ -20,8 +19,10 @@ class CopyEngine(SessionGateMixin):
 
     Copies OPEN with the absolute SL/TP the master sent, and follows MODIFY
     and CLOSE via the master_ticket -> slave_ticket mapping in the Trade
-    Registry. Mirror mode always maps one master symbol to itself (no
-    symbol_map fan-out), so there's exactly one mapping per master_ticket.
+    Registry. One master symbol becomes exactly one slave symbol -- there is
+    no fan-out here, so there's exactly one mapping per master_ticket -- but
+    that one symbol need no longer be the master's own: see app.mirror, where
+    `mirror_map` translates the instrument and converts the lots.
     """
 
     def __init__(
@@ -49,43 +50,41 @@ class CopyEngine(SessionGateMixin):
     def _scaled_lots(self, lots: float):
         """The master's lots, scaled by risk_scale. None means "don't trade".
 
-        Mirror mode has no sizing model to lean on, so the rounding is done
-        here: MT4/MT5 volumes are quoted to 0.01, and a scaled lot that
-        doesn't land on that grid is rejected by the terminal rather than
-        clamped. The slave bridge still has the last word -- it knows the
-        broker's own min/max/step -- but sending 0.0075 and letting it refuse
-        would turn a configuration mistake into a missed trade with a
-        confusing error.
+        Kept as a thin wrapper over app.mirror so that a slave with no
+        mirror_map behaves exactly as it always did. The sizing itself moved
+        there when the futures slave arrived: a scale factor is no longer the
+        only thing between a master lot and a slave lot, because one BTCUSD
+        lot is ten MBT_X contracts.
         """
-        scale = float(self.slave_config.get("risk_scale", 1.0))
-        if scale == 1.0:
-            return lots
-        if scale <= 0:
-            logger.error(
-                "slave=%s risk_scale is %s, which is not a tradeable fraction; "
-                "refusing the trade rather than sending a zero or inverted size",
-                self.slave_id, scale,
-            )
+        target, reason = mirror.resolve_target(self.slave_config, "", lots)
+        if target is None:
+            logger.warning("slave=%s %s", self.slave_id, reason)
             return None
-        # Floored to the 0.01 grid, not rounded. This dial's job is to
-        # carry LESS risk than the master, so it must never hand back more
-        # than was asked for. round() would also be erratic here: 0.075 is
-        # not exactly representable in binary, so round(0.075, 2) is 0.07
-        # while round(0.125, 2) is 0.12 by banker's rounding -- the same
-        # input shape giving different answers for invisible reasons.
-        scaled = math.floor(lots * scale * 100) / 100
-        if scaled < 0.01:
+        return target.lots
+
+    async def _slave_positions(self):
+        """The slave's open positions, or None when it cannot say.
+
+        None is not an empty book, and the difference matters: an empty book
+        permits a trade and an unknown book should not be read as permission.
+        """
+        read = getattr(self.adapter, "get_open_positions", None)
+        if read is None:
+            # Asked explicitly rather than catching AttributeError, which
+            # would also swallow one raised inside a working implementation.
+            return None
+        try:
+            return await read()
+        except NotImplementedError:
+            # An EA older than the POSITIONS command. Reported by the adapter
+            # with a recompile instruction of its own; nothing to add here.
+            return None
+        except AdapterError as exc:
             logger.warning(
-                "slave=%s risk_scale %s takes %s lots down to %s, below the 0.01 "
-                "minimum volume; skipping rather than sending an order the "
-                "terminal will reject",
-                self.slave_id, scale, lots, scaled,
+                "slave=%s could not read open positions for the netting check: %s",
+                self.slave_id, exc,
             )
             return None
-        logger.info(
-            "slave=%s risk_scale %s: %s lots -> %s", self.slave_id, scale, lots, scaled,
-        )
-        return scaled
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name=f"copy-engine-{self.slave_id}")
@@ -153,16 +152,57 @@ class CopyEngine(SessionGateMixin):
                                  slave_ticket=existing[0].slave_ticket)
                 return
 
-            lots = self._scaled_lots(signal.lots)
-            if lots is None:
+            target, reason = mirror.resolve_target(
+                self.slave_config, signal.symbol, signal.lots
+            )
+            if target is None:
+                logger.warning(
+                    "slave=%s refusing OPEN ticket=%s: %s",
+                    self.slave_id, signal.ticket, reason,
+                )
                 await self._emit("slave_error", master_ticket=signal.ticket,
-                                 action="OPEN",
-                                 message=f"risk_scale left no tradeable volume for "
-                                         f"{signal.lots} lots")
+                                 action="OPEN", message=reason)
                 return
+            lots = target.lots
+
+            # Checked against what the account actually holds, not against what
+            # this copier opened. A slave that runs its own strategies can
+            # already be positioned in the target instrument, and on a hedging
+            # account an opposing copy sits alongside it rather than being
+            # refused by the terminal.
+            #
+            # Opt-in per slave, and deliberately so. A master running two
+            # strategies that hold both sides of one symbol is a legitimate
+            # workflow this would block, and it costs a POSITIONS round trip
+            # on every OPEN -- neither belongs to a slave that never asked.
+            # `is not None`, not truthiness: "netting": {} means "on, with the
+            # defaults", and an empty dict is falsy. Read as a boolean it
+            # would switch the guard off at exactly the moment someone had
+            # just switched it on.
+            netting_policy = self.slave_config.get("netting")
+            positions = (
+                await self._slave_positions() if netting_policy is not None else None
+            )
+            if positions is not None:
+                refusal = mirror.netting_refusal(
+                    positions, target.symbol, signal.direction, lots, netting_policy,
+                )
+                if refusal:
+                    logger.warning(
+                        "slave=%s refusing OPEN ticket=%s on %s: %s",
+                        self.slave_id, signal.ticket, target.symbol, refusal,
+                    )
+                    await self._emit("netting_blocked", master_ticket=signal.ticket,
+                                     slave_symbol=target.symbol, message=refusal)
+                    return
+
+            logger.info(
+                "slave=%s ticket=%s %s -> %s: %s",
+                self.slave_id, signal.ticket, signal.symbol, target.symbol, target.how,
+            )
 
             order = OrderRequest(
-                symbol=signal.symbol,
+                symbol=target.symbol,
                 direction=signal.direction,
                 size=lots,
                 sl=signal.sl,
@@ -178,7 +218,11 @@ class CopyEngine(SessionGateMixin):
             result = await self.adapter.open(order)
             filled_at = time.time()
             trade_registry.record_open(
-                self.slave_id, signal.account, signal.ticket, signal.symbol, result.slave_ticket,
+                # The TARGET symbol, not the master's: this column is the
+                # slave's own, reconciliation matches open positions on it,
+                # and MODIFY/CLOSE read it back out of the mapping.
+                self.slave_id, signal.account, signal.ticket, target.symbol,
+                result.slave_ticket,
                 master_price=signal.price,
                 slave_price=result.price,
                 slave_lots=result.lots if result.lots is not None else lots,
@@ -192,7 +236,7 @@ class CopyEngine(SessionGateMixin):
             await self._emit(
                 "slave_open",
                 master_ticket=signal.ticket,
-                slave_symbol=signal.symbol,
+                slave_symbol=target.symbol,
                 slave_ticket=result.slave_ticket,
                 size=lots,
                 sl=signal.sl,
