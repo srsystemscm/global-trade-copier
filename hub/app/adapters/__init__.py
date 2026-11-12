@@ -38,6 +38,16 @@ def create_adapter(slave: SlaveConfig) -> BrokerAdapter:
             host=slave.config.get("host", "127.0.0.1"),
             port=slave.config["port"],
             timeout_ms=slave.config.get("timeout_ms", 5000),
+            # Per slave, because the right answer depends on how that EA is
+            # configured. A volume above the symbol's maximum opens as
+            # several deals inside ONE OPEN command (SlaveBridge.mq5 1.04),
+            # which can keep the EA busy for ten seconds or more -- and an
+            # OPEN is not idempotent, so retrying one that had in fact
+            # executed opens a SECOND position while the hub records only the
+            # first. A slave that splits wants max_retries 0 and a timeout
+            # covering the whole split; one that never splits is better off
+            # retrying through an EA restart. None keeps the global default.
+            max_retries=slave.config.get("max_retries"),
         )
 
     if slave.broker_type == "schwab":
