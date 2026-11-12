@@ -60,6 +60,13 @@ MICRO_FUTURES_SPECS: Dict[str, ContractSpec] = {
     # Full-size. GC is 100 troy oz -- 10x MGC, so roughly $430k notional per
     # contract at $4,300 gold. Size it deliberately; dollar_notional will
     # floor to zero (and skip the trade) for any sensible notional.
+    # Full-size Henry Hub natural gas: 10,000 MMBtu, ten times MNG. The
+    # reason to reach for it is cost -- the commission is per contract, so
+    # one NG is far cheaper than ten MNG for the same exposure. Whether the
+    # account can carry one contract's risk is what decides it, which is
+    # what max_risk_pct answers.
+    "NG":  ContractSpec("NG",  tick_size=0.001, tick_value=10.00, point_value=10000.0, exchange="NYMEX"),
+
     "GC":  ContractSpec("GC",  tick_size=0.10, tick_value=10.00, point_value=100.0, exchange="COMEX", liquid_months=(2, 4, 6, 8, 12)), # Gold
 }
 
