@@ -1,10 +1,12 @@
 import asyncio
 import logging
+from dataclasses import dataclass
 import time
 from typing import Any, Dict, Optional, Tuple
 
 from app import trade_registry
 from app.adapters.base import (
+    AccountSummary,
     AdapterError, BrokerAdapter, EntryNeverFilled, OrderRequest,
 )
 from app.atr import compute_atr
@@ -15,6 +17,7 @@ from app.notifier import Notifier
 from app.risk_controls import is_within_trading_hours
 from app.session_gate import SessionGateMixin
 from app.sizing import (
+    resolve_balance_adjustment,
     capital_base_amount, compute_size, merge_sizing, resolve_risk_scale,
     resolve_sizing_config,
 )
@@ -23,6 +26,21 @@ from app import position_store
 from app.routing import Route, describe_refusal, resolve_routes
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Refusal:
+    """Why a candidate was turned away, and whether the next one may be tried.
+
+    `overflowable` separates a capacity limit from a rule. Running out of
+    netting legs or of margin on one instrument is exactly what the next
+    candidate in the list is for; an opposing-direction rule or a
+    correlated-risk budget is not something a sibling product escapes, and
+    treating it as such would subvert the limit while appearing to honour it.
+    """
+
+    reason: str
+    overflowable: bool = False
 
 
 class AutonomousCopyEngine(SessionGateMixin):
@@ -264,6 +282,32 @@ class AutonomousCopyEngine(SessionGateMixin):
                 # noisier than dropping it and far easier to notice.
                 await self._defer_open(signal, route, sl_mult, tp_mult, exc)
 
+    def _risk_account(self, account):
+        """The account figures RISK is measured against.
+
+        Returns (summary, reason): a summary to size against, or None and
+        the reason this account cannot be sized against at all.
+
+        Margin deliberately does not come through here. What the broker
+        holds is held against real equity, so a margin cap measured against
+        an inflated figure would believe it had room it does not have --
+        which is a margin call rather than an over-sized trade. The
+        watchdog's drawdown alert stays on the real figure too: an alert
+        about money that is not there is not an alert.
+        """
+        adjustment = resolve_balance_adjustment(self.slave_config)
+        if not adjustment:
+            return account, None
+        balance = (account.balance or 0.0) + adjustment
+        equity = (account.equity or 0.0) + adjustment
+        if balance <= 0 or equity <= 0:
+            return None, (
+                f"balance_adjustment of {adjustment:+,.0f} would put the "
+                f"account at {balance:,.0f} balance / {equity:,.0f} equity, "
+                f"which is not something risk can be measured against"
+            )
+        return AccountSummary(balance=balance, equity=equity), None
+
     async def _size_candidate(
         self, signal: Signal, route: Route, target_symbol: str,
         sl_mult: Optional[float], tp_mult: Optional[float],
@@ -302,7 +346,10 @@ class AutonomousCopyEngine(SessionGateMixin):
 
         spec = get_contract_spec(target_symbol)
         account_type = "futures" if spec else "brokerage"
-        account = await self.adapter.get_account_summary(account_type)
+        real_account = await self.adapter.get_account_summary(account_type)
+        account, reason = self._risk_account(real_account)
+        if account is None:
+            return None, reason
 
         sizing_config = merge_sizing(
             resolve_sizing_config(self.slave_config, target_symbol), route.sizing)
@@ -325,10 +372,13 @@ class AutonomousCopyEngine(SessionGateMixin):
             "atr_period": atr_period, "bar_size": bar_size, "quote": quote,
             "sl": slave_sl, "tp": slave_tp, "direction": traded_direction,
             "sizing_result": sizing_result, "sizing_config": sizing_config,
-            "account": account,
+            # `account` carries the balance_adjustment and is what risk is
+            # measured against; `real_account` is the broker's own figure,
+            # for margin, which cannot be told a bigger number.
+            "account": account, "real_account": real_account,
         }, None
 
-    async def _margin_refusal(self, signal, route, chosen, account) -> Optional[str]:
+    async def _margin_refusal(self, signal, route, chosen, account) -> Optional["Refusal"]:
         """Would this order push total initial margin past the cap?
 
         Only asked when a cap is configured, because whatIfOrder is a round
@@ -355,34 +405,42 @@ class AutonomousCopyEngine(SessionGateMixin):
                 month_slot=route.month_slot,
             ))
         except NotImplementedError:
-            return (
+            # The adapter cannot do this for any candidate, so trying the
+            # rest of the list would be N round trips to the same answer.
+            return Refusal(overflowable=False, reason=(
                 f"netting.max_margin_pct is set but {type(self.adapter).__name__} "
                 f"cannot preview margin, so the cap cannot be enforced"
-            )
+            ))
         except AdapterError as exc:
-            return f"could not price the margin for {chosen['symbol']}: {exc}"
+            return Refusal(
+                overflowable=True,
+                reason=f"could not price the margin for {chosen['symbol']}: {exc}")
 
         after = preview.initial_after
         if after is None:
-            return (
+            return Refusal(overflowable=True, reason=(
                 f"the broker gave no post-order margin figure for "
                 f"{chosen['symbol']}, so netting.max_margin_pct cannot be enforced"
-            )
+            ))
 
         equity = account.equity or account.balance
         if not equity:
-            return "no account equity to measure margin against"
+            return Refusal(
+                overflowable=False,
+                reason="no account equity to measure margin against")
 
         ceiling = equity * float(cap_pct)
         if after > ceiling:
             change = preview.initial_change
-            return (
+            # Capacity at the broker: a cheaper instrument is the point of
+            # having a list.
+            return Refusal(overflowable=True, reason=(
                 f"{chosen['symbol']} x{chosen['sizing_result'].size:g} would take "
                 f"initial margin to {after:.0f}"
                 + (f" (adding {change:.0f})" if change is not None else "")
                 + f", over the {float(cap_pct):.1%} ceiling of {ceiling:.0f}. "
                 f"Margin binds before risk does on this instrument."
-            )
+            ))
         logger.debug(
             "slave=%s %s margin after = %.0f of %.0f allowed",
             self.slave_id, chosen["symbol"], after, ceiling,
@@ -404,7 +462,7 @@ class AutonomousCopyEngine(SessionGateMixin):
             return (distance / spec.tick_size) * spec.tick_value * size
         return distance * size
 
-    def _netting_check(self, signal, route, chosen, account) -> Optional[str]:
+    def _netting_check(self, signal, route, chosen, account) -> Optional["Refusal"]:
         """Is this leg allowed to stack onto what is already held?
 
         Returns a refusal reason, or None to proceed. Everything here exists
@@ -425,23 +483,27 @@ class AutonomousCopyEngine(SessionGateMixin):
         if not policy.get("allow_opposing", False):
             held = {pos.get("direction") for _, pos in existing}
             if chosen["direction"] not in held and held:
-                return (
+                # Never overflowable: the next product would simply be where
+                # the opposing position got opened instead.
+                return Refusal(overflowable=False, reason=(
                     f"already holding {', '.join(sorted(h or '?' for h in held))} "
                     f"on {symbol} and this signal is {chosen['direction']}. On a "
                     f"netting account the opposite side does not open a position, "
                     f"it REDUCES the one held -- while this leg would be tracked "
                     f"as {chosen['direction']} with its stop on the wrong side. "
                     f"Set netting.allow_opposing to override."
-                )
+                ))
 
         # --- how many may stack -------------------------------------------
         max_legs = policy.get("max_legs")
         same_side = [p for _, p in existing if p.get("direction") == chosen["direction"]]
         if max_legs is not None and len(same_side) >= int(max_legs):
-            return (
+            # Capacity, so the next candidate is exactly the answer: this is
+            # the case a second product is listed for.
+            return Refusal(overflowable=True, reason=(
                 f"already holding {len(same_side)} {chosen['direction']} leg(s) on "
                 f"{symbol}, at the netting.max_legs limit of {max_legs}"
-            )
+            ))
 
         # --- how much they may risk together ------------------------------
         cap_pct = policy.get("max_aggregate_risk_pct")
@@ -452,10 +514,10 @@ class AutonomousCopyEngine(SessionGateMixin):
             })
             held_risks = [self._leg_risk(p) for _, p in existing]
             if any(r is None for r in held_risks) or new_risk is None:
-                return (
+                return Refusal(overflowable=False, reason=(
                     f"cannot measure the combined risk on {symbol} -- a leg has no "
                     f"stop, so netting.max_aggregate_risk_pct cannot be enforced"
-                )
+                ))
             total = sum(held_risks) + new_risk
             capital = capital_base_amount(
                 (route.sizing or {}).get("capital_base")
@@ -464,12 +526,17 @@ class AutonomousCopyEngine(SessionGateMixin):
             )
             ceiling = capital * float(cap_pct)
             if total > ceiling:
-                return (
+                # Not overflowable. The cap exists because several systems on
+                # one symbol are a single correlated bet, and a sibling
+                # product on the same underlying is the same bet -- escaping
+                # the cap by changing ticker would defeat it while looking
+                # like compliance.
+                return Refusal(overflowable=False, reason=(
                     f"{len(existing)} leg(s) already risk {sum(held_risks):.2f} on "
                     f"{symbol}; adding {new_risk:.2f} would make {total:.2f}, over "
                     f"the {float(cap_pct):.2%} aggregate ceiling of {ceiling:.2f}. "
                     f"These net into ONE position, so the limit is across them."
-                )
+                ))
         return None
 
     async def _open_one(
@@ -482,21 +549,51 @@ class AutonomousCopyEngine(SessionGateMixin):
         # cannot be settled when the route is written.
         candidates = route.candidates or [route.target]
         rejected = []
+        refused = []
         chosen = None
         for candidate in candidates:
-            chosen, reason = await self._size_candidate(
+            sized, reason = await self._size_candidate(
                 signal, route, candidate, sl_mult, tp_mult)
-            if chosen is not None:
-                break
-            rejected.append((candidate, reason))
+            if sized is None:
+                rejected.append((candidate, reason))
+                continue
+
+            # Inside the loop, not after it. A netting or margin refusal is
+            # precisely what the next candidate is for: a book already full
+            # on BITU is when the overflow product earns its place, and
+            # refusing the signal there would throw away the flexibility the
+            # list was written to provide.
+            refusal = self._netting_check(signal, route, sized, sized["account"])
+            if refusal is None:
+                refusal = await self._margin_refusal(
+                    signal, route, sized, sized["real_account"])
+            if refusal is not None:
+                rejected.append((candidate, refusal.reason))
+                refused.append(refusal.reason)
+                if not refusal.overflowable:
+                    # A rule rather than a capacity limit. The rest of the
+                    # list is not an answer to it, so stop here instead of
+                    # finding a different instrument to break it on.
+                    break
+                continue
+
+            chosen = sized
+            break
 
         if chosen is None:
             logger.warning(
-                "slave=%s skipping OPEN ticket=%s: no tradeable contract among "
+                "slave=%s skipping OPEN ticket=%s: nothing tradeable among "
                 "%s -- %s",
                 self.slave_id, signal.ticket, ", ".join(candidates),
                 "; ".join("%s: %s" % r for r in rejected),
             )
+            if refused:
+                # Still reported as a refusal: the signal was turned away by
+                # policy, not by arithmetic, and that is the thing worth
+                # seeing in the ledger.
+                await self._emit(
+                    "netting_refused", master_ticket=signal.ticket,
+                    slave_symbol=candidates[0], reason="; ".join(refused))
             return
 
         if rejected:
@@ -507,18 +604,6 @@ class AutonomousCopyEngine(SessionGateMixin):
                 ", ".join(c for c, _ in rejected),
                 "; ".join("%s: %s" % r for r in rejected),
             )
-
-        refusal = self._netting_check(signal, route, chosen, chosen["account"])
-        if refusal is None:
-            refusal = await self._margin_refusal(
-                signal, route, chosen, chosen["account"])
-        if refusal is not None:
-            logger.warning(
-                "slave=%s refusing %s for ticket=%s: %s",
-                self.slave_id, chosen["symbol"], signal.ticket, refusal)
-            await self._emit("netting_refused", master_ticket=signal.ticket,
-                             slave_symbol=chosen["symbol"], reason=refusal)
-            return
 
         target_symbol = chosen["symbol"]
         spec = chosen["spec"]

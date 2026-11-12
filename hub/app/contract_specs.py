@@ -21,6 +21,18 @@ class ContractSpec:
     # to "the next expiry" instead of "the next *liquid* expiry" would park it
     # in one of those. Empty means every month is liquid (e.g. crude).
     liquid_months: Tuple[int, ...] = ()
+    # What IBKR calls this root, when that differs from the name used here.
+    # Micro silver forced this: IBKR lists no "SIL" symbol, so
+    # Future("SIL") returns Error 200 while Future("SI") returns both
+    # silver sizes. None means the name here is the name IBKR uses, which
+    # is true of every other root in this table.
+    ib_symbol: Optional[str] = None
+    # The IBKR trading class. Needed only where one ib_symbol carries more
+    # than one contract size, and part of the contract's identity when it
+    # does: under symbol "SI", trading class "SIL" is 1,000 ounces and "SI"
+    # is 5,000. Choosing wrongly sizes every position five times over while
+    # resolving and filling perfectly happily.
+    trading_class: Optional[str] = None
 
 
 # Indicative CME-complex futures specs: the micro preset (the project's
@@ -95,6 +107,18 @@ MICRO_FUTURES_SPECS: Dict[str, ContractSpec] = {
     "NG":  ContractSpec("NG",  tick_size=0.001, tick_value=10.00, point_value=10000.0, exchange="NYMEX"),
 
     "GC":  ContractSpec("GC",  tick_size=0.10, tick_value=10.00, point_value=100.0, exchange="COMEX", liquid_months=(2, 4, 6, 8, 12)), # Gold
+
+    # Silver, both sizes. Verified against the live Gateway rather than a
+    # fact card: multiplier 1000 and 5000, minTick 0.005 on both, so a tick
+    # is $5.00 on the micro and $25.00 on the full-size. Both are listed
+    # under IBKR symbol "SI" and separated only by trading class.
+    #
+    # liquid_months is the COMEX silver cycle (Jan, Mar, May, Jul, Sep,
+    # Dec). IBKR lists a November serial for both; the micro lists only the
+    # cycle plus that serial, so filtering to the cycle is what keeps a
+    # month_slot walk off the serial.
+    "SIL": ContractSpec("SIL", tick_size=0.005, tick_value=5.00, point_value=1000.0, exchange="COMEX", liquid_months=(1, 3, 5, 7, 9, 12), ib_symbol="SI", trading_class="SIL"),  # Micro Silver, 1,000 oz
+    "SI":  ContractSpec("SI",  tick_size=0.005, tick_value=25.00, point_value=5000.0, exchange="COMEX", liquid_months=(1, 3, 5, 7, 9, 12), trading_class="SI"),                   # Silver, 5,000 oz
 }
 
 

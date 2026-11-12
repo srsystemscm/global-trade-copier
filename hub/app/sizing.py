@@ -80,6 +80,24 @@ def capital_base_amount(
     raise ValueError(f"unknown capital_base {capital_base!r}")
 
 
+def resolve_balance_adjustment(slave_config: Dict[str, Any]) -> float:
+    """A standing correction to what the broker reports, portfolio-wide.
+
+    Signed, in account currency. The case it exists for: a 250k account
+    pays 50k in tax, and its strategies are meant to keep risking as if it
+    were still 250k, because the withdrawal is not a drawdown.
+
+    Deliberately at the slave's top level rather than inside a sizing block.
+    It is a fact about the account, not about one strategy's sizing mode, so
+    a route must not be able to quietly forget to carry it -- and it applies
+    whatever capital_base is in force, including "equity".
+
+    Risk is measured against the adjusted figure. Margin is not: see
+    AutonomousCopyEngine._risk_account.
+    """
+    return float(slave_config.get("balance_adjustment", 0.0) or 0.0)
+
+
 def resolve_risk_scale(slave_config: Dict[str, Any], route_scale: Optional[float]) -> float:
     """How much of the configured risk this leg carries.
 

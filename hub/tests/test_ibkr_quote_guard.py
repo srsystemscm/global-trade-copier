@@ -180,3 +180,47 @@ def test_retries_can_be_switched_off():
     with pytest.raises(AdapterRejectedError):
         asyncio.run(a.get_quote("MES"))
     assert seq.calls == 1
+
+
+# ---------------- a root with two contract sizes ------------------------
+
+def test_a_trading_class_spec_skips_contfuture():
+    """ContFuture ignores tradingClass. Probed live:
+    ContFuture("SI", tradingClass="SIL") resolves to SIZ6, multiplier 5000 --
+    the 5,000 ounce contract, which quotes and fills perfectly happily while
+    being five times the intended size. reqContractDetails does honour it,
+    so a two-size root resolves from the dated list instead."""
+    import inspect
+    import re
+    from app.adapters.ibkr import IBKRAdapter
+
+    src = re.sub(r"\s+", " ", inspect.getsource(IBKRAdapter._qualified_contract))
+    assert "spec.trading_class" in src
+    assert "_dated_contract" in src
+    # and the branch has to come before the ContFuture path, or it never runs
+    assert src.index("_dated_contract") < src.index("_contract_for(symbol)")
+
+
+def test_the_month_list_filters_by_trading_class():
+    """Belt and braces behind the request filter: one root carrying two
+    sizes must not mix them into one cycle, or a month_slot walk steps from
+    a micro contract into a full-size one."""
+    import inspect
+    import re
+    from app.adapters.ibkr import IBKRAdapter
+
+    src = re.sub(r"\s+", " ", inspect.getsource(
+        IBKRAdapter._liquid_dated_contracts))
+    assert "spec.trading_class and k.tradingClass != spec.trading_class" in src
+
+
+def test_the_contract_request_names_the_ibkr_symbol():
+    """A route says SIL; IBKR has never heard of it."""
+    import inspect
+    import re
+    from app.adapters.ibkr import IBKRAdapter
+
+    for method in (IBKRAdapter._contract_for,
+                   IBKRAdapter._liquid_dated_contracts):
+        src = re.sub(r"\s+", " ", inspect.getsource(method))
+        assert "spec.ib_symbol or symbol" in src, method.__name__

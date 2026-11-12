@@ -256,7 +256,16 @@ class IBKRAdapter(BrokerAdapter):
             # spec.exchange, not a hardcoded "CME": the micro complex spans
             # COMEX (MGC), NYMEX (MCL) and CBOT (MYM) too, and IBKR's
             # qualifyContracts() rejects the wrong exchange outright.
-            return ib_mod.ContFuture(symbol, exchange=spec.exchange, currency="USD")
+            # ib_symbol/trading_class, not `symbol`: the name used in a
+            # route is not always the name IBKR lists. Silver is listed
+            # under "SI" for both sizes, so without the trading class this
+            # resolves to whichever one IBKR returns first -- 1,000 or
+            # 5,000 ounces, a five-fold sizing error that fills happily.
+            return ib_mod.ContFuture(
+                spec.ib_symbol or symbol, exchange=spec.exchange,
+                currency="USD",
+                **({"tradingClass": spec.trading_class}
+                   if spec.trading_class else {}))
         return ib_mod.Stock(symbol, exchange="SMART", currency="USD")
 
     @staticmethod
@@ -284,7 +293,11 @@ class IBKRAdapter(BrokerAdapter):
             raise AdapterRejectedError(f"{symbol} has no futures spec, so it has no contract months")
 
         details = await self.ib.reqContractDetailsAsync(
-            ib_mod.Future(symbol, exchange=spec.exchange, currency="USD")
+            ib_mod.Future(
+                spec.ib_symbol or symbol, exchange=spec.exchange,
+                currency="USD",
+                **({"tradingClass": spec.trading_class}
+                   if spec.trading_class else {}))
         )
         today = time.strftime("%Y%m%d")
         out, seen = [], set()
@@ -294,6 +307,11 @@ class IBKRAdapter(BrokerAdapter):
             if len(expiry) < 8 or expiry[:8] < today or k.conId in seen:
                 continue
             if spec.liquid_months and int(expiry[4:6]) not in spec.liquid_months:
+                continue
+            # Belt and braces behind the request filter: one root carrying
+            # two contract sizes must not mix them into one month cycle, or
+            # a month_slot walk would step from a micro into a full-size.
+            if spec.trading_class and k.tradingClass != spec.trading_class:
                 continue
             seen.add(k.conId)
             out.append(k)
@@ -316,6 +334,40 @@ class IBKRAdapter(BrokerAdapter):
             return await self._contract_by_id(symbol, contract_id)
         return await self._qualified_contract(symbol, month_slot)
 
+    async def _dated_contract(self, symbol: str, month_slot: int = 0):
+        """Resolve a slot straight from the dated contract list.
+
+        For roots where one IBKR symbol carries several contract sizes, this
+        is the only way to get the right one: ContFuture ignores
+        tradingClass. Probed live -- ContFuture("SI", tradingClass="SIL")
+        returns the 5,000 ounce contract, which resolves, qualifies and
+        quotes perfectly while being five times the intended size.
+
+        reqContractDetails does honour it, and liquid_months filters out the
+        near-dead serial months, which is the part ContFuture was doing that
+        a plain expiry sort does not.
+        """
+        months = await self._liquid_dated_contracts(symbol)
+        if not months:
+            raise AdapterRejectedError(
+                f"IBKR listed no liquid contract for {symbol} -- check "
+                f"liquid_months and trading_class in contract_specs.py"
+            )
+        if month_slot >= len(months):
+            raise AdapterRejectedError(
+                f"{symbol} has no liquid contract at month_slot={month_slot} "
+                f"(only {len(months)} listed ahead)"
+            )
+        resolved = months[month_slot]
+        logger.info(
+            "IBKRAdapter[%s] %s slot %s -> %s (expiry %s, conId %s, "
+            "tradingClass %s)",
+            self.slave_id, symbol, month_slot, resolved.localSymbol,
+            resolved.lastTradeDateOrContractMonth, resolved.conId,
+            resolved.tradingClass,
+        )
+        return resolved
+
     async def _qualified_contract(self, symbol: str, month_slot: int = 0):
         """`month_slot` 0 is the front month, 1 the next liquid month, and so
         on. Strategies that would otherwise net against each other on a single
@@ -327,6 +379,12 @@ class IBKRAdapter(BrokerAdapter):
         cached = self._contracts.get((symbol, month_slot))
         if cached is not None and not self._is_expired(cached):
             return cached
+
+        spec = get_contract_spec(symbol)
+        if spec is not None and spec.trading_class:
+            resolved = await self._dated_contract(symbol, month_slot)
+            self._contracts[(symbol, month_slot)] = resolved
+            return resolved
 
         ib_mod = self._require_ib()
         contract = self._contract_for(symbol)
@@ -527,14 +585,16 @@ class IBKRAdapter(BrokerAdapter):
         sl_order_id = tp_order_id = None
         if sl is not None:
             sl_order = self._protective(
-                ib_mod.StopOrder(closing_action, pos["size"], self._round_to_tick(sl, pos["contract"].symbol))
+                ib_mod.StopOrder(closing_action, pos["size"], self._round_to_tick(
+                    sl, pos.get("symbol") or pos["contract"].symbol))
             )
             sl_order.ocaGroup = oca_group
             sl_order.ocaType = 1
             sl_order_id = self._place(pos["contract"], sl_order).order.orderId
         if tp is not None:
             tp_order = self._protective(
-                ib_mod.LimitOrder(closing_action, pos["size"], self._round_to_tick(tp, pos["contract"].symbol))
+                ib_mod.LimitOrder(closing_action, pos["size"], self._round_to_tick(
+                    tp, pos.get("symbol") or pos["contract"].symbol))
             )
             tp_order.ocaGroup = oca_group
             tp_order.ocaType = 1

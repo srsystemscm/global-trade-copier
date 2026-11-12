@@ -207,3 +207,63 @@ def test_every_spec_tick_value_is_multiplier_times_tick():
         assert spec.tick_size == pytest.approx(min_tick), symbol
         assert spec.point_value == pytest.approx(multiplier), symbol
         assert spec.tick_value == pytest.approx(min_tick * multiplier), symbol
+
+
+# ---------------- silver, and the two-size root problem -----------------
+
+def test_micro_silver_is_a_thousand_ounces():
+    """Probed against the live Gateway: multiplier 1000, minTick 0.005, so
+    a tick is $5.00. Getting this wrong by taking the full-size figures
+    would size every silver position five times over."""
+    spec = get_contract_spec("SIL")
+    assert spec is not None
+    assert spec.tick_size == 0.005
+    assert spec.tick_value == 5.00
+    assert spec.point_value == 1000.0
+    assert spec.exchange == "COMEX"
+
+
+def test_full_size_silver_is_five_thousand_ounces():
+    spec = get_contract_spec("SI")
+    assert spec.tick_size == 0.005
+    assert spec.tick_value == 25.00
+    assert spec.point_value == 5000.0
+
+
+def test_the_two_silver_contracts_are_a_factor_of_five_apart():
+    """The thing that makes picking the wrong one dangerous rather than
+    merely wrong: both quote the same price and fill identically."""
+    assert (get_contract_spec("SI").point_value
+            == 5 * get_contract_spec("SIL").point_value)
+
+
+def test_micro_silver_names_the_symbol_ibkr_actually_lists():
+    """IBKR carries no "SIL" symbol at all -- Future("SIL") returns Error
+    200. Both sizes are listed under "SI"."""
+    spec = get_contract_spec("SIL")
+    assert spec.ib_symbol == "SI"
+
+
+def test_both_silver_specs_pin_a_trading_class():
+    """The only thing separating the two sizes under symbol SI. Without it,
+    whichever contract IBKR returns first is the one that gets traded."""
+    assert get_contract_spec("SIL").trading_class == "SIL"
+    assert get_contract_spec("SI").trading_class == "SI"
+
+
+def test_silver_is_filtered_to_its_liquid_cycle():
+    """IBKR lists a November serial for both. month_slot walks the cycle,
+    so the serial has to be excluded or a slot lands in a dead month."""
+    for sym in ("SIL", "SI"):
+        months = get_contract_spec(sym).liquid_months
+        assert months == (1, 3, 5, 7, 9, 12), sym
+        assert 11 not in months
+
+
+def test_every_other_root_needs_neither_field():
+    """These exist for silver. A root whose name matches IBKR's and which
+    carries one size must not be made to declare them."""
+    for sym in ("MGC", "MES", "MNQ", "MCL", "NG", "M2K"):
+        spec = get_contract_spec(sym)
+        assert spec.ib_symbol is None, sym
+        assert spec.trading_class is None, sym
