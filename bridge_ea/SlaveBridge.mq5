@@ -204,9 +204,11 @@ string HandleOpen(string json)
    req.type         = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
    req.price        = NormalizeDouble(price, digits);
    // A master SL/TP of 0 means "unset", exactly as in MQL4 -- and 0 is also
-   // how MQL5 says "no level", so this passes straight through.
-   req.sl           = (sl > 0.0) ? NormalizeDouble(sl, digits) : 0.0;
-   req.tp           = (tp > 0.0) ? NormalizeDouble(tp, digits) : 0.0;
+   // how MQL5 says "no level", so this passes straight through. Non-zero
+   // levels go onto the tick grid: see OnTickGrid, and MBT_X, whose tick is
+   // 5 whole dollars.
+   req.sl           = (sl > 0.0) ? OnTickGrid(symbol, sl) : 0.0;
+   req.tp           = (tp > 0.0) ? OnTickGrid(symbol, tp) : 0.0;
    req.deviation    = (ulong)Slippage;
    req.magic        = (ulong)MagicNumber;
    req.comment      = "copier";
@@ -283,8 +285,8 @@ string HandleModify(string json)
    req.action   = TRADE_ACTION_SLTP;
    req.position = ticket;
    req.symbol   = symbol;
-   req.sl       = (sl > 0.0) ? NormalizeDouble(sl, digits) : 0.0;
-   req.tp       = (tp > 0.0) ? NormalizeDouble(tp, digits) : 0.0;
+   req.sl       = (sl > 0.0) ? OnTickGrid(symbol, sl) : 0.0;
+   req.tp       = (tp > 0.0) ? OnTickGrid(symbol, tp) : 0.0;
 
    ENUM_ORDER_TYPE asOrder = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
                              ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
@@ -768,6 +770,26 @@ int VolumeDigits(double step)
          return d;
      }
    return 2;
+  }
+
+//| A price on the symbol's TICK grid, not merely rounded to its       |
+//| digits. The two are the same thing for a spot pair and are not for  |
+//| an exchange future: Darwinex's MBT_X has tick_size 5 and digits 0,  |
+//| so NormalizeDouble alone yields a stop like 70949, which sits       |
+//| between two tradeable prices and can come back as an invalid price. |
+//|                                                                     |
+//| Nearest tick, never wider: the master chose the stop, and moving it  |
+//| out to fit the grid would change the risk -- the same reason         |
+//| CheckStopsDistance refuses rather than adjusts.                     |
+double OnTickGrid(const string symbol, double price)
+  {
+   if(price <= 0.0)
+      return 0.0;
+   int    digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   double tick   = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tick <= 0.0)
+      return NormalizeDouble(price, digits);
+   return NormalizeDouble(MathRound(price / tick) * tick, digits);
   }
 
 //| A stop closer to market than SYMBOL_TRADE_STOPS_LEVEL is rejected  |
