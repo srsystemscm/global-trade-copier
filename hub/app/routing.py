@@ -88,6 +88,10 @@ class Route:
     # candidate, so anything keyed on "the route's instrument" -- the
     # deferral and its log lines -- is unchanged.
     candidates: List[str] = field(default_factory=list)
+    # Per-strategy netting policy, overriding the slave's. A pyramiding
+    # strategy may stack three legs where everything else on the slave
+    # stacks none.
+    netting: Optional[Dict[str, Any]] = None
 
 
 def routing_is_strict(slave_config: Dict[str, Any]) -> bool:
@@ -164,6 +168,7 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                                 else float(entry["risk_scale"])),
                     broker_brackets=bool(entry.get("broker_brackets", True)),
                     candidates=list(group),
+                    netting=entry.get("netting"),
                 )
             )
     return matched

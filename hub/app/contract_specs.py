@@ -55,10 +55,13 @@ MICRO_FUTURES_SPECS: Dict[str, ContractSpec] = {
     # not the quarter it looks like next to the other micros. 0.001 tick on
     # 1,000 MMBtu is $1.00, so a 1.00 move is $1,000. NYMEX, like MCL:
     # IBKR's qualifyContracts() fails outright on the wrong exchange.
-    # NOT OFFERED BY IBKR. Probed on 2026-11-12: reqContractDetails for
-    # symbol MNG returns nothing on NYMEX or on any exchange. Kept only
-    # because another broker may carry it; do not put it in an IBKR route,
-    # where it would resolve to nothing at the moment it was needed.
+    # Real contract, but NOT CARRIED BY IBKR. Probed on 2026-11-12:
+    # reqContractDetails for symbol MNG returns nothing on NYMEX or on any
+    # exchange, while Schwab does trade it. So availability is per broker,
+    # not per instrument: this spec is valid and routable on a Schwab slave,
+    # and must not go in an IBKR route, where it would resolve to nothing at
+    # the exact moment a tier list fell through to it. IBKR's small gas
+    # contract is QG below.
     "MNG": ContractSpec("MNG", tick_size=0.001, tick_value=1.00, point_value=1000.0, exchange="NYMEX"),
 
     # The small natural gas contract IBKR actually carries: NYMEX MINY, a

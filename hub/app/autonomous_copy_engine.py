@@ -15,7 +15,8 @@ from app.notifier import Notifier
 from app.risk_controls import is_within_trading_hours
 from app.session_gate import SessionGateMixin
 from app.sizing import (
-    compute_size, merge_sizing, resolve_risk_scale, resolve_sizing_config,
+    capital_base_amount, compute_size, merge_sizing, resolve_risk_scale,
+    resolve_sizing_config,
 )
 from app.contract_roll import roll_sequence, volume_crossover
 from app import position_store
@@ -115,6 +116,12 @@ class AutonomousCopyEngine(SessionGateMixin):
         self.defer_close_poll_seconds = dc.get("poll_seconds", 10)
         # keyed (master_account, master_ticket, slave_symbol)
         self._deferred_closes: Dict[tuple, dict] = {}
+        # How much deliberate netting to permit. The broker nets, so several
+        # same-direction legs become one position -- which is wanted here
+        # (weekly trend, then pullback, then breakout) but has to be bounded.
+        # allow_opposing defaults to false because the opposite side does not
+        # open a position on a netting account, it reduces the one held.
+        self.netting_policy = slave_config.get("netting", {}) or {}
         self._last_roll_check = 0.0
 
         # Keyed (master_account, master_ticket, slave_symbol): ticket
@@ -318,7 +325,91 @@ class AutonomousCopyEngine(SessionGateMixin):
             "atr_period": atr_period, "bar_size": bar_size, "quote": quote,
             "sl": slave_sl, "tp": slave_tp, "direction": traded_direction,
             "sizing_result": sizing_result, "sizing_config": sizing_config,
+            "account": account,
         }, None
+
+    def _leg_risk(self, pos) -> Optional[float]:
+        """What one tracked leg stands to lose if its stop fills.
+
+        None when it cannot be measured -- a leg with no stop has no bounded
+        loss, which the caller has to treat as unknown rather than as zero.
+        """
+        sl, entry, size = pos.get("sl"), pos.get("entry_price"), pos.get("size")
+        if sl is None or entry is None or not size:
+            return None
+        distance = abs(entry - sl)
+        spec = get_contract_spec(pos.get("symbol") or "")
+        if spec:
+            return (distance / spec.tick_size) * spec.tick_value * size
+        return distance * size
+
+    def _netting_check(self, signal, route, chosen, account) -> Optional[str]:
+        """Is this leg allowed to stack onto what is already held?
+
+        Returns a refusal reason, or None to proceed. Everything here exists
+        because the broker nets: these legs become one position, so the
+        limits have to be applied across them rather than one at a time.
+        """
+        symbol = chosen["symbol"]
+        existing = [
+            (key, pos) for key, pos in self._positions.items()
+            if key[2] == symbol and key[0] == signal.account
+        ]
+        if not existing:
+            return None
+
+        policy = route.netting or self.netting_policy
+
+        # --- opposing legs -------------------------------------------------
+        if not policy.get("allow_opposing", False):
+            held = {pos.get("direction") for _, pos in existing}
+            if chosen["direction"] not in held and held:
+                return (
+                    f"already holding {', '.join(sorted(h or '?' for h in held))} "
+                    f"on {symbol} and this signal is {chosen['direction']}. On a "
+                    f"netting account the opposite side does not open a position, "
+                    f"it REDUCES the one held -- while this leg would be tracked "
+                    f"as {chosen['direction']} with its stop on the wrong side. "
+                    f"Set netting.allow_opposing to override."
+                )
+
+        # --- how many may stack -------------------------------------------
+        max_legs = policy.get("max_legs")
+        same_side = [p for _, p in existing if p.get("direction") == chosen["direction"]]
+        if max_legs is not None and len(same_side) >= int(max_legs):
+            return (
+                f"already holding {len(same_side)} {chosen['direction']} leg(s) on "
+                f"{symbol}, at the netting.max_legs limit of {max_legs}"
+            )
+
+        # --- how much they may risk together ------------------------------
+        cap_pct = policy.get("max_aggregate_risk_pct")
+        if cap_pct is not None:
+            new_risk = self._leg_risk({
+                "sl": chosen["sl"], "entry_price": chosen["quote"],
+                "size": chosen["sizing_result"].size, "symbol": symbol,
+            })
+            held_risks = [self._leg_risk(p) for _, p in existing]
+            if any(r is None for r in held_risks) or new_risk is None:
+                return (
+                    f"cannot measure the combined risk on {symbol} -- a leg has no "
+                    f"stop, so netting.max_aggregate_risk_pct cannot be enforced"
+                )
+            total = sum(held_risks) + new_risk
+            capital = capital_base_amount(
+                (route.sizing or {}).get("capital_base")
+                or self.slave_config.get("sizing", {}).get("capital_base", "balance"),
+                account.balance, account.equity, 0.0, 0.0,
+            )
+            ceiling = capital * float(cap_pct)
+            if total > ceiling:
+                return (
+                    f"{len(existing)} leg(s) already risk {sum(held_risks):.2f} on "
+                    f"{symbol}; adding {new_risk:.2f} would make {total:.2f}, over "
+                    f"the {float(cap_pct):.2%} aggregate ceiling of {ceiling:.2f}. "
+                    f"These net into ONE position, so the limit is across them."
+                )
+        return None
 
     async def _open_one(
         self, signal: Signal, route: Route, sl_mult: Optional[float], tp_mult: Optional[float]
@@ -355,6 +446,15 @@ class AutonomousCopyEngine(SessionGateMixin):
                 ", ".join(c for c, _ in rejected),
                 "; ".join("%s: %s" % r for r in rejected),
             )
+
+        refusal = self._netting_check(signal, route, chosen, chosen["account"])
+        if refusal is not None:
+            logger.warning(
+                "slave=%s refusing %s for ticket=%s: %s",
+                self.slave_id, chosen["symbol"], signal.ticket, refusal)
+            await self._emit("netting_refused", master_ticket=signal.ticket,
+                             slave_symbol=chosen["symbol"], reason=refusal)
+            return
 
         target_symbol = chosen["symbol"]
         spec = chosen["spec"]
@@ -447,6 +547,9 @@ class AutonomousCopyEngine(SessionGateMixin):
         key = (signal.account, signal.ticket, target_symbol)
         self._positions[key] = {
             "slave_ticket": result.slave_ticket,
+            # Carried so aggregate risk can be measured across netted legs
+            # without having to reconstruct which symbol a key belongs to.
+            "symbol": target_symbol,
             "entry_price": quote,
             "direction": traded_direction,
             "atr": slave_atr,
