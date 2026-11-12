@@ -86,6 +86,22 @@ class OrderResult:
 
 
 @dataclass
+class MarginPreview:
+    """What an order would do to margin, before it is placed.
+
+    `initial_after` is the broker's own total once the order is in, which is
+    the figure to compare against a ceiling: on a netting account it already
+    accounts for the order offsetting or combining with what is held.
+    """
+
+    initial_change: Optional[float] = None
+    initial_after: Optional[float] = None
+    maintenance_after: Optional[float] = None
+    # The broker's commission estimate, free alongside the margin.
+    commission: Optional[float] = None
+
+
+@dataclass
 class AccountSummary:
     balance: float
     equity: float
@@ -160,6 +176,18 @@ class BrokerAdapter(abc.ABC):
 
     @abc.abstractmethod
     async def close(self, slave_ticket: int) -> Optional[float]: ...
+
+    async def preview_margin(self, order: "OrderRequest") -> "MarginPreview":
+        """What this order would cost in margin, without placing it.
+
+        Not abstract: most brokers cannot answer this. The netting policy
+        treats "cannot measure" as a refusal rather than as zero, so an
+        adapter without it simply cannot use the margin cap -- and says so
+        instead of appearing to enforce one.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot preview margin"
+        )
 
     @abc.abstractmethod
     async def get_status(self) -> bool: ...

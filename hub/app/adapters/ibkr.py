@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 
 from app.adapters.base import (
     EntryNeverFilled,
+    MarginPreview,
     AccountSummary,
     ContractInfo,
     AdapterConnectionError,
@@ -728,6 +729,40 @@ class IBKRAdapter(BrokerAdapter):
         if trade is None:
             return None, None
         return await self._await_fill(trade, "close")
+
+    async def preview_margin(self, order: OrderRequest) -> MarginPreview:
+        """IBKR's own margin and commission for this order, unplaced.
+
+        whatIfOrder is a real round trip, so it is only worth making when
+        something will act on the answer. IBKR returns a huge sentinel
+        (~1.8e308) rather than null for a field it cannot supply, which has
+        to be filtered or it arrives looking like a plausible number.
+        """
+        ib_mod = self._require_ib()
+        assert self.ib is not None, "adapter not connected"
+        contract = await self._contract_for_request(
+            order.symbol, order.month_slot, order.contract_id)
+        action = "BUY" if order.direction == "BUY" else "SELL"
+
+        probe = ib_mod.MarketOrder(action, order.size)
+        probe.tif = self.entry_tif
+        if self.account:
+            probe.account = self.account
+        state = await self.ib.whatIfOrderAsync(contract, probe)
+
+        def number(value):
+            try:
+                f = float(value)
+            except (TypeError, ValueError):
+                return None
+            return None if abs(f) > 1e100 else f
+
+        return MarginPreview(
+            initial_change=number(state.initMarginChange),
+            initial_after=number(state.initMarginAfter),
+            maintenance_after=number(state.maintMarginAfter),
+            commission=number(state.commission),
+        )
 
     async def get_status(self) -> bool:
         return self.ib is not None and self.ib.isConnected()

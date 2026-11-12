@@ -328,6 +328,67 @@ class AutonomousCopyEngine(SessionGateMixin):
             "account": account,
         }, None
 
+    async def _margin_refusal(self, signal, route, chosen, account) -> Optional[str]:
+        """Would this order push total initial margin past the cap?
+
+        Only asked when a cap is configured, because whatIfOrder is a round
+        trip to the broker and most signals do not need one.
+
+        The broker's own initMarginAfter is compared directly, rather than
+        adding a change to a figure tracked here: on a netting account what
+        is held against a combined position is not the sum of what each leg
+        would cost alone, and a cached total would be stale exactly while
+        positions were moving.
+        """
+        policy = route.netting or self.netting_policy
+        cap_pct = policy.get("max_margin_pct")
+        if cap_pct is None:
+            return None
+
+        try:
+            preview = await self.adapter.preview_margin(OrderRequest(
+                symbol=chosen["symbol"],
+                direction=chosen["direction"],
+                size=chosen["sizing_result"].size,
+                sl=None, tp=None,
+                master_ticket=signal.ticket,
+                month_slot=route.month_slot,
+            ))
+        except NotImplementedError:
+            return (
+                f"netting.max_margin_pct is set but {type(self.adapter).__name__} "
+                f"cannot preview margin, so the cap cannot be enforced"
+            )
+        except AdapterError as exc:
+            return f"could not price the margin for {chosen['symbol']}: {exc}"
+
+        after = preview.initial_after
+        if after is None:
+            return (
+                f"the broker gave no post-order margin figure for "
+                f"{chosen['symbol']}, so netting.max_margin_pct cannot be enforced"
+            )
+
+        equity = account.equity or account.balance
+        if not equity:
+            return "no account equity to measure margin against"
+
+        ceiling = equity * float(cap_pct)
+        if after > ceiling:
+            change = preview.initial_change
+            return (
+                f"{chosen['symbol']} x{chosen['sizing_result'].size:g} would take "
+                f"initial margin to {after:.0f}"
+                + (f" (adding {change:.0f})" if change is not None else "")
+                + f", over the {float(cap_pct):.1%} ceiling of {ceiling:.0f}. "
+                f"Margin binds before risk does on this instrument."
+            )
+        logger.debug(
+            "slave=%s %s margin after = %.0f of %.0f allowed",
+            self.slave_id, chosen["symbol"], after, ceiling,
+        )
+        return None
+
     def _leg_risk(self, pos) -> Optional[float]:
         """What one tracked leg stands to lose if its stop fills.
 
@@ -448,6 +509,9 @@ class AutonomousCopyEngine(SessionGateMixin):
             )
 
         refusal = self._netting_check(signal, route, chosen, chosen["account"])
+        if refusal is None:
+            refusal = await self._margin_refusal(
+                signal, route, chosen, chosen["account"])
         if refusal is not None:
             logger.warning(
                 "slave=%s refusing %s for ticket=%s: %s",
