@@ -257,42 +257,37 @@ class AutonomousCopyEngine(SessionGateMixin):
                 # noisier than dropping it and far easier to notice.
                 await self._defer_open(signal, route, sl_mult, tp_mult, exc)
 
-    async def _open_one(
-        self, signal: Signal, route: Route, sl_mult: Optional[float], tp_mult: Optional[float]
-    ) -> None:
-        target_symbol = route.target
+    async def _size_candidate(
+        self, signal: Signal, route: Route, target_symbol: str,
+        sl_mult: Optional[float], tp_mult: Optional[float],
+    ):
+        """Price, measure and size one candidate contract.
 
-        # ATR and price both come from the contract actually traded. A back
-        # month's own volatility is what its stops have to survive, and
-        # borrowing the front month's would misstate it -- deferred months
-        # damp differently, and the calendar spread between them is real
-        # money (GCZ6 4051.6 vs GCJ7 4118.5).
-        #
-        # The cost is that thin back months give thin bars: slot 2 on gold
-        # trades ~174 contracts/day. compute_atr() raises on insufficient
-        # history and the open is skipped with a reason rather than sized off
-        # a bad number.
-        # The route's period when the strategy declares one, this slave's
-        # otherwise. Pinned onto the position below so a roll re-derives the
-        # new contract's ATR the same way the entry was measured.
+        Returns (sized, reason): a dict when this contract can be traded, or
+        None plus the reason it cannot. Everything here is per-instrument --
+        a back month's own volatility is what its stops have to survive, and
+        a smaller contract's lower risk per unit is the entire point of
+        offering it as an alternative.
+        """
         atr_period = route.atr_period or self.atr_period
         bar_size = route.bar_size
 
-        bars = await self.adapter.get_price_history(
-            target_symbol, atr_period, month_slot=route.month_slot, bar_size=bar_size
-        )
         try:
+            bars = await self.adapter.get_price_history(
+                target_symbol, atr_period, month_slot=route.month_slot,
+                bar_size=bar_size)
             slave_atr = compute_atr(bars, atr_period)
         except ValueError as exc:
-            logger.error("slave=%s skipping %s: %s", self.slave_id, target_symbol, exc)
-            return
+            return None, f"no usable ATR ({exc})"
+        except AdapterError as exc:
+            return None, f"no price history ({exc})"
 
-        quote = await self.adapter.get_quote(target_symbol, month_slot=route.month_slot)
-        # The side actually traded on the target, which is not always the
-        # master's. An inverse ETF is a long-only instrument -- a short view
-        # is expressed by BUYING one -- so the stop, the limit price and the
-        # stored position all have to follow THIS, not the signal. Using the
-        # master's side here would put a long ETF's stop above its entry.
+        try:
+            quote = await self.adapter.get_quote(
+                target_symbol, month_slot=route.month_slot)
+        except AdapterError as exc:
+            return None, f"no quote ({exc})"
+
         traded_direction = route.target_direction or signal.direction
         sign = 1 if traded_direction == "BUY" else -1
         slave_sl = quote - sign * sl_mult * slave_atr if sl_mult is not None else None
@@ -302,16 +297,8 @@ class AutonomousCopyEngine(SessionGateMixin):
         account_type = "futures" if spec else "brokerage"
         account = await self.adapter.get_account_summary(account_type)
 
-        # Layered, not replaced: a slave-wide guard such as max_risk_pct
-        # stays in force unless this route deliberately overrides it. The
-        # old `route.sizing or <slave>` dropped the whole slave block the
-        # moment a route mentioned sizing at all, so every new futures route
-        # was a chance to lose the risk gate silently.
         sizing_config = merge_sizing(
             resolve_sizing_config(self.slave_config, target_symbol), route.sizing)
-        # Resolved separately from the sizing block on purpose: route.sizing
-        # REPLACES the slave's, so a scale living inside it would have to be
-        # restated by every route that overrides sizing at all.
         risk_scale = resolve_risk_scale(self.slave_config, route.risk_scale)
         sizing_result = compute_size(
             sizing_config=sizing_config,
@@ -324,8 +311,60 @@ class AutonomousCopyEngine(SessionGateMixin):
             risk_scale=risk_scale,
         )
         if sizing_result.skipped:
-            logger.warning("slave=%s skipping %s: %s", self.slave_id, target_symbol, sizing_result.reason)
+            return None, sizing_result.reason
+
+        return {
+            "symbol": target_symbol, "spec": spec, "atr": slave_atr,
+            "atr_period": atr_period, "bar_size": bar_size, "quote": quote,
+            "sl": slave_sl, "tp": slave_tp, "direction": traded_direction,
+            "sizing_result": sizing_result, "sizing_config": sizing_config,
+        }, None
+
+    async def _open_one(
+        self, signal: Signal, route: Route, sl_mult: Optional[float], tp_mult: Optional[float]
+    ) -> None:
+        # Candidates in declared order of preference, largest first by
+        # convention. Commission is per contract, so one NG is far cheaper
+        # than ten MNG for the same exposure -- but only if the account can
+        # carry a whole NG, which depends on the account and therefore
+        # cannot be settled when the route is written.
+        candidates = route.candidates or [route.target]
+        rejected = []
+        chosen = None
+        for candidate in candidates:
+            chosen, reason = await self._size_candidate(
+                signal, route, candidate, sl_mult, tp_mult)
+            if chosen is not None:
+                break
+            rejected.append((candidate, reason))
+
+        if chosen is None:
+            logger.warning(
+                "slave=%s skipping OPEN ticket=%s: no tradeable contract among "
+                "%s -- %s",
+                self.slave_id, signal.ticket, ", ".join(candidates),
+                "; ".join("%s: %s" % r for r in rejected),
+            )
             return
+
+        if rejected:
+            # "Why did it take MNG today" has to be answerable afterwards.
+            logger.info(
+                "slave=%s chose %s over %s -- %s",
+                self.slave_id, chosen["symbol"],
+                ", ".join(c for c, _ in rejected),
+                "; ".join("%s: %s" % r for r in rejected),
+            )
+
+        target_symbol = chosen["symbol"]
+        spec = chosen["spec"]
+        slave_atr = chosen["atr"]
+        atr_period = chosen["atr_period"]
+        bar_size = chosen["bar_size"]
+        quote = chosen["quote"]
+        slave_sl, slave_tp = chosen["sl"], chosen["tp"]
+        traded_direction = chosen["direction"]
+        sizing_result = chosen["sizing_result"]
 
         # Per target rather than per signal: one master signal can fan out
         # to several instruments on this slave, and a repeat must re-open

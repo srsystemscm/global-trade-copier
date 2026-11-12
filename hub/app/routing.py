@@ -20,7 +20,7 @@ Two modes, chosen by whether the slave config has a `routes` key:
 - `routes` absent: the legacy `symbol_map` behaviour, every signal routed to
   slot 0. Keeps existing slaves (and all mirror-mode slaves) working.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from app.models import Signal
@@ -82,6 +82,12 @@ class Route:
     # resting them achieves nothing while leaving GTC orders to strand when
     # the entry is cancelled. Such a leg is closed by the master's CLOSE.
     broker_brackets: bool = True
+    # Candidate contracts for THIS one position, in order of preference.
+    # Not to be confused with the config's plural `targets`, which fans one
+    # signal out into several positions. `target` remains the first
+    # candidate, so anything keyed on "the route's instrument" -- the
+    # deferral and its log lines -- is unchanged.
+    candidates: List[str] = field(default_factory=list)
 
 
 def routing_is_strict(slave_config: Dict[str, Any]) -> bool:
@@ -112,14 +118,30 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
         if direction is not None and signal.direction != str(direction).upper():
             continue
 
-        targets = entry.get("targets")
-        if targets is None:
-            target = entry.get("target")
-            targets = [target] if target else []
-        elif isinstance(targets, str):
-            targets = [targets]
+        # Two different ideas, deliberately separate keys:
+        #   "target":  ["NG", "MNG"]   one position, preferred contract first
+        #   "targets": ["MGC", "GLD"]  one position on each
+        # Allowing both at once would make "three names" ambiguous between
+        # three positions and three fallbacks, so it is refused outright.
+        fan_out = entry.get("targets")
+        target_entry = entry.get("target")
+        if fan_out is not None and isinstance(target_entry, (list, tuple)):
+            raise ValueError(
+                f"route for {entry.get('symbol')!r} gives both a `targets` "
+                f"fan-out and a `target` preference list; use one or the other"
+            )
 
-        for target in targets:
+        if fan_out is not None:
+            groups = [[t] for t in ([fan_out] if isinstance(fan_out, str) else fan_out)]
+        elif target_entry is None:
+            groups = []
+        elif isinstance(target_entry, str):
+            groups = [[target_entry]]
+        else:
+            groups = [[str(t) for t in target_entry]]
+
+        for group in groups:
+            target = group[0]
             matched.append(
                 Route(
                     target=target,
@@ -141,6 +163,7 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                     risk_scale=(None if entry.get("risk_scale") is None
                                 else float(entry["risk_scale"])),
                     broker_brackets=bool(entry.get("broker_brackets", True)),
+                    candidates=list(group),
                 )
             )
     return matched
