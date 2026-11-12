@@ -1144,11 +1144,18 @@ class IBKRAdapter(BrokerAdapter):
 
     @staticmethod
     def _info(symbol: str, contract) -> ContractInfo:
+        try:
+            multiplier = float(contract.multiplier)
+        except (TypeError, ValueError):
+            # Equities report "" rather than 1, and nothing is asked of it
+            # there: an ETF has no spec for it to disagree with.
+            multiplier = None
         return ContractInfo(
             symbol=symbol,
             contract_id=contract.conId,
             local_symbol=contract.localSymbol,
             expiry=contract.lastTradeDateOrContractMonth,
+            multiplier=multiplier,
         )
 
     async def restore_position(self, slave_ticket: int, state: dict) -> None:

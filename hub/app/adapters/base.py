@@ -119,6 +119,13 @@ class ContractInfo:
     contract_id: int     # broker contract id (IBKR conId)
     local_symbol: str    # e.g. "GCZ6"
     expiry: str          # YYYYMMDD
+    # The broker's own contract value per point. Carried so startup can
+    # check it against the spec: a root that resolves to the wrong contract
+    # SIZE is otherwise completely silent -- SIL resolved to the 5,000 ounce
+    # silver contract and quoted happily at five times the intended size.
+    # None where the broker does not say (equities, which have no spec to
+    # disagree with anyway).
+    multiplier: Optional[float] = None
 
 
 @dataclass

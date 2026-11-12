@@ -23,7 +23,9 @@ from app.sizing import (
 )
 from app.contract_roll import roll_sequence, volume_crossover
 from app import position_store
-from app.routing import Route, describe_refusal, resolve_routes
+from app.routing import (
+    Route, configured_targets, describe_refusal, resolve_routes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +142,14 @@ class AutonomousCopyEngine(SessionGateMixin):
         # allow_opposing defaults to false because the opposite side does not
         # open a position on a netting account, it reduces the one held.
         self.netting_policy = slave_config.get("netting", {}) or {}
+        # Targets preflight found to resolve to the wrong contract size, as
+        # {symbol: reason}. Treated as a per-candidate refusal, so a tier
+        # steps past a blocked one and a single-target route says why.
+        self.blocked_targets: Dict[str, str] = {}
+        self._preflight_done = asyncio.Event()
+        self._preflight_task: Optional[asyncio.Task] = None
+        self.preflight_wait_seconds = float(
+            slave_config.get("preflight_wait_seconds", 30.0))
         self._last_roll_check = 0.0
 
         # Keyed (master_account, master_ticket, slave_symbol): ticket
@@ -186,10 +196,14 @@ class AutonomousCopyEngine(SessionGateMixin):
         self._deferred_close_task = asyncio.create_task(
             self._deferred_close_loop(),
             name=f"autonomous-deferred-close-{self.slave_id}")
+        # Backgrounded so the hub starts at once; _await_preflight is what
+        # keeps a signal from overtaking it.
+        self._preflight_task = asyncio.create_task(
+            self._preflight_routes(), name=f"autonomous-preflight-{self.slave_id}")
 
     async def stop(self) -> None:
         for task in (self._consume_task, self._monitor_task, self._deferred_task,
-                     self._deferred_close_task):
+                     self._deferred_close_task, self._preflight_task):
             if task is not None:
                 task.cancel()
                 try:
@@ -308,6 +322,97 @@ class AutonomousCopyEngine(SessionGateMixin):
             )
         return AccountSummary(balance=balance, equity=equity), None
 
+    async def _preflight_routes(self) -> None:
+        """Resolve every configured target once, before any signal needs it.
+
+        Reports anything that will not resolve, and BLOCKS anything that
+        resolves to a contract whose multiplier disagrees with its spec.
+        The asymmetry is the point: an unresolvable target fails loudly at
+        signal time anyway, while a wrong contract size is silent and would
+        mis-size every position on that instrument.
+
+        Nothing is quoted. Most ETF routes are shut overnight, so quote
+        failures here would mean nothing, and holding 35 market-data lines
+        at startup is how MES came back empty twice.
+        """
+        try:
+            targets = configured_targets(self.slave_config)
+            if not targets:
+                return
+            blocked, unresolved = {}, []
+            for symbol, slot in targets:
+                try:
+                    info = await self.adapter.resolve_contract(symbol, slot)
+                except NotImplementedError:
+                    # This adapter has no contract resolution at all, so
+                    # there is nothing here to check.
+                    return
+                except Exception as exc:
+                    unresolved.append((symbol, slot, str(exc)[:160]))
+                    continue
+
+                spec = get_contract_spec(symbol)
+                if spec is None or info.multiplier is None:
+                    continue
+                if abs(info.multiplier - spec.point_value) > 1e-6:
+                    blocked[symbol] = (
+                        f"{symbol} resolves to {info.local_symbol} with a "
+                        f"multiplier of {info.multiplier:g}, but its spec says "
+                        f"{spec.point_value:g} -- every position would be sized "
+                        f"by the wrong contract value, so this target is blocked "
+                        f"until contract_specs.py and the broker agree"
+                    )
+
+            self.blocked_targets = blocked
+            for symbol, slot, exc in unresolved:
+                logger.error(
+                    "slave=%s route target %s (slot %s) will not resolve at the "
+                    "broker: %s -- signals to it will be refused; every other "
+                    "route still works",
+                    self.slave_id, symbol, slot, exc,
+                )
+                await self._emit("route_unresolved", slave_symbol=symbol,
+                                 month_slot=slot, reason=exc)
+            for symbol, reason in blocked.items():
+                logger.error("slave=%s %s", self.slave_id, reason)
+                await self._emit("route_blocked", slave_symbol=symbol,
+                                 reason=reason)
+            if not unresolved and not blocked:
+                logger.info(
+                    "slave=%s preflight: all %d route targets resolve, and "
+                    "every multiplier matches its spec",
+                    self.slave_id, len(targets),
+                )
+        finally:
+            # Set even on failure. A preflight that died must not be the
+            # thing that stops the copier from trading.
+            self._preflight_done.set()
+
+    async def _await_preflight(self) -> None:
+        """Hold a signal until preflight has had its say, but not for long.
+
+        Without this, a signal arriving in the first seconds after startup
+        would be sized before the multiplier check had run -- which is the
+        one case the check exists for.
+        """
+        if self._preflight_done.is_set():
+            return
+        if self._preflight_task is None:
+            # No preflight was ever started, so there is nothing to wait
+            # for. Without this, any caller that drives the engine without
+            # start() -- a test, or a one-shot replay -- sits out the whole
+            # timeout on every single signal.
+            return
+        try:
+            await asyncio.wait_for(self._preflight_done.wait(),
+                                   timeout=self.preflight_wait_seconds)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "slave=%s preflight has not finished after %.0fs; sizing "
+                "anyway rather than holding the signal any longer",
+                self.slave_id, self.preflight_wait_seconds,
+            )
+
     async def _size_candidate(
         self, signal: Signal, route: Route, target_symbol: str,
         sl_mult: Optional[float], tp_mult: Optional[float],
@@ -320,6 +425,10 @@ class AutonomousCopyEngine(SessionGateMixin):
         a smaller contract's lower risk per unit is the entire point of
         offering it as an alternative.
         """
+        blocked = self.blocked_targets.get(target_symbol)
+        if blocked:
+            return None, blocked
+
         atr_period = route.atr_period or self.atr_period
         bar_size = route.bar_size
 
@@ -547,6 +656,8 @@ class AutonomousCopyEngine(SessionGateMixin):
         # than ten MNG for the same exposure -- but only if the account can
         # carry a whole NG, which depends on the account and therefore
         # cannot be settled when the route is written.
+        await self._await_preflight()
+
         candidates = route.candidates or [route.target]
         rejected = []
         refused = []

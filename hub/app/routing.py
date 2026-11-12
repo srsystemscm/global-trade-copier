@@ -21,7 +21,7 @@ Two modes, chosen by whether the slave config has a `routes` key:
   slot 0. Keeps existing slaves (and all mirror-mode slaves) working.
 """
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.models import Signal
 from app.symbol_mapper import map_symbol
@@ -172,6 +172,36 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                 )
             )
     return matched
+
+
+def configured_targets(slave_config: Dict[str, Any]) -> List[Tuple[str, int]]:
+    """Every (target, month_slot) this config can route a signal to.
+
+    Independent of any signal, because startup has none: a target reachable
+    only by a SELL on one magic still has to resolve before that signal
+    arrives. Covers the singular `target` as a string and as a preference
+    list, and the plural `targets` fan-out, since any of them can name an
+    instrument that does not exist at the broker.
+    """
+    out: List[Tuple[str, int]] = []
+    seen = set()
+    for entry in slave_config.get("routes", []) or []:
+        slot = int(entry.get("month_slot", 0))
+        names = []
+        fan_out = entry.get("targets")
+        target_entry = entry.get("target")
+        if fan_out is not None:
+            names += [fan_out] if isinstance(fan_out, str) else list(fan_out)
+        if isinstance(target_entry, str):
+            names.append(target_entry)
+        elif isinstance(target_entry, (list, tuple)):
+            names += [str(t) for t in target_entry]
+        for name in names:
+            key = (str(name), slot)
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
+    return out
 
 
 def describe_refusal(slave_config: Dict[str, Any], signal: Signal) -> str:
