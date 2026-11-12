@@ -110,6 +110,7 @@ class IBKRAdapter(BrokerAdapter):
         bracket_tif: str = "GTC",
         entry_tif: str = "DAY",
         fill_timeout: float = 10.0,
+        entry_timeout: float = 900.0,
         account: Optional[str] = None,
     ) -> None:
         self.slave_id = slave_id
@@ -145,6 +146,12 @@ class IBKRAdapter(BrokerAdapter):
         # price. The order is live at the broker either way -- a timeout here
         # means "no price captured", never "no position".
         self.fill_timeout = fill_timeout
+        # How long a LIMIT entry may rest before it is cancelled outright.
+        # Not the same question as fill_timeout: a market order that hasn't
+        # filled in ten seconds is a problem, while a limit resting in a thin
+        # evening book for ten minutes is the plan. What must not happen is
+        # resting forever -- see abandon_unfilled_entry().
+        self.entry_timeout = entry_timeout
         # Which of the login's accounts this slave trades. Empty means
         # "work it out at connect time" -- see _resolve_account().
         self.account = account or ""
@@ -526,7 +533,7 @@ class IBKRAdapter(BrokerAdapter):
         self._exit_trades[slave_ticket] = trade
         return None
 
-    async def _await_fill(self, trade, label: str):
+    async def _await_fill(self, trade, label: str, timeout: Optional[float] = None):
         """Wait briefly for `trade` to fill, returning (price, size).
 
         Returns (None, None) if it hasn't filled in time. That is not a
@@ -541,7 +548,8 @@ class IBKRAdapter(BrokerAdapter):
         perfectly good order; waiting on status would either abort on that or
         have to second-guess which cancels are real. A fill is unambiguous.
         """
-        deadline = time.monotonic() + self.fill_timeout
+        timeout = self.fill_timeout if timeout is None else timeout
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             status = trade.orderStatus
             if trade.fills and status.avgFillPrice:
@@ -550,10 +558,8 @@ class IBKRAdapter(BrokerAdapter):
             await asyncio.sleep(0.05)
 
         logger.warning(
-            "IBKRAdapter[%s] %s order %s not filled within %.1fs (status=%s) -- "
-            "recording the trade without a fill price; the order is still live "
-            "at the broker",
-            self.slave_id, label, trade.order.orderId, self.fill_timeout,
+            "IBKRAdapter[%s] %s order %s not filled within %.1fs (status=%s)",
+            self.slave_id, label, trade.order.orderId, timeout,
             trade.orderStatus.status,
         )
         return None, None
@@ -564,11 +570,60 @@ class IBKRAdapter(BrokerAdapter):
         Separate from open() so that nothing in the signal path waits on a
         broker. The caller runs this in the background and records the fill
         when it lands.
+
+        The Trade is left in place on a timeout, so the caller can still
+        reach the order to cancel it -- see abandon_unfilled_entry().
         """
-        trade = self._entry_trades.pop(slave_ticket, None)
+        trade = self._entry_trades.get(slave_ticket)
         if trade is None:
             return None, None
-        return await self._await_fill(trade, "entry")
+        # A resting limit is supposed to take a while; a market order that
+        # takes this long has something wrong with it. Different questions,
+        # so different clocks.
+        is_limit = getattr(trade.order, "orderType", "") == "LMT"
+        timeout = self.entry_timeout if is_limit else self.fill_timeout
+        price, size = await self._await_fill(trade, "entry", timeout)
+        if price is not None:
+            self._entry_trades.pop(slave_ticket, None)
+        return price, size
+
+    async def abandon_unfilled_entry(self, slave_ticket: int):
+        """Cancel an entry that never filled, and its protective legs.
+
+        Returns (price, size): a price means the order filled after all, in
+        the gap between the timeout and this call, and the position stands.
+
+        The legs matter as much as the entry. They are placed alongside it
+        and carry GTC, so leaving them would strand a live stop and target
+        with no position behind them -- either able to execute later and open
+        a position nobody asked for.
+        """
+        trade = self._entry_trades.pop(slave_ticket, None)
+        pos = self._positions.get(slave_ticket)
+
+        # Last look before cancelling. The fill may have landed while this
+        # was being scheduled, and cancelling then would leave a real
+        # position with no stop.
+        if trade is not None:
+            status = trade.orderStatus
+            if trade.fills and status.avgFillPrice:
+                logger.info(
+                    "IBKRAdapter[%s] entry %s filled just after its timeout; "
+                    "keeping the position", self.slave_id, slave_ticket,
+                )
+                return float(status.avgFillPrice), float(status.filled)
+            self._cancel_tracked_order(trade.order.orderId)
+
+        if pos is not None:
+            self._cancel_tracked_order(pos.get("sl_order_id"))
+            self._cancel_tracked_order(pos.get("tp_order_id"))
+            del self._positions[slave_ticket]
+
+        logger.warning(
+            "IBKRAdapter[%s] cancelled unfilled entry %s and its protective legs",
+            self.slave_id, slave_ticket,
+        )
+        return None, None
 
     async def await_exit_fill(self, slave_ticket: int):
         """Wait for the closing order's fill, returning (price, size)."""

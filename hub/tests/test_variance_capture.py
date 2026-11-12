@@ -355,3 +355,127 @@ def test_a_synchronous_adapter_needs_no_collector():
 
     engine._capture_fill("entry", ACCT, 7004, "XAUUSD", 1)
     assert engine._fill_tasks == set()
+
+
+# --- an entry that never filled ------------------------------------------
+
+def _engine(adapter):
+    """An AutonomousCopyEngine with just the state the abandon path uses."""
+    from app.autonomous_copy_engine import AutonomousCopyEngine
+
+    e = object.__new__(AutonomousCopyEngine)
+    e.slave_id = SLAVE
+    e._fill_tasks = set()
+    e._positions = {}
+    e.adapter = adapter
+    e.events = None
+    e.notifier = None
+    return e
+
+
+class _Unfilled:
+    """Never fills, and records that it was asked to clean up."""
+
+    def __init__(self):
+        self.abandoned = []
+
+    async def await_entry_fill(self, slave_ticket):
+        return None, None
+
+    async def abandon_unfilled_entry(self, slave_ticket):
+        self.abandoned.append(slave_ticket)
+        return None, None
+
+
+def test_an_unfilled_entry_leaves_no_phantom_open_row():
+    """Left at OPEN, reconciliation reports a mismatch against a position the
+    broker has never had -- every cycle, forever."""
+    from app import position_store
+
+    adapter = _Unfilled()
+    engine = _engine(adapter)
+
+    pos = {"slave_ticket": 70, "direction": "BUY", "size": 120.0,
+           "entry_price": 41.60, "atr": 0.9, "sl": 40.1, "tp": None,
+           "month_slot": 0, "breakeven_done": False}
+    trade_registry.record_open(SLAVE, ACCT, 8001, "UGL", 70, master_price=3980.0)
+    engine._positions[(ACCT, 8001, "UGL")] = pos
+    position_store.save(SLAVE, ACCT, 8001, "UGL", pos)
+
+    async def go():
+        engine._capture_fill("entry", ACCT, 8001, "UGL", 70)
+        await asyncio.gather(*engine._fill_tasks)
+
+    asyncio.run(go())
+
+    assert adapter.abandoned == [70], "the broker order was never cancelled"
+    row = _row(8001, "UGL")
+    assert row["status"] == "CANCELLED"
+    assert row["slave_price"] is None
+    # Nothing left that a later MODIFY or CLOSE could act on.
+    assert engine._positions == {}
+    assert position_store.load_all(SLAVE) == []
+
+
+def test_the_cancelled_row_is_kept_rather_than_deleted():
+    """A signal that reached the slave and produced no position is exactly
+    what the variance work exists to notice; deleting it would make that
+    indistinguishable from a signal that never arrived."""
+    engine = _engine(_Unfilled())
+    trade_registry.record_open(SLAVE, ACCT, 8002, "TQQQ", 71, master_price=100.0)
+
+    async def go():
+        engine._capture_fill("entry", ACCT, 8002, "TQQQ", 71)
+        await asyncio.gather(*engine._fill_tasks)
+
+    asyncio.run(go())
+    row = _row(8002, "TQQQ")
+    assert row is not None
+    assert row["status"] == "CANCELLED"
+    assert row["master_price"] == 100.0
+
+
+def test_a_late_fill_during_abandonment_keeps_the_position():
+    """The fill can land between the timeout and the cancel. Tearing the row
+    down then would leave a real position with nothing tracking it."""
+    class _LateFill(_Unfilled):
+        async def abandon_unfilled_entry(self, slave_ticket):
+            self.abandoned.append(slave_ticket)
+            return 41.62, 120.0
+
+    adapter = _LateFill()
+    engine = _engine(adapter)
+    trade_registry.record_open(SLAVE, ACCT, 8003, "UGL", 72, master_price=3980.0)
+    engine._positions[(ACCT, 8003, "UGL")] = {"slave_ticket": 72}
+
+    async def go():
+        engine._capture_fill("entry", ACCT, 8003, "UGL", 72)
+        await asyncio.gather(*engine._fill_tasks)
+
+    asyncio.run(go())
+
+    row = _row(8003, "UGL")
+    assert row["status"] == "OPEN", "tore down a position that had filled"
+    assert row["slave_price"] == 41.62
+    assert engine._positions, "forgot a position that exists at the broker"
+
+
+def test_a_failed_cancel_does_not_silently_drop_the_position():
+    """If the broker cancel fails there may still be live orders, so the
+    engine must not tidy its own records away and forget about them."""
+    class _Raises(_Unfilled):
+        async def abandon_unfilled_entry(self, slave_ticket):
+            raise RuntimeError("gateway went away")
+
+    engine = _engine(_Raises())
+    trade_registry.record_open(SLAVE, ACCT, 8004, "UGL", 73, master_price=3980.0)
+    engine._positions[(ACCT, 8004, "UGL")] = {"slave_ticket": 73}
+
+    async def go():
+        engine._capture_fill("entry", ACCT, 8004, "UGL", 73)
+        await asyncio.gather(*engine._fill_tasks)
+
+    asyncio.run(go())
+
+    assert _row(8004, "UGL")["status"] == "OPEN"
+    assert engine._positions, "dropped a position whose orders may still be live"

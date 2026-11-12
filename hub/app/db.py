@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS slave_trades (
     master_ticket   INTEGER NOT NULL,
     slave_symbol    TEXT NOT NULL,      -- the mapped slave-side symbol (e.g. MGC, GLD)
     slave_ticket    INTEGER,
-    status          TEXT NOT NULL DEFAULT 'OPEN',  -- OPEN | CLOSED
+    status          TEXT NOT NULL DEFAULT 'OPEN',  -- OPEN | CLOSED | CANCELLED
     opened_at       REAL,
     closed_at       REAL,
     -- What this copy actually executed at. Captured because none of it can

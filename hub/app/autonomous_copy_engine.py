@@ -616,6 +616,58 @@ class AutonomousCopyEngine(SessionGateMixin):
             del self._deferred[k]
         return len(stale)
 
+    async def _abandon_unfilled_entry(self, account: str, master_ticket: int,
+                                      slave_symbol: str, slave_ticket: int) -> None:
+        """An entry that never filled leaves nothing behind.
+
+        Every copy of the position has to go: the broker's own order and its
+        protective legs, this engine's in-memory position, the position_store
+        row that would restore it across a restart, and the registry's OPEN
+        status. Miss any one and a later MODIFY or CLOSE acts on a position
+        that does not exist -- or a stranded GTC stop opens one.
+        """
+        abandon = getattr(self.adapter, "abandon_unfilled_entry", None)
+        if abandon is None:
+            return
+        try:
+            price, size = await abandon(slave_ticket)
+        except Exception:
+            logger.exception(
+                "slave=%s failed cancelling the unfilled entry for slave_ticket=%s; "
+                "CHECK THE BROKER BY HAND -- a stranded protective leg can open a "
+                "position on its own", self.slave_id, slave_ticket,
+            )
+            return
+
+        if price is not None:
+            # It filled in the gap. The position stands; just record it.
+            trade_registry.record_fill(
+                self.slave_id, account, master_ticket, slave_symbol,
+                slave_price=price, slave_lots=size, filled_at=time.time(),
+            )
+            return
+
+        key = (account, master_ticket, slave_symbol)
+        self._positions.pop(key, None)
+        position_store.delete(self.slave_id, account, master_ticket, slave_symbol)
+        trade_registry.record_entry_cancelled(
+            self.slave_id, account, master_ticket, slave_symbol)
+
+        msg = (
+            f"Slave {self.slave_id} never filled {slave_symbol} for "
+            f"master_ticket={master_ticket}; the order and its protective legs "
+            f"have been cancelled. The master IS in this trade and this leg is "
+            f"NOT."
+        )
+        logger.error(msg)
+        await self._emit("entry_unfilled", master_ticket=master_ticket,
+                         slave_symbol=slave_symbol, slave_ticket=slave_ticket)
+        if self.notifier:
+            await self.notifier.notify(
+                "entry_unfilled", msg, slave_id=self.slave_id,
+                master_ticket=master_ticket, slave_symbol=slave_symbol,
+            )
+
     def _capture_fill(self, which: str, account: str, master_ticket: int,
                       slave_symbol: str, slave_ticket: int) -> None:
         """Collect a fill in the background and write it into the registry.
@@ -642,6 +694,12 @@ class AutonomousCopyEngine(SessionGateMixin):
                 )
                 return
             if price is None:
+                if which == "entry":
+                    # Not just "no price captured": there is no position, and
+                    # a live order plus two GTC legs are still sitting at the
+                    # broker.
+                    await self._abandon_unfilled_entry(
+                        account, master_ticket, slave_symbol, slave_ticket)
                 return
             if which == "entry":
                 trade_registry.record_fill(

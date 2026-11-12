@@ -168,6 +168,7 @@ class _FakeIB:
     def __init__(self, trades):
         self._queue = list(trades)
         self.placed = []
+        self.cancelled = []
         self._all = []
 
     def placeOrder(self, contract, order):
@@ -179,7 +180,7 @@ class _FakeIB:
         return t
 
     def cancelOrder(self, order):
-        pass
+        self.cancelled.append(order.orderId)
 
     def trades(self):
         return list(self._all)
@@ -288,3 +289,90 @@ def test_a_second_close_places_no_second_order():
 
     asyncio.run(two_closes())
     assert len(a.ib.placed) == 1
+
+
+# ---------------- an entry that never fills ------------------------------
+#
+# A limit placed into a thin evening book may simply not fill. IBKR accepts
+# it, so nothing is rejected and the deferral -- which retries rejections --
+# never fires. What must not be left behind is the protective legs: they are
+# placed alongside the entry and carry GTC, so an unfilled entry would leave
+# a live stop and target with no position behind them, either able to
+# execute later and OPEN a position nobody asked for.
+
+def test_a_resting_limit_gets_a_longer_clock_than_a_market_order():
+    """Observing a market fill takes seconds; letting a limit rest in the
+    evening book is meant to take minutes. Different questions, so the
+    timeout actually applied has to follow the order type."""
+    a = _prepared(_adapter(fill_timeout=0.05, entry_timeout=5.0), _NeverFills())
+    used = {}
+
+    async def _record(trade, label, timeout=None):
+        used["timeout"] = timeout
+        return None, None
+
+    a._await_fill = _record
+
+    market = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=None,
+                          tp=None, master_ticket=1)
+    res = asyncio.run(a.open(market))
+    asyncio.run(a.await_entry_fill(res.slave_ticket))
+    assert used["timeout"] == 0.05, "a market order waited on the limit clock"
+
+    a2 = _prepared(_adapter(fill_timeout=0.05, entry_timeout=5.0), _NeverFills())
+    a2._await_fill = _record
+    limit = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=None,
+                         tp=None, master_ticket=2,
+                         order_type="limit", limit_price=41.60)
+    res2 = asyncio.run(a2.open(limit))
+    asyncio.run(a2.await_entry_fill(res2.slave_ticket))
+    assert used["timeout"] == 5.0, "a resting limit was cut off at fill_timeout"
+
+
+def test_timeout_leaves_the_trade_reachable_for_cancelling():
+    """await_entry_fill() must not discard the Trade on a timeout, or there
+    is no way left to cancel the order it refers to."""
+    a = _prepared(_adapter(fill_timeout=0.1, entry_timeout=0.1), _NeverFills())
+    req = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=None, tp=None,
+                       master_ticket=1)
+    res = asyncio.run(a.open(req))
+    price, _ = _drive(a, a.ib._all[0], a.await_entry_fill(res.slave_ticket))
+    assert price is None
+    assert res.slave_ticket in a._entry_trades, "the Trade was thrown away"
+
+
+def test_abandon_cancels_the_entry_and_both_legs():
+    a = _prepared(_adapter(fill_timeout=0.1, entry_timeout=0.1),
+                  _NeverFills(), _NeverFills(), _NeverFills())
+    req = OrderRequest(symbol="MGC", direction="BUY", size=1.0,
+                       sl=3876.5, tp=4100.0, master_ticket=1)
+    res = asyncio.run(a.open(req))
+    entry_id = res.slave_ticket
+    assert len(a.ib.placed) == 3, "expected entry + stop + target"
+
+    price, _ = asyncio.run(a.abandon_unfilled_entry(entry_id))
+    assert price is None
+    assert set(a.ib.cancelled) == {entry_id, res.sl_order_id, res.tp_order_id}
+    assert entry_id not in a._positions
+    assert entry_id not in a._entry_trades
+
+
+def test_abandon_keeps_a_position_that_filled_in_the_gap():
+    """The fill can land between the timeout and the cancel. Cancelling then
+    would strand a real position with no stop at all."""
+    entry = _Trade(price=3988.4, size=1.0, fills_after=1)
+    a = _prepared(_adapter(), entry, _NeverFills())
+    req = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=3876.5,
+                       tp=None, master_ticket=1)
+    res = asyncio.run(a.open(req))
+    entry.poll()  # the fill arrives late, before abandon is called
+
+    price, size = asyncio.run(a.abandon_unfilled_entry(res.slave_ticket))
+    assert (price, size) == (3988.4, 1.0)
+    assert a.ib.cancelled == [], "cancelled a position that had filled"
+    assert res.slave_ticket in a._positions
+
+
+def test_abandon_is_safe_when_there_is_nothing_to_cancel():
+    a = _prepared(_adapter(), _NeverFills())
+    assert asyncio.run(a.abandon_unfilled_entry(999)) == (None, None)

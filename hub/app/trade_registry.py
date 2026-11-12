@@ -106,6 +106,33 @@ def get_all_open_for_slave(slave_id: str) -> List[OpenSlaveTrade]:
     ]
 
 
+def record_entry_cancelled(
+    slave_id: str,
+    master_account: str,
+    master_ticket: int,
+    slave_symbol: str,
+) -> None:
+    """Close out a row whose entry never filled.
+
+    CANCELLED rather than CLOSED, and deliberately not deleted: the signal
+    did reach this slave and produced no position, which is exactly the kind
+    of thing the variance work exists to notice. Deleting it would make a
+    missed fill indistinguishable from a signal that never arrived.
+
+    Moving it out of OPEN is also what stops reconciliation reporting a
+    position the broker has never had.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE slave_trades SET status = 'CANCELLED', closed_at = ?
+            WHERE slave_id = ? AND master_account = ? AND master_ticket = ?
+              AND slave_symbol = ? AND status = 'OPEN'
+            """,
+            (time.time(), slave_id, master_account, master_ticket, slave_symbol),
+        )
+
+
 def record_fill(
     slave_id: str,
     master_account: str,
