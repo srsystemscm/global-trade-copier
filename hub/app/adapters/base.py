@@ -17,6 +17,16 @@ class AdapterTimeoutError(AdapterError):
     """The broker/slave terminal did not reply in time."""
 
 
+class EntryNeverFilled(AdapterError):
+    """A close was asked for on an entry that never filled.
+
+    Not a failure: the order and its protective legs have been cancelled and
+    nothing is left at the broker. It is raised rather than returned so the
+    caller cannot mistake it for an ordinary close and record a position that
+    never existed as one that was closed.
+    """
+
+
 class AdapterRejectedError(AdapterError):
     """The broker/slave terminal rejected the command (e.g. OrderSend failed)."""
 
@@ -44,6 +54,15 @@ class OrderRequest:
     order_type: str = "market"
     limit_price: Optional[float] = None
     outside_rth: bool = False
+    # How far through the quote to price a limit, carried so the EXIT can be
+    # priced the same way as the entry. Without it the adapter would have to
+    # guess, and a market exit cannot fill outside regular hours.
+    limit_offset_pct: float = 0.0
+    # Whether to place broker-side stop/target orders at all. ETF legs set
+    # this false: those orders do not execute in extended hours, so resting
+    # them achieves nothing while leaving GTC orders to strand. Those legs
+    # are closed by the master's CLOSE signal instead.
+    broker_brackets: bool = True
     # Futures contract month: 0 = front, 1 = next liquid month, etc. Used to
     # keep strategies on one netting account from merging into one position.
     # Ignored by brokers/instruments that have no contract months.

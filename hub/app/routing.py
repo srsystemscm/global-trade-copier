@@ -77,6 +77,11 @@ class Route:
     # How much of the configured risk this strategy carries on this slave.
     # None falls back to the slave's own risk_scale, then to 1.0.
     risk_scale: Optional[float] = None
+    # Whether to rest broker-side stop/target orders for this route. ETF
+    # legs set this false: those orders do not execute in extended hours, so
+    # resting them achieves nothing while leaving GTC orders to strand when
+    # the entry is cancelled. Such a leg is closed by the master's CLOSE.
+    broker_brackets: bool = True
 
 
 def routing_is_strict(slave_config: Dict[str, Any]) -> bool:
@@ -135,6 +140,7 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                                       else str(entry["target_direction"]).upper()),
                     risk_scale=(None if entry.get("risk_scale") is None
                                 else float(entry["risk_scale"])),
+                    broker_brackets=bool(entry.get("broker_brackets", True)),
                 )
             )
     return matched

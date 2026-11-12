@@ -4,7 +4,9 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 from app import trade_registry
-from app.adapters.base import AdapterError, BrokerAdapter, OrderRequest
+from app.adapters.base import (
+    AdapterError, BrokerAdapter, EntryNeverFilled, OrderRequest,
+)
 from app.atr import compute_atr
 from app.contract_specs import get_contract_spec
 from app.events import EventBus
@@ -347,6 +349,8 @@ class AutonomousCopyEngine(SessionGateMixin):
             order_type=route.order_type,
             limit_price=limit_price,
             outside_rth=route.outside_rth,
+            limit_offset_pct=route.limit_offset_pct,
+            broker_brackets=route.broker_brackets,
         )
         requested_at = time.time()
         result = await self.adapter.open(order)
@@ -752,7 +756,25 @@ class AutonomousCopyEngine(SessionGateMixin):
             )
             return
         for mapping in mappings:
-            slave_close = await self.adapter.close(mapping.slave_ticket)
+            try:
+                slave_close = await self.adapter.close(mapping.slave_ticket)
+            except EntryNeverFilled as exc:
+                # The adapter has already cancelled the order and its legs.
+                # Recorded as CANCELLED, not CLOSED: "never existed" and
+                # "closed without a captured price" have to stay apart, or
+                # reconciliation cannot tell a missed fill from a missing
+                # measurement.
+                logger.warning("slave=%s %s", self.slave_id, exc)
+                trade_registry.record_entry_cancelled(
+                    self.slave_id, signal.account, signal.ticket, mapping.slave_symbol)
+                self._positions.pop(
+                    (signal.account, signal.ticket, mapping.slave_symbol), None)
+                position_store.delete(
+                    self.slave_id, signal.account, signal.ticket, mapping.slave_symbol)
+                await self._emit("entry_unfilled", master_ticket=signal.ticket,
+                                 slave_symbol=mapping.slave_symbol,
+                                 slave_ticket=mapping.slave_ticket)
+                continue
             trade_registry.record_close(
                 self.slave_id, signal.account, signal.ticket, mapping.slave_symbol,
                 # 0 means the EA could not determine the exit; recorded as

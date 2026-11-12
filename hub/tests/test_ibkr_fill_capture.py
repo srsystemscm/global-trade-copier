@@ -376,3 +376,137 @@ def test_abandon_keeps_a_position_that_filled_in_the_gap():
 def test_abandon_is_safe_when_there_is_nothing_to_cancel():
     a = _prepared(_adapter(), _NeverFills())
     assert asyncio.run(a.abandon_unfilled_entry(999)) == (None, None)
+
+
+# ---------------- closing an entry that never filled --------------------
+#
+# Seen live on 2026-11-11. Three ETF entry limits were placed into a closed
+# market, never filled, and then the master's CLOSE arrived -- so close()
+# placed a market SELL for a position that did not exist and cancelled the
+# protective legs. Six orders were left resting against a flat account, the
+# entry limits able to fill from 04:00 and the market SELLs from 09:30. A
+# limit that failed to fill while its SELL went through is a naked short
+# with no stop, created entirely by the copier.
+
+def test_closing_an_unfilled_entry_cancels_it_instead_of_selling():
+    from app.adapters.base import EntryNeverFilled
+
+    a = _prepared(_adapter(), _NeverFills(), _NeverFills(), _NeverFills())
+    req = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=3876.5,
+                       tp=4100.0, master_ticket=1)
+    res = asyncio.run(a.open(req))
+    placed_on_open = len(a.ib.placed)
+
+    with pytest.raises(EntryNeverFilled):
+        asyncio.run(a.close(res.slave_ticket))
+
+    assert len(a.ib.placed) == placed_on_open, "placed a closing order anyway"
+    assert set(a.ib.cancelled) == {res.slave_ticket, res.sl_order_id, res.tp_order_id}
+    assert res.slave_ticket not in a._positions
+
+
+def test_a_filled_entry_still_closes_normally():
+    entry = _Trade(price=3988.4, size=1.0, fills_after=1)
+    a = _prepared(_adapter(), entry, _Trade(price=1.0, fills_after=1))
+    req = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=None, tp=None,
+                       master_ticket=1)
+    res = asyncio.run(a.open(req))
+    entry.poll()                      # the entry fills
+    asyncio.run(a.close(res.slave_ticket))
+    assert len(a.ib.placed) == 2      # entry + the closing order
+    assert a.ib.placed[1].action == "SELL"
+
+
+def test_a_partial_fill_closes_only_what_exists():
+    """Closing the full requested size would short the unfilled remainder."""
+    entry = _Trade(price=100.0, size=40.0, fills_after=1)
+    a = _prepared(_adapter(), entry, _Trade(price=1.0, fills_after=1))
+    req = OrderRequest(symbol="MGC", direction="BUY", size=120.0, sl=None,
+                       tp=None, master_ticket=1)
+    res = asyncio.run(a.open(req))
+    entry.poll()                      # 40 of 120
+    asyncio.run(a.close(res.slave_ticket))
+    assert a.ib.placed[1].totalQuantity == 40.0
+    assert res.slave_ticket in a.ib.cancelled, "left the remainder able to fill"
+
+
+# ---------------- the exit mirrors the entry ----------------------------
+
+def test_a_limit_entry_is_closed_with_a_limit_in_the_same_session():
+    """A market order is refused outside regular hours, and an exit without
+    outsideRth waits for the 09:30 open -- the live bug showed DAY/rth on the
+    SELL against DAY/outRTH on the entry."""
+    a = _prepared(_adapter(), _Trade(price=41.60, size=120.0, fills_after=1),
+                  _Trade(price=1.0, fills_after=1))
+
+    async def _quote(symbol, month_slot=0, contract_id=None):
+        return 41.50
+
+    a.get_quote = _quote
+    req = OrderRequest(symbol="UGL", direction="BUY", size=120.0, sl=None,
+                       tp=None, master_ticket=1, order_type="limit",
+                       limit_price=41.68, outside_rth=True,
+                       limit_offset_pct=0.002)
+    res = asyncio.run(a.open(req))
+    a.ib._all[0].poll()
+    asyncio.run(a.close(res.slave_ticket))
+
+    exit_order = a.ib.placed[1]
+    assert exit_order.orderType == "LMT"
+    assert exit_order.outsideRth is True
+    # priced THROUGH the quote downward for a sale, so it actually trades
+    assert exit_order.lmtPrice < 41.50
+
+
+def test_a_market_entry_is_still_closed_at_market():
+    a = _prepared(_adapter(), _Trade(price=3988.4, fills_after=1),
+                  _Trade(price=1.0, fills_after=1))
+    req = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=None,
+                       tp=None, master_ticket=1)
+    res = asyncio.run(a.open(req))
+    a.ib._all[0].poll()
+    asyncio.run(a.close(res.slave_ticket))
+    assert a.ib.placed[1].orderType == "MKT"
+    assert a.ib.placed[1].outsideRth is False
+
+
+def test_no_quote_falls_back_to_market_rather_than_leaving_it_open():
+    a = _prepared(_adapter(), _Trade(price=41.60, size=120.0, fills_after=1),
+                  _Trade(price=1.0, fills_after=1))
+
+    async def _no_quote(symbol, month_slot=0, contract_id=None):
+        raise RuntimeError("no market data")
+
+    a.get_quote = _no_quote
+    req = OrderRequest(symbol="UGL", direction="BUY", size=120.0, sl=None,
+                       tp=None, master_ticket=1, order_type="limit",
+                       limit_price=41.68, outside_rth=True)
+    res = asyncio.run(a.open(req))
+    a.ib._all[0].poll()
+    asyncio.run(a.close(res.slave_ticket))
+    assert a.ib.placed[1].orderType == "MKT"
+
+
+# ---------------- broker brackets can be declined -----------------------
+
+def test_an_exit_driven_route_rests_no_stop_or_target():
+    """Stops and targets do not execute in extended hours, so resting them
+    achieves nothing while leaving GTC orders to strand."""
+    a = _prepared(_adapter(), _NeverFills())
+    req = OrderRequest(symbol="UGL", direction="BUY", size=120.0, sl=39.07,
+                       tp=45.0, master_ticket=1, order_type="limit",
+                       limit_price=41.68, outside_rth=True,
+                       broker_brackets=False)
+    res = asyncio.run(a.open(req))
+    assert len(a.ib.placed) == 1, "rested a bracket on an exit-driven route"
+    assert res.sl_order_id is None
+    assert res.tp_order_id is None
+
+
+def test_brackets_are_still_the_default():
+    a = _prepared(_adapter(), _NeverFills(), _NeverFills())
+    req = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=3876.5,
+                       tp=None, master_ticket=1)
+    res = asyncio.run(a.open(req))
+    assert len(a.ib.placed) == 2
+    assert res.sl_order_id is not None

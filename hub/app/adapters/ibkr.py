@@ -4,6 +4,7 @@ import time
 from typing import Dict, List, Optional
 
 from app.adapters.base import (
+    EntryNeverFilled,
     AccountSummary,
     ContractInfo,
     AdapterConnectionError,
@@ -413,7 +414,14 @@ class IBKRAdapter(BrokerAdapter):
         slave_ticket = trade.order.orderId
 
         sl_order_id = tp_order_id = None
-        if sl_price is not None or tp_price is not None:
+        if not order.broker_brackets and (sl_price is not None or tp_price is not None):
+            logger.info(
+                "IBKRAdapter[%s] %s: not resting broker stop/target -- this "
+                "route is exit-driven by the master, because those orders do "
+                "not execute in extended hours",
+                self.slave_id, order.symbol,
+            )
+        if order.broker_brackets and (sl_price is not None or tp_price is not None):
             oca_group = f"tc-{self.slave_id}-{slave_ticket}"
             if sl_price is not None:
                 sl_order = self._protective(
@@ -434,6 +442,16 @@ class IBKRAdapter(BrokerAdapter):
             "size": order.size,
             "sl_order_id": sl_order_id,
             "tp_order_id": tp_order_id,
+            # Kept so the EXIT can mirror the entry. A position opened with a
+            # limit in the evening session has to be closed the same way: a
+            # market order is refused outside regular hours, and an exit
+            # without outsideRth waits for the 09:30 open.
+            "order_type": order.order_type,
+            "outside_rth": order.outside_rth,
+            "limit_offset_pct": order.limit_offset_pct,
+            "symbol": order.symbol,
+            "month_slot": order.month_slot,
+            "contract_id": order.contract_id,
         }
 
         # A rejected bracket leg leaves a filled position with no protection,
@@ -520,9 +538,36 @@ class IBKRAdapter(BrokerAdapter):
         self._cancel_tracked_order(pos.get("sl_order_id"))
         self._cancel_tracked_order(pos.get("tp_order_id"))
 
+        # Did the entry ever fill? _entry_trades keeps the Trade until the
+        # fill is collected, so a Trade still sitting there with no fill on
+        # it means there is no position to close. Selling anyway opens the
+        # opposite position -- seen live on UGL, BITX and ETHA.
+        entry = self._entry_trades.get(slave_ticket)
+        if entry is not None:
+            st = entry.orderStatus
+            filled = float(st.filled or 0.0) if (entry.fills and st.avgFillPrice) else 0.0
+            if filled <= 0:
+                await self.abandon_unfilled_entry(slave_ticket)
+                raise EntryNeverFilled(
+                    f"entry {slave_ticket} for {pos.get('symbol')} never filled; "
+                    f"cancelled it and its protective legs instead of placing a "
+                    f"closing order against a position that does not exist"
+                )
+            if filled < pos["size"]:
+                # Partially filled: close what exists and stop the rest from
+                # filling after the master is already out.
+                logger.warning(
+                    "IBKRAdapter[%s] entry %s filled only %s of %s; closing the "
+                    "filled part and cancelling the remainder",
+                    self.slave_id, slave_ticket, filled, pos["size"],
+                )
+                self._cancel_tracked_order(entry.order.orderId)
+                pos["size"] = filled
+
         closing_action = "SELL" if pos["direction"] == "BUY" else "BUY"
-        closing_order = ib_mod.MarketOrder(closing_action, pos["size"])
+        closing_order = await self._closing_order(ib_mod, pos, closing_action)
         closing_order.tif = self.entry_tif
+        closing_order.outsideRth = pos.get("outside_rth", False)
         trade = self._place(pos["contract"], closing_order)
         # Dropped before awaiting the fill, deliberately: the position is
         # gone from IBKR's point of view the moment the closing order is
@@ -532,6 +577,38 @@ class IBKRAdapter(BrokerAdapter):
         # Collected out of band too, for the same reason as the entry.
         self._exit_trades[slave_ticket] = trade
         return None
+
+    async def _closing_order(self, ib_mod, pos, action):
+        """Build the exit the same way the entry was built.
+
+        A market order is simply refused outside regular hours, so a leg
+        deliberately opened on a limit in the evening session has to be
+        closed on one too. The limit is priced THROUGH the current quote in
+        the direction that gets filled -- the point is to exit, not to post
+        a resting order that quietly never trades.
+        """
+        if pos.get("order_type") != "limit":
+            return ib_mod.MarketOrder(action, pos["size"])
+
+        offset = float(pos.get("limit_offset_pct", 0.0))
+        try:
+            quote = await self.get_quote(
+                pos.get("symbol"), pos.get("month_slot", 0), pos.get("contract_id"))
+        except Exception as exc:
+            # No quote means no limit price. A market order at least reaches
+            # the broker, and inside regular hours it fills; outside them it
+            # is refused, which surfaces as an error rather than as a
+            # position quietly left open.
+            logger.warning(
+                "IBKRAdapter[%s] no quote to price the exit for %s (%s); "
+                "falling back to a market order",
+                self.slave_id, pos.get("symbol"), exc,
+            )
+            return ib_mod.MarketOrder(action, pos["size"])
+
+        through = (1 - offset) if action == "SELL" else (1 + offset)
+        price = self._round_to_tick(quote * through, pos.get("symbol"))
+        return ib_mod.LimitOrder(action, pos["size"], price)
 
     async def _await_fill(self, trade, label: str, timeout: Optional[float] = None):
         """Wait briefly for `trade` to fill, returning (price, size).
