@@ -627,12 +627,32 @@ class IBKRAdapter(BrokerAdapter):
         """
         timeout = self.fill_timeout if timeout is None else timeout
         deadline = time.monotonic() + timeout
+        partial = None
         while time.monotonic() < deadline:
             status = trade.orderStatus
-            if trade.fills and status.avgFillPrice:
-                return float(status.avgFillPrice), float(status.filled)
+            filled = float(status.filled or 0.0)
+            remaining = float(status.remaining or 0.0)
+            if filled > 0 and status.avgFillPrice:
+                # Remember it, but do not return yet: a large market order
+                # fills in pieces, and the first piece is not the trade. A
+                # 47-lot order once reported 1.
+                partial = (float(status.avgFillPrice), filled)
+                if remaining <= 0:
+                    return partial
             # Yield to ib_async's reader so order/exec callbacks can land.
             await asyncio.sleep(0.05)
+
+        if partial is not None:
+            # Honest partial: this much really did fill, so recording it
+            # beats recording nothing, and close() needs the true number to
+            # avoid selling more than exists.
+            logger.warning(
+                "IBKRAdapter[%s] %s order %s only partially filled within %.1fs "
+                "(%s of %s, status=%s) -- recording the part that filled",
+                self.slave_id, label, trade.order.orderId, timeout,
+                partial[1], trade.order.totalQuantity, trade.orderStatus.status,
+            )
+            return partial
 
         logger.warning(
             "IBKRAdapter[%s] %s order %s not filled within %.1fs (status=%s)",
@@ -757,6 +777,22 @@ class IBKRAdapter(BrokerAdapter):
         # tidier one-shot if this ever needs revisiting.)
         await asyncio.sleep(self.quote_timeout)
         price = ticker.marketPrice()
+        # NaN means "nothing has arrived", which is not the same as IBKR
+        # saying there is no market (-1). With delayed data NaN is common
+        # even on an open session, and refusing on it dropped MES at 00:42
+        # while the session was open -- US500 produced no futures leg at
+        # all. So fall back to the last trade, then the session close,
+        # before giving up. A -1 is left to fail below: that is IBKR
+        # stating there is no market, and a stale close is no substitute.
+        if price != price:
+            for name, candidate in (("last", ticker.last), ("close", ticker.close)):
+                if candidate is not None and candidate == candidate and candidate > 0:
+                    logger.info(
+                        "IBKRAdapter[%s] %s had no marketPrice; using %s=%s",
+                        self.slave_id, symbol, name, candidate,
+                    )
+                    price = float(candidate)
+                    break
         self.ib.cancelMktData(contract)
         # NaN *or* a non-positive sentinel. IBKR returns -1 (not NaN) when
         # there's no market -- seen live on GLD outside the US cash session

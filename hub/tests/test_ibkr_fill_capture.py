@@ -26,15 +26,20 @@ from app.slaves import SlaveConfig
 
 
 class _Status:
-    def __init__(self, avg=0.0, filled=0.0, status="PreSubmitted"):
+    def __init__(self, avg=0.0, filled=0.0, status="PreSubmitted", remaining=None):
         self.avgFillPrice = avg
         self.filled = filled
         self.status = status
+        # A large market order fills in pieces, so "has it finished" is
+        # remaining == 0, not "has anything filled". Defaults to done when
+        # a quantity filled, which is what the simple fakes mean.
+        self.remaining = 0.0 if remaining is None else remaining
 
 
 class _Order:
     def __init__(self, order_id=1):
         self.orderId = order_id
+        self.totalQuantity = 0.0
         self.tif = None
         self.outsideRth = False
         self.account = None
@@ -510,3 +515,65 @@ def test_brackets_are_still_the_default():
     res = asyncio.run(a.open(req))
     assert len(a.ib.placed) == 2
     assert res.sl_order_id is not None
+
+
+# ---------------- partial fills ------------------------------------------
+#
+# Seen live on 2026-11-12 across six futures routes: a 47-lot M2K market
+# order reported 1 filled, MCL ordered 32 and reported 24, and the exits
+# reported 4 of 47, 5 of 9 and 5 of 32. The broker executed every one
+# correctly and the account ended flat -- the recording was wrong, which
+# corrupts exactly the variance data this exists to collect. close() also
+# compares that number against the tracked size to detect a partial fill,
+# so a first-piece reading could have cancelled a real remainder.
+
+class _PiecewiseTrade(_Trade):
+    """Fills in pieces, like a large market order does."""
+
+    def __init__(self, total, pieces, price=100.0):
+        super().__init__(price=price, size=total, fills_after=10**9)
+        self._total = float(total)
+        self._pieces = list(pieces)
+        self._done = 0.0
+
+    def poll(self):
+        if not self._pieces:
+            return
+        self._done += self._pieces.pop(0)
+        self.fills = ["fill"] * int(self._done)
+        self.orderStatus = _Status(
+            self._price, self._done,
+            "Filled" if self._done >= self._total else "PreSubmitted",
+            remaining=self._total - self._done,
+        )
+
+
+def test_the_first_piece_of_a_fill_is_not_the_fill():
+    """A 47-lot order reported 1. The wait must run to completion."""
+    a = _adapter(fill_timeout=5.0)
+    trade = _PiecewiseTrade(47, [1, 6, 20, 20], price=2850.9)
+    price, size = _drive(a, trade, a._await_fill(trade, "entry"))
+    assert size == 47.0, f"reported {size} of 47"
+    assert price == 2850.9
+
+
+def test_a_partial_that_never_completes_is_reported_honestly():
+    """Not None: that much really did fill, and close() needs the true
+    number so it does not sell more than exists."""
+    a = _adapter(fill_timeout=0.3)
+    trade = _PiecewiseTrade(47, [12])
+    price, size = _drive(a, trade, a._await_fill(trade, "entry"))
+    assert size == 12.0
+    assert price is not None
+
+
+def test_closing_a_partially_filled_entry_sells_only_what_filled():
+    a = _prepared(_adapter(fill_timeout=0.3), _PiecewiseTrade(47, [12]),
+                  _Trade(price=1.0, fills_after=1))
+    req = OrderRequest(symbol="M2K", direction="BUY", size=47.0, sl=None,
+                       tp=None, master_ticket=1)
+    res = asyncio.run(a.open(req))
+    a.ib._all[0].poll()                      # 12 of 47 fill
+    asyncio.run(a.close(res.slave_ticket))
+    assert a.ib.placed[1].totalQuantity == 12.0
+    assert res.slave_ticket in a.ib.cancelled, "left 35 able to fill later"

@@ -14,8 +14,17 @@ from app.adapters.ibkr import IBKRAdapter
 
 
 class _Ticker:
-    def __init__(self, price):
+    """A ticker with nothing but marketPrice, as an unsubscribed one is.
+
+    last and close are None here on purpose: get_quote falls back to them
+    when marketPrice is NaN, and the point of these cases is that there is
+    no price available at all.
+    """
+
+    def __init__(self, price, last=None, close=None):
         self._price = price
+        self.last = last
+        self.close = close
 
     def marketPrice(self):
         return self._price
@@ -56,3 +65,39 @@ def test_no_market_sentinels_are_rejected(bad):
 def test_error_names_the_value_it_got():
     with pytest.raises(AdapterRejectedError, match=r"-1\.0"):
         _quote(-1.0)
+
+
+def test_nan_falls_back_to_the_last_trade_when_there_is_one():
+    """NaN means "nothing has arrived yet", not "there is no market". With
+    delayed data it is routine even on an open session, and refusing on it
+    dropped MES while CME was open -- US500 produced no futures leg at all.
+    A -1 is different: that is IBKR stating there is no market, and no
+    fallback should rescue it.
+    """
+    a = IBKRAdapter("t", "127.0.0.1", 4002, client_id=1, quote_timeout=0)
+
+    class _IB:
+        def __init__(self, ticker):
+            self._t = ticker
+
+        def reqMktData(self, *a, **k):
+            return self._t
+
+        def cancelMktData(self, *a, **k):
+            pass
+
+    async def contract(symbol, month_slot=0, contract_id=None):
+        return object()
+
+    a._contract_for_request = contract
+
+    a.ib = _IB(_Ticker(float("nan"), last=5432.25))
+    assert asyncio.run(a.get_quote("MES")) == 5432.25
+
+    a.ib = _IB(_Ticker(float("nan"), last=None, close=5400.0))
+    assert asyncio.run(a.get_quote("MES")) == 5400.0
+
+    # -1 is not rescued by a stale close
+    a.ib = _IB(_Ticker(-1.0, last=5432.25, close=5400.0))
+    with pytest.raises(AdapterRejectedError):
+        asyncio.run(a.get_quote("SPXL"))
