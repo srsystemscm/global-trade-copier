@@ -212,6 +212,11 @@ class MirrorPlan:
     sl: Optional[float]
     tp: Optional[float]
     how: str
+    # The broker's volume grid, carried along because whatever trims this
+    # size afterwards -- the margin ceiling -- has to land on it too, and
+    # should not have to ask the broker a second time to find out what it is.
+    volume_step: float = DEFAULT_STEP
+    volume_min: float = DEFAULT_STEP
 
 
 def _on_tick_grid(level: float, tick_size: float, digits: int) -> float:
@@ -353,7 +358,86 @@ def plan_by_risk(
             f"held together as one group"
         )
 
-    return MirrorPlan(symbol=target_symbol, lots=lots, sl=sl, tp=tp, how=how), None
+    return MirrorPlan(
+        symbol=target_symbol, lots=lots, sl=sl, tp=tp, how=how,
+        volume_step=spec.volume_step or DEFAULT_STEP,
+        volume_min=max(spec.volume_min or 0.0, spec.volume_step or DEFAULT_STEP),
+    ), None
+
+
+def margin_fit(
+    lots: float,
+    preview: Any,
+    policy: Optional[Dict[str, Any]],
+    volume_step: float,
+    volume_min: float,
+) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+    """Trim a risk-correct size down to one the account can margin.
+
+    Returns (lots, note, refusal). Exactly one of lots/refusal is set; note
+    is present when the size was reduced.
+
+    A risk model bounds the loss at the stop and says nothing whatever about
+    margin, and the two come apart when the stop is tight: 2% risked over a
+    1% stop is twice equity in notional, whatever the instrument. Measured on
+    MBT_X -- 3,400 of margin a lot against a 7,161 notional, 47% -- the
+    risk-correct size wanted more margin than the account had.
+
+    Reduced rather than refused, because a trade at a size the account can
+    carry is worth more than no trade, and reducing is the safe direction:
+    it carries less risk than asked for, never more. The reduction is
+    reported so a position sized by margin rather than by the risk model is
+    never mistaken for one the risk model chose.
+
+    `preview.per_unit` is what makes the arithmetic possible in one round
+    trip: margin is linear in volume for these instruments, so the affordable
+    size is (free x ceiling) / per_unit.
+    """
+    policy = policy or {}
+    ceiling_pct = policy.get("max_pct_of_free")
+    if ceiling_pct is None:
+        return lots, None, None
+
+    required = getattr(preview, "initial_change", None)
+    free = getattr(preview, "free_before", None)
+    per_unit = getattr(preview, "per_unit", None)
+    if not required or not free:
+        return None, None, (
+            "a margin ceiling is configured but the slave did not report a "
+            "usable margin figure, so the ceiling cannot be enforced. Refusing "
+            "rather than trading past a limit that is switched on."
+        )
+
+    ceiling = float(free) * float(ceiling_pct)
+    if required <= ceiling:
+        return lots, None, None
+
+    if not per_unit or per_unit <= 0:
+        return None, None, (
+            f"{required:.2f} of margin is needed and the ceiling is {ceiling:.2f} "
+            f"({float(ceiling_pct):.0%} of {float(free):.2f} free), but the slave "
+            f"reported no per-lot margin, so there is no way to work out an "
+            f"affordable size"
+        )
+
+    affordable = floor_to_step(ceiling / float(per_unit), volume_step or DEFAULT_STEP)
+    floor = max(volume_min or 0.0, volume_step or DEFAULT_STEP)
+    if affordable < floor:
+        return None, None, (
+            f"even the minimum {floor:g} lots needs {floor * float(per_unit):.2f} of "
+            f"margin, over the ceiling of {ceiling:.2f} ({float(ceiling_pct):.0%} of "
+            f"{float(free):.2f} free). This instrument cannot be traded on this "
+            f"account at this size."
+        )
+
+    note = (
+        f"REDUCED by margin from {lots:g} to {affordable:g} lots: {lots:g} needed "
+        f"{required:.2f} of margin at {float(per_unit):.2f}/lot, over the "
+        f"{float(ceiling_pct):.0%} ceiling of {ceiling:.2f} on {float(free):.2f} "
+        f"free. This leg carries {affordable / lots:.1%} of the risk the model asked "
+        f"for"
+    )
+    return affordable, note, None
 
 
 def netting_refusal(
@@ -413,7 +497,12 @@ def netting_refusal(
                 f"{symbol}, at the netting.max_legs limit of {int(max_legs)}"
             )
 
+    # Either one number for every symbol, or a number per symbol. Per symbol
+    # is usually what is meant: a ceiling that suits gold at 388,290 a
+    # contract is meaningless for bitcoin at 7,161.
     max_net = policy.get("max_net_lots")
+    if isinstance(max_net, dict):
+        max_net = max_net.get(symbol)
     if max_net is not None and abs(net + signed) > float(max_net) + 1e-9:
         return (
             f"{net:+g} lots of {symbol} are open and this leg would make "

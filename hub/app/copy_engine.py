@@ -85,12 +85,19 @@ class CopyEngine(SessionGateMixin):
             )
             if target is None:
                 return None, reason
+            # Whatever the map states, since lot mirroring never asks the
+            # broker. Defaults to the 0.01 grid, as it always has.
+            entry = (self.slave_config.get("mirror_map") or {}).get(signal.symbol)
+            entry = entry if isinstance(entry, dict) else {}
+            step = float(entry.get("volume_step") or mirror.DEFAULT_STEP)
             return mirror.MirrorPlan(
                 symbol=target.symbol, lots=target.lots,
                 sl=signal.sl, tp=signal.tp, how=target.how,
+                volume_step=step,
+                volume_min=float(entry.get("volume_min") or step),
             ), None
 
-        symbol, _spec, reason = mirror.resolve_symbol(self.slave_config, signal.symbol)
+        symbol, route, reason = mirror.resolve_symbol(self.slave_config, signal.symbol)
         if symbol is None:
             return None, reason
 
@@ -117,6 +124,54 @@ class CopyEngine(SessionGateMixin):
             master_price=signal.price, master_sl=signal.sl, master_tp=signal.tp,
             spec=spec, balance=account.balance, equity=account.equity,
         )
+
+    async def _fit_margin(self, plan, signal):
+        """The configured margin ceiling, applied to a sized order.
+
+        Returns (lots, None) or (None, reason). Opt-in via a `margin` block:
+        it costs a round trip, and a slave whose instruments are nowhere near
+        its margin has no use for it.
+        """
+        policy = self.slave_config.get("margin")
+        if policy is None:
+            return plan.lots, None
+
+        preview_margin = getattr(self.adapter, "preview_margin", None)
+        if preview_margin is None:
+            return None, (
+                f"a margin ceiling is configured but "
+                f"{type(self.adapter).__name__} cannot preview margin"
+            )
+
+        try:
+            preview = await preview_margin(OrderRequest(
+                symbol=plan.symbol, direction=signal.direction, size=plan.lots,
+                sl=plan.sl, tp=plan.tp, master_ticket=signal.ticket,
+            ))
+        except NotImplementedError as exc:
+            # Switched on but unanswerable: refusing is the only honest
+            # outcome. Trading past a ceiling because the EA is old would
+            # make the setting decorative.
+            return None, (
+                f"a margin ceiling is configured, which needs the EA's MARGIN "
+                f"command (SlaveBridge.mq5 1.05+): {exc}"
+            )
+        except AdapterError as exc:
+            return None, f"could not price the margin for this order: {exc}"
+
+        lots, note, refusal = mirror.margin_fit(
+            plan.lots, preview, policy,
+            volume_step=plan.volume_step, volume_min=plan.volume_min,
+        )
+        if refusal:
+            return None, refusal
+        if note:
+            logger.warning("slave=%s ticket=%s %s: %s",
+                           self.slave_id, signal.ticket, plan.symbol, note)
+            plan.how += f" -- {note}"
+            await self._emit("margin_reduced", master_ticket=signal.ticket,
+                             slave_symbol=plan.symbol, size=lots, message=note)
+        return lots, None
 
     async def _slave_positions(self):
         """The slave's open positions, or None when it cannot say.
@@ -218,6 +273,19 @@ class CopyEngine(SessionGateMixin):
                                  action="OPEN", message=reason)
                 return
             target, lots = plan, plan.lots
+
+            # The margin ceiling, where one is configured. Last, because it
+            # trims a size the risk model has already decided -- and it can
+            # only be asked once the size exists.
+            lots, reason = await self._fit_margin(plan, signal)
+            if lots is None:
+                logger.warning(
+                    "slave=%s refusing OPEN ticket=%s on %s: %s",
+                    self.slave_id, signal.ticket, plan.symbol, reason,
+                )
+                await self._emit("margin_blocked", master_ticket=signal.ticket,
+                                 slave_symbol=plan.symbol, message=reason)
+                return
 
             # Checked against what the account actually holds, not against what
             # this copier opened. A slave that runs its own strategies can

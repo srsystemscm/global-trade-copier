@@ -13,6 +13,7 @@ from app.adapters.base import (
     AdapterTimeoutError,
     BrokerAdapter,
     BrokerSymbolSpec,
+    MarginPreview,
     OrderRequest,
     OrderResult,
     Position,
@@ -218,6 +219,33 @@ class MT4Adapter(BrokerAdapter):
             trade_mode=str(row.get("trade_mode") or ""),
             contract_size=float(row.get("contract_size") or 0.0),
             expiry=str(row.get("expiry") or ""),
+        )
+
+    async def preview_margin(self, order: OrderRequest) -> MarginPreview:
+        """What the broker would hold for this order, from its own sum.
+
+        Via the EA's MARGIN command, which wraps MQL5's OrderCalcMargin. It
+        prices a STANDALONE position: netting against existing opposite
+        exposure is not modelled, so the figure is the worst case. That is
+        the right direction for a ceiling, and it reads high on an account
+        already positioned the other way.
+        """
+        reply = await self._ask_tolerating_old_ea(
+            {
+                "cmd": "MARGIN",
+                "symbol": order.symbol,
+                "direction": order.direction,
+                "lots": order.size,
+            },
+            "MARGIN",
+        )
+        margin = float(reply["margin"])
+        used = float(reply.get("margin_used") or 0.0)
+        return MarginPreview(
+            initial_change=margin,
+            initial_after=used + margin,
+            per_unit=float(reply.get("margin_per_lot") or 0.0) or None,
+            free_before=float(reply.get("margin_free") or 0.0) or None,
         )
 
     async def _ask_tolerating_old_ea(self, command: dict, name: str) -> dict:

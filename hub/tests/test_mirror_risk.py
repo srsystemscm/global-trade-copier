@@ -284,3 +284,152 @@ def test_a_slave_without_a_sizing_block_still_mirrors_lots_exactly_as_before():
     assert broker.opened[0]["size"] == 0.1
     # The master's own stop, untranslated, because it is the same instrument.
     assert broker.opened[0]["sl"] == 3845.16
+
+
+def test_max_net_lots_can_be_set_per_symbol():
+    from app.mirror import netting_refusal
+
+    class P:
+        def __init__(self, s, q):
+            self.symbol, self.quantity = s, q
+
+    policy = {"max_net_lots": {"MBT_X": 70, "GC_Z": 3}, "allow_opposing": True}
+    assert netting_refusal([P("MBT_X", 50.0)], "MBT_X", "BUY", 20.0, policy) is None
+    assert netting_refusal([P("MBT_X", 60.0)], "MBT_X", "BUY", 20.0, policy) is not None
+    # A ceiling that suits gold at 388,290 a contract is meaningless for
+    # bitcoin at 7,161, which is why one number for both is the wrong shape.
+    assert netting_refusal([P("GC_Z", 2.0)], "GC_Z", "BUY", 2.0, policy) is not None
+
+
+def test_a_symbol_with_no_entry_in_the_per_symbol_cap_is_uncapped():
+    from app.mirror import netting_refusal
+
+    class P:
+        def __init__(self, s, q):
+            self.symbol, self.quantity = s, q
+
+    policy = {"max_net_lots": {"MBT_X": 70}}
+    assert netting_refusal([P("SI_Z", 900.0)], "SI_Z", "BUY", 100.0, policy) is None
+
+
+# --------------------------------------------------- the margin ceiling
+
+class FakePreview:
+    def __init__(self, initial_change, per_unit, free_before, initial_after=None):
+        self.initial_change = initial_change
+        self.per_unit = per_unit
+        self.free_before = free_before
+        self.initial_after = initial_after
+
+
+def test_no_margin_policy_leaves_the_size_alone():
+    from app.mirror import margin_fit
+    lots, note, refusal = margin_fit(401.0, FakePreview(1_363_400, 3400, 1_250_000),
+                                     None, 1.0, 1.0)
+    assert (lots, note, refusal) == (401.0, None, None)
+
+
+def test_a_size_that_fits_the_ceiling_passes_untouched():
+    from app.mirror import margin_fit
+    lots, note, refusal = margin_fit(7.0, FakePreview(60_000, 8571, 1_250_000),
+                                     {"max_pct_of_free": 0.25}, 1.0, 1.0)
+    assert lots == 7.0 and note is None and refusal is None
+
+
+def test_the_measured_mbt_case_is_reduced_to_what_the_account_can_margin():
+    """401 MBT_X contracts at the 3,400/lot measured is 1,363,400 of margin
+    against 1,250,000 free. A 25% ceiling is 312,500, which affords 91."""
+    from app.mirror import margin_fit
+    lots, note, refusal = margin_fit(
+        401.0, FakePreview(1_363_400, 3400, 1_250_000),
+        {"max_pct_of_free": 0.25}, 1.0, 1.0,
+    )
+    assert refusal is None
+    assert lots == 91.0
+    assert "REDUCED by margin from 401 to 91" in note
+    # The honest part: this leg no longer carries the risk that was asked for.
+    assert "22.7% of the risk" in note
+
+
+def test_reducing_lands_on_the_broker_s_volume_grid():
+    from app.mirror import margin_fit
+    lots, _, _ = margin_fit(401.0, FakePreview(1_363_400, 3400, 1_000_000),
+                            {"max_pct_of_free": 0.25}, 5.0, 5.0)
+    assert lots % 5 == 0
+
+
+def test_a_ceiling_that_cannot_afford_even_one_lot_refuses():
+    from app.mirror import margin_fit
+    lots, note, refusal = margin_fit(
+        7.0, FakePreview(60_000, 8571, 100_000),
+        {"max_pct_of_free": 0.05}, 1.0, 1.0,
+    )
+    assert lots is None
+    assert "even the minimum 1 lots needs" in refusal
+
+
+def test_a_ceiling_switched_on_but_unanswerable_refuses_rather_than_trading():
+    """A setting that silently stops applying is worse than no setting."""
+    from app.mirror import margin_fit
+    lots, note, refusal = margin_fit(7.0, FakePreview(None, None, None),
+                                     {"max_pct_of_free": 0.25}, 1.0, 1.0)
+    assert lots is None
+    assert "did not report a usable margin figure" in refusal
+
+
+def test_no_per_lot_figure_means_no_affordable_size_can_be_worked_out():
+    from app.mirror import margin_fit
+    lots, note, refusal = margin_fit(401.0, FakePreview(1_363_400, None, 1_250_000),
+                                     {"max_pct_of_free": 0.25}, 1.0, 1.0)
+    assert lots is None
+    assert "no per-lot margin" in refusal
+
+
+class MarginBroker(SpecBroker):
+    def __init__(self, spec, per_lot, free, **kw):
+        super().__init__(spec, **kw)
+        self.per_lot = per_lot
+        self.free = free
+        self.previews = 0
+
+    async def preview_margin(self, order):
+        from app.adapters.base import MarginPreview
+        self.previews += 1
+        return MarginPreview(initial_change=order.size * self.per_lot,
+                             per_unit=self.per_lot, free_before=self.free)
+
+
+def test_the_engine_sends_the_margin_reduced_size():
+    broker = MarginBroker(bitcoin(), per_lot=3400.0, free=1_250_000.0)
+    config = {
+        "mirror_map": {"BTCUSD": {"target": "MBT_X"}},
+        "sizing": {"mode": "pct_risk", "risk_pct": 0.02, "capital_base": "balance"},
+        "margin": {"max_pct_of_free": 0.25},
+    }
+    _run(broker, config, symbol="BTCUSD", price=71600.0, sl=70884.0)
+    assert len(broker.opened) == 1
+    assert broker.opened[0]["size"] == 91.0
+    assert broker.previews == 1
+
+
+def test_no_margin_block_means_no_round_trip():
+    broker = MarginBroker(gold(), per_lot=8571.0, free=1_250_000.0)
+    config = {"mirror_map": {"XAUUSD": {"target": "GC_Z"}},
+              "sizing": {"mode": "pct_risk", "risk_pct": 0.02,
+                         "capital_base": "balance"}}
+    _run(broker, config, symbol="XAUUSD")
+    assert broker.previews == 0
+    assert broker.opened[0]["size"] == 7.0
+
+
+def test_an_old_ea_refuses_a_configured_ceiling_rather_than_ignoring_it():
+    class NoMargin(SpecBroker):
+        async def preview_margin(self, order):
+            raise NotImplementedError("slave EA predates the MARGIN command")
+
+    broker = NoMargin(gold())
+    config = {"mirror_map": {"XAUUSD": {"target": "GC_Z"}},
+              "sizing": {"mode": "pct_risk", "risk_pct": 0.02},
+              "margin": {"max_pct_of_free": 0.25}}
+    _run(broker, config, symbol="XAUUSD")
+    assert broker.opened == []

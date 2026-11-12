@@ -31,9 +31,10 @@
 //|                   to the step instead of rounding to nearest     |
 //|   1.04 2026-11-12 SL/TP on the tick grid; a volume above the      |
 //|                   symbol's maximum opens as a position group      |
+//|   1.05 2026-11-12 MARGIN command, from OrderCalcMargin            |
 //+------------------------------------------------------------------+
-#property version   "1.04"
-#define   BRIDGE_VERSION "1.04"
+#property version   "1.05"
+#define   BRIDGE_VERSION "1.05"
 
 #include <Zmq/Zmq.mqh>
 
@@ -191,6 +192,8 @@ string HandleCommand(string json)
       return HandleSymbols(json);
    if(cmd == "ACCOUNT")
       return HandleAccount();
+   if(cmd == "MARGIN")
+      return HandleMargin(json);
 
    return JsonError("unknown cmd '" + cmd + "'");
   }
@@ -1182,6 +1185,74 @@ string HandleAccount()
         + ",\"algo_allowed\":"
         + (MQLInfoInteger(MQL_TRADE_ALLOWED) ? "true" : "false")
         + ",\"bridge_version\":" + JsonQuote(BRIDGE_VERSION)
+        + "}";
+  }
+
+//+------------------------------------------------------------------+
+//| MARGIN -- what the broker would actually hold for an order this   |
+//| size, from the broker's own calculation. Places nothing.          |
+//|                                                                   |
+//| New in 1.05, and it closes a real gap. A risk model bounds the    |
+//| loss at the stop and says NOTHING about margin, and the two come  |
+//| apart when the stop is tight: 2% risked over a 1% stop is twice   |
+//| equity in notional whatever the instrument. On MBT_X, where       |
+//| margin measured 3,400 a lot against a 7,161 notional, the         |
+//| risk-correct size needed more margin than the account had. The    |
+//| hub could not see that coming -- mirror mode has no margin        |
+//| preview, because this bridge could not answer one.                |
+//|                                                                   |
+//| margin_per_lot is reported alongside the total because margin is  |
+//| linear in volume for these instruments, so one call tells the hub |
+//| the largest size it can afford instead of it having to ask again  |
+//| for every candidate size.                                         |
+//|                                                                   |
+//| One caveat worth knowing at the other end: OrderCalcMargin prices |
+//| a STANDALONE position. It does not model netting against existing |
+//| opposite exposure, which on this account released 3,400 a lot     |
+//| while a long was reducing a short. The figure is therefore the    |
+//| worst case, which is the right direction for a safety check but   |
+//| will read high on an account already positioned the other way.    |
+//+------------------------------------------------------------------+
+string HandleMargin(string json)
+  {
+   string symbol    = JsonGetString(json, "symbol");
+   string direction = JsonGetString(json, "direction");
+   double lots      = JsonGetDouble(json, "lots");
+   if(lots <= 0.0)
+      lots = 1.0;                      // per-lot enquiry
+
+   if(!SymbolSelect(symbol, true))
+      return JsonError(StringFormat(
+         "symbol '%s' is not offered by this broker, so its margin cannot be "
+         "calculated", symbol));
+
+   if(!AwaitPrice(symbol))
+      return JsonError(StringFormat(
+         "no price for '%s' yet, and margin is priced off the market", symbol));
+
+   bool   isBuy = (direction != "SELL");
+   double price = isBuy ? SymbolInfoDouble(symbol, SYMBOL_ASK)
+                        : SymbolInfoDouble(symbol, SYMBOL_BID);
+   ENUM_ORDER_TYPE otype = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
+   double margin = 0.0;
+   ResetLastError();
+   if(!OrderCalcMargin(otype, symbol, lots, price, margin))
+      return JsonError(StringFormat(
+         "OrderCalcMargin refused %.2f lots of %s at %s (last_error=%d)",
+         lots, symbol, DoubleToString(price, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS)),
+         GetLastError()));
+
+   return "{\"status\":\"ok\",\"symbol\":" + JsonQuote(symbol)
+        + ",\"lots\":" + DoubleToString(lots, 2)
+        + ",\"direction\":" + JsonQuote(isBuy ? "BUY" : "SELL")
+        + ",\"price\":" + DoubleToString(price, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS))
+        + ",\"margin\":" + DoubleToString(margin, 2)
+        + ",\"margin_per_lot\":" + DoubleToString(margin / lots, 2)
+        + ",\"margin_used\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN), 2)
+        + ",\"margin_free\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2)
+        + ",\"equity\":" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2)
+        + ",\"currency\":" + JsonQuote(AccountInfoString(ACCOUNT_CURRENCY))
         + "}";
   }
 

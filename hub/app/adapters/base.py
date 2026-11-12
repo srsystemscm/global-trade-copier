@@ -99,6 +99,14 @@ class MarginPreview:
     maintenance_after: Optional[float] = None
     # The broker's commission estimate, free alongside the margin.
     commission: Optional[float] = None
+    # Margin for ONE unit, where the broker charges it linearly. An MT
+    # bridge reports this, and it is what lets a caller work out the largest
+    # size it can afford from a single enquiry instead of asking again for
+    # every candidate size. None where the broker does not say.
+    per_unit: Optional[float] = None
+    # Free margin BEFORE the order, so a caller can express a ceiling as a
+    # fraction of what is actually available rather than of equity.
+    free_before: Optional[float] = None
 
 
 @dataclass
