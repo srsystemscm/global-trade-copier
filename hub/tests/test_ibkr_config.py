@@ -59,3 +59,22 @@ def test_constructing_the_adapter_does_not_import_ib_async():
 
     mod = a._require_ib()
     assert hasattr(mod, "IB") and hasattr(mod, "ContFuture")
+
+
+def test_env_only_settings_must_be_declared():
+    """Settings forbids extra inputs, so an undeclared TC_* key in .env stops
+    the hub starting -- and does it on the NEXT restart, long after the key
+    was added, which is a miserable way to find out. Adding TC_FLEX_TOKEN
+    did exactly that before these fields existed."""
+    from app.config import Settings
+
+    assert Settings.model_config.get("extra", "forbid") == "forbid"
+    for field in ("flex_token", "flex_query_id"):
+        assert field in Settings.model_fields, (
+            f"{field} is read from .env but not declared on Settings; "
+            f"the hub will refuse to start"
+        )
+        assert Settings.model_fields[field].default == "", (
+            f"{field} must default to empty -- the hub has to run without "
+            f"Flex configured"
+        )

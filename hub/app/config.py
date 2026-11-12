@@ -50,6 +50,17 @@ class Settings(BaseSettings):
     smtp_password: str = ""
     smtp_from: str = ""
 
+    # IBKR Flex Web Service, for the independent statement of record that
+    # live positions get reconciled against. Empty means "not configured",
+    # which is a normal state -- the hub runs fine without it.
+    #
+    # These must be DECLARED, not merely present in .env: Settings forbids
+    # extra inputs, so an undeclared TC_* key in .env stops the hub from
+    # starting at all, and does it on the next restart rather than when the
+    # key was added.
+    flex_token: str = ""
+    flex_query_id: str = ""
+
     model_config = SettingsConfigDict(env_prefix="TC_", env_file=".env")
 
 
