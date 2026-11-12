@@ -64,6 +64,7 @@ def create_adapter(slave: SlaveConfig) -> BrokerAdapter:
             client_id=slave.config.get("client_id", 1),
             market_data_type=slave.config.get("market_data_type"),
             quote_timeout=float(slave.config.get("quote_timeout", 1.0)),
+            quote_retries=int(slave.config.get("quote_retries", 2)),
             bracket_tif=slave.config.get("bracket_tif", "GTC"),
             entry_tif=slave.config.get("entry_tif", "DAY"),
             fill_timeout=float(slave.config.get("fill_timeout", 10.0)),

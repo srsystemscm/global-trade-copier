@@ -101,3 +101,82 @@ def test_nan_falls_back_to_the_last_trade_when_there_is_one():
     a.ib = _IB(_Ticker(-1.0, last=5432.25, close=5400.0))
     with pytest.raises(AdapterRejectedError):
         asyncio.run(a.get_quote("SPXL"))
+
+
+# ---------------- contention, not latency --------------------------------
+#
+# US500 produced no futures leg in two consecutive live runs: MES came back
+# NaN both times, in the same instant as the ETF slave's own quote request.
+# Probed alone straight afterwards it quoted 7603.25 within a second, so it
+# was neither a timeout nor a missing subscription -- it was two engines on
+# one account asking at once, with IBKR delivering nothing to the loser.
+
+class _Sequence:
+    """Returns a scripted series of prices, one per sampling attempt."""
+
+    def __init__(self, *prices):
+        self.prices = list(prices)
+        self.calls = 0
+
+    def __call__(self, contract, symbol):
+        self.calls += 1
+        value = self.prices.pop(0) if self.prices else float("nan")
+
+        async def result():
+            return value
+
+        return result()
+
+
+def _adapter_with(sequence, retries=2):
+    a = IBKRAdapter("t", "127.0.0.1", 4002, client_id=1, quote_timeout=0,
+                    quote_retries=retries)
+    a.ib = object()
+
+    async def contract(symbol, month_slot=0, contract_id=None):
+        return object()
+
+    a._contract_for_request = contract
+    a._sample_quote = sequence
+    return a
+
+
+def test_an_empty_quote_is_retried_and_succeeds():
+    seq = _Sequence(float("nan"), 7603.25)
+    a = _adapter_with(seq)
+    assert asyncio.run(a.get_quote("MES")) == 7603.25
+    assert seq.calls == 2
+
+
+def test_retries_are_bounded():
+    seq = _Sequence(float("nan"), float("nan"), float("nan"), 1.0)
+    a = _adapter_with(seq, retries=2)
+    with pytest.raises(AdapterRejectedError):
+        asyncio.run(a.get_quote("MES"))
+    assert seq.calls == 3, "should try once plus two retries"
+
+
+def test_a_first_attempt_that_works_costs_nothing_extra():
+    seq = _Sequence(7603.25)
+    a = _adapter_with(seq)
+    assert asyncio.run(a.get_quote("MES")) == 7603.25
+    assert seq.calls == 1
+
+
+def test_a_no_market_sentinel_is_not_retried():
+    """-1 is IBKR stating there is no market. It will still be true in a
+    second, and retrying would multiply the wait by every closed route on
+    the slave -- all fourteen ETF ones, overnight."""
+    seq = _Sequence(-1.0, 7603.25)
+    a = _adapter_with(seq)
+    with pytest.raises(AdapterRejectedError):
+        asyncio.run(a.get_quote("SPXL"))
+    assert seq.calls == 1, "retried a market IBKR says does not exist"
+
+
+def test_retries_can_be_switched_off():
+    seq = _Sequence(float("nan"), 7603.25)
+    a = _adapter_with(seq, retries=0)
+    with pytest.raises(AdapterRejectedError):
+        asyncio.run(a.get_quote("MES"))
+    assert seq.calls == 1

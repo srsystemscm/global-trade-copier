@@ -109,6 +109,7 @@ class IBKRAdapter(BrokerAdapter):
         client_id: int,
         market_data_type: Optional[int] = None,
         quote_timeout: float = 1.0,
+        quote_retries: int = 2,
         bracket_tif: str = "GTC",
         entry_tif: str = "DAY",
         fill_timeout: float = 10.0,
@@ -125,6 +126,11 @@ class IBKRAdapter(BrokerAdapter):
         # and plenty for paper testing. See config/slaves.json.
         self.market_data_type = market_data_type
         self.quote_timeout = quote_timeout
+        # Extra attempts when a quote arrives empty. The failure this
+        # answers is contention rather than latency: two engines on one
+        # account asking at the same moment, where IBKR silently delivers
+        # nothing to the loser. Asking again a beat later gets it.
+        self.quote_retries = quote_retries
         # how long to let IBKR's async rejection of a bracket leg arrive
         self.bracket_check_delay = 1.0
         # Time in force for the protective legs. GTC by default because a
@@ -803,6 +809,38 @@ class IBKRAdapter(BrokerAdapter):
     ) -> float:
         assert self.ib is not None, "adapter not connected"
         contract = await self._contract_for_request(symbol, month_slot, contract_id)
+
+        attempts = 1 + max(0, int(self.quote_retries))
+        price = float("nan")
+        for attempt in range(attempts):
+            if attempt:
+                # A short beat, not a long one: the losing request needs
+                # only the competing one to have finished, which takes about
+                # as long as a quote does.
+                await asyncio.sleep(self.quote_timeout)
+            price = await self._sample_quote(contract, symbol)
+            if price == price and price > 0:
+                if attempt:
+                    logger.info(
+                        "IBKRAdapter[%s] %s quoted on attempt %d of %d",
+                        self.slave_id, symbol, attempt + 1, attempts)
+                break
+            if price == price:
+                # A real number that is not positive: IBKR saying there is
+                # no market. Still true in a second, so stop.
+                break
+            if attempt + 1 < attempts:
+                logger.info(
+                    "IBKRAdapter[%s] %s returned nothing on attempt %d of %d; "
+                    "retrying -- usually another request on this account held "
+                    "the market data line",
+                    self.slave_id, symbol, attempt + 1, attempts)
+
+        return self._require_usable_quote(price, symbol)
+
+    async def _sample_quote(self, contract, symbol: str) -> float:
+        """One subscribe-wait-read cycle. NaN when nothing arrived."""
+        assert self.ib is not None
         ticker = self.ib.reqMktData(contract, "", False, False)
         # asyncio.sleep, NOT ib.sleep(): IB.sleep() is a *synchronous* helper
         # that returns a bool, so `await self.ib.sleep(1)` raised
@@ -829,6 +867,14 @@ class IBKRAdapter(BrokerAdapter):
                     price = float(candidate)
                     break
         self.ib.cancelMktData(contract)
+        return float(price)
+
+    def _require_usable_quote(self, price: float, symbol: str) -> float:
+        """Accept a usable price, or refuse with advice on what to do.
+
+        Kept separate from the sampling so the retry loop can decide whether
+        a given failure is worth another attempt.
+        """
         # NaN *or* a non-positive sentinel. IBKR returns -1 (not NaN) when
         # there's no market -- seen live on GLD outside the US cash session
         # while GC, which trades nearly 24h, quoted fine. A -1 slipping
