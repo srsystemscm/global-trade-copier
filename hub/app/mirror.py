@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 from app.contract_specs import ContractSpec
-from app.sizing import compute_size, resolve_balance_adjustment
+from app.sizing import capital_base_amount, compute_size, resolve_balance_adjustment
 
 logger = logging.getLogger(__name__)
 
@@ -339,11 +339,22 @@ def plan_by_risk(
     # against and the one the order will carry -- quoting the unrounded
     # distance here would print a risk per lot nobody can reproduce.
     placed_distance = abs(price - sl)
+    # The capital that was actually sized against, which is not necessarily
+    # the balance: capital_base chooses, and this slave uses equity. Printing
+    # the wrong one makes the line unreproducible, and a diagnostic nobody can
+    # check is worse than none -- so it is derived the same way compute_size
+    # derives it, and it names which base it is.
+    base = sizing.get("capital_base", "balance")
+    capital = capital_base_amount(
+        base, balance + adjustment, equity + adjustment,
+        float(sizing.get("fixed_offset", 0.0) or 0.0),
+        float(sizing.get("fixed_amount", 0.0) or 0.0),
+    )
     how = (
         f"{sizing.get('mode')} on {target_symbol}: a {stop_fraction:.3%} stop "
         f"({placed_distance:.{spec.digits}f} away at {price}) risks "
-        f"{placed_distance * point_value:.2f}/lot of "
-        f"{balance + adjustment:.2f} -> {lots:g} lots"
+        f"{placed_distance * point_value:.2f}/lot of {capital:.2f} "
+        f"({base}) -> {lots:g} lots"
     )
     if result.reason:
         how += f" ({result.reason})"

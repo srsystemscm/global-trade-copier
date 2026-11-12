@@ -52,8 +52,9 @@ def test_two_percent_of_the_slave_s_own_balance_decides_the_size():
     assert reason is None
     assert plan.lots == 7.0
     # One contract risks 3,880 at this stop, and the log line has to let a
-    # reader reproduce that from the figures it prints.
-    assert "3880.00/lot of 1433614.86" in plan.how
+    # reader reproduce that from the figures it prints -- including WHICH
+    # capital figure was sized against, since capital_base chooses.
+    assert "3880.00/lot of 1433614.86 (balance)" in plan.how
 
 
 def test_the_master_s_lot_count_is_irrelevant():
@@ -433,3 +434,18 @@ def test_an_old_ea_refuses_a_configured_ceiling_rather_than_ignoring_it():
               "margin": {"max_pct_of_free": 0.25}}
     _run(broker, config, symbol="XAUUSD")
     assert broker.opened == []
+
+
+def test_the_explanation_names_the_capital_it_actually_sized_against():
+    """Caught by a live dry run: capital_base was equity, the size came from
+    equity, and the line printed the balance -- so the figures in it did not
+    add up to the size beside them."""
+    plan, reason = _plan(
+        gold(),
+        config={"sizing": {"mode": "pct_risk", "risk_pct": 0.02,
+                           "capital_base": "equity"}},
+        balance=1_000_000.0, equity=1_536_551.86,
+    )
+    assert reason is None
+    assert "of 1536551.86 (equity)" in plan.how
+    assert "1000000" not in plan.how
