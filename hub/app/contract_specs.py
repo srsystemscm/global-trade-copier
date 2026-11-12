@@ -73,6 +73,20 @@ MICRO_FUTURES_SPECS: Dict[str, ContractSpec] = {
     # Full-size. GC is 100 troy oz -- 10x MGC, so roughly $430k notional per
     # contract at $4,300 gold. Size it deliberately; dollar_notional will
     # floor to zero (and skip the trade) for any sensible notional.
+    # Full-size CME crypto, which IBKR lists under the reference-rate names
+    # rather than ETH and BTC -- those symbols resolve to nothing here, and
+    # guessing them is how "IBKR has no full-size ether" nearly became a
+    # recorded fact. Verified from IBKR's own contract details on
+    # 2026-11-12: minTick x multiplier gives $25.00 a tick on both.
+    #
+    # The reason to reach for them is cost per unit of risk. One ETHUSDRR
+    # costs $9.06 a side against 50 ether of exposure, where the same
+    # exposure in MET is ~500 contracts at $0.31 each. Commission as a
+    # fraction of risk: 0.25% for ETHUSDRR against 4.21% for MET, and 0.16%
+    # for BRR against 1.18% for MBT.
+    "ETHUSDRR": ContractSpec("ETHUSDRR", tick_size=0.50, tick_value=25.00, point_value=50.0, exchange="CME"),  # CME Ether, 50 ether
+    "BRR": ContractSpec("BRR", tick_size=5.00, tick_value=25.00, point_value=5.0, exchange="CME"),              # CME Bitcoin, 5 BTC
+
     # Full-size Henry Hub natural gas: 10,000 MMBtu, ten times MNG. The
     # reason to reach for it is cost -- the commission is per contract, so
     # one NG is far cheaper than ten MNG for the same exposure. Whether the
