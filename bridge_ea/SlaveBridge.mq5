@@ -32,9 +32,10 @@
 //|   1.04 2026-11-12 SL/TP on the tick grid; a volume above the      |
 //|                   symbol's maximum opens as a position group      |
 //|   1.05 2026-11-12 MARGIN command, from OrderCalcMargin            |
+//|   1.06 2026-11-12 a named SYMBOLS read waits for a price          |
 //+------------------------------------------------------------------+
-#property version   "1.05"
-#define   BRIDGE_VERSION "1.05"
+#property version   "1.06"
+#define   BRIDGE_VERSION "1.06"
 
 #include <Zmq/Zmq.mqh>
 
@@ -979,6 +980,7 @@ string HandleSymbols(string json)
   {
    string names[];
    int    n     = JsonGetStringArray(json, "symbols", names);
+   bool   explicit_ = (n > 0);          // the caller named them
    string match = JsonGetString(json, "match");
    bool   truncated = false;
    bool   namesOnly = JsonGetBool(json, "names_only");
@@ -1032,7 +1034,15 @@ string HandleSymbols(string json)
      {
       if(i > 0)
          items += ",";
-      items += namesOnly ? JsonQuote(names[i]) : SymbolSpecJson(names[i]);
+      // Wait for a price only when the caller named its symbols. A named
+      // spec read is a sizing enquiry and a spec without a price is no use
+      // to it -- CL_F and ES_Z came back at 0.00 for exactly this reason,
+      // added and dropped again before a tick arrived. A match or Market
+      // Watch scan must NOT wait: two hundred symbols at a second each
+      // would stall OnTimer far past the hub's request timeout.
+      items += namesOnly
+               ? JsonQuote(names[i])
+               : SymbolSpecJson(names[i], explicit_);
      }
 
    return "{\"status\":\"ok\",\"count\":" + IntegerToString(n)
@@ -1059,7 +1069,7 @@ bool SymbolKnownToServer(const string symbol)
 //| Watch, so a symbol that is not there is added, read, and then       |
 //| removed again -- an operator's Market Watch is theirs, and a probe |
 //| that silently grew it by two hundred rows would be its own bug.     |
-string SymbolSpecJson(const string symbol)
+string SymbolSpecJson(const string symbol, bool awaitPrice = false)
   {
    if(!SymbolKnownToServer(symbol))
       return "{\"symbol\":" + JsonQuote(symbol) + ",\"exists\":false}";
@@ -1067,6 +1077,12 @@ string SymbolSpecJson(const string symbol)
    bool wasSelected = (bool)SymbolInfoInteger(symbol, SYMBOL_SELECT);
    if(!wasSelected)
       SymbolSelect(symbol, true);
+
+   // A symbol added this instant has no bid or ask until it ticks, and a
+   // spec reporting 0.00 is useless to a caller sizing a position. Only on
+   // request: see the note at the call site.
+   if(awaitPrice)
+      AwaitPrice(symbol);
 
    int    digits  = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    long   expiry  = (long)SymbolInfoInteger(symbol, SYMBOL_EXPIRATION_TIME);
