@@ -185,3 +185,25 @@ def test_the_energy_micros_are_on_nymex_not_cme():
     assert get_contract_spec("MNG").exchange == "NYMEX"
     assert get_contract_spec("MCL").exchange == "NYMEX"
     assert get_contract_spec("MBT").exchange == "CME"
+
+
+def test_every_spec_tick_value_is_multiplier_times_tick():
+    """Verified against IBKR's own contract details on 2026-11-12: for each
+    of these, minTick x multiplier equals the tick_value recorded here. A
+    spec that drifts from the exchange silently misstates risk, since
+    pct_risk divides the risk budget by exactly this number.
+    """
+    from app.contract_specs import get_contract_spec
+
+    # (symbol, IBKR minTick, IBKR multiplier)
+    verified = [
+        ("NG", 0.001, 10000.0), ("QG", 0.005, 2500.0), ("MCL", 0.01, 100.0),
+        ("MGC", 0.1, 10.0), ("MES", 0.25, 5.0), ("MNQ", 0.25, 2.0),
+        ("M2K", 0.1, 5.0), ("MBT", 5.0, 0.1), ("MET", 0.5, 0.1),
+    ]
+    for symbol, min_tick, multiplier in verified:
+        spec = get_contract_spec(symbol)
+        assert spec is not None, f"{symbol} has no spec"
+        assert spec.tick_size == pytest.approx(min_tick), symbol
+        assert spec.point_value == pytest.approx(multiplier), symbol
+        assert spec.tick_value == pytest.approx(min_tick * multiplier), symbol

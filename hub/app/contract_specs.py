@@ -55,7 +55,17 @@ MICRO_FUTURES_SPECS: Dict[str, ContractSpec] = {
     # not the quarter it looks like next to the other micros. 0.001 tick on
     # 1,000 MMBtu is $1.00, so a 1.00 move is $1,000. NYMEX, like MCL:
     # IBKR's qualifyContracts() fails outright on the wrong exchange.
+    # NOT OFFERED BY IBKR. Probed on 2026-11-12: reqContractDetails for
+    # symbol MNG returns nothing on NYMEX or on any exchange. Kept only
+    # because another broker may carry it; do not put it in an IBKR route,
+    # where it would resolve to nothing at the moment it was needed.
     "MNG": ContractSpec("MNG", tick_size=0.001, tick_value=1.00, point_value=1000.0, exchange="NYMEX"),
+
+    # The small natural gas contract IBKR actually carries: NYMEX MINY, a
+    # QUARTER of NG at 2,500 MMBtu rather than the tenth MNG would have
+    # been. Verified from IBKR's own contract details -- minTick 0.005 on a
+    # 2500 multiplier is $12.50 a tick.
+    "QG":  ContractSpec("QG",  tick_size=0.005, tick_value=12.50, point_value=2500.0, exchange="NYMEX"),
 
     # Full-size. GC is 100 troy oz -- 10x MGC, so roughly $430k notional per
     # contract at $4,300 gold. Size it deliberately; dollar_notional will
