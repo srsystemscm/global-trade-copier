@@ -113,6 +113,8 @@ class IBKRAdapter(BrokerAdapter):
         bracket_tif: str = "GTC",
         entry_tif: str = "DAY",
         fill_timeout: float = 10.0,
+        exit_chase_steps: int = 4,
+        exit_chase_pct: float = 0.002,
         entry_timeout: float = 900.0,
         account: Optional[str] = None,
     ) -> None:
@@ -154,6 +156,12 @@ class IBKRAdapter(BrokerAdapter):
         # price. The order is live at the broker either way -- a timeout here
         # means "no price captured", never "no position".
         self.fill_timeout = fill_timeout
+        # How far an unfilled limit exit may be walked, and in what size of
+        # step. Bounded on purpose: a wrong quote should cost a known
+        # number of ticks, not an open-ended slide. The step defaults to
+        # the route's own limit_offset_pct where it has one.
+        self.exit_chase_steps = exit_chase_steps
+        self.exit_chase_pct = exit_chase_pct
         # How long a LIMIT entry may rest before it is cancelled outright.
         # Not the same question as fill_timeout: a market order that hasn't
         # filled in ten seconds is a problem, while a limit resting in a thin
@@ -582,7 +590,8 @@ class IBKRAdapter(BrokerAdapter):
         # place a second closing order.
         del self._positions[slave_ticket]
         # Collected out of band too, for the same reason as the entry.
-        self._exit_trades[slave_ticket] = trade
+        self._exit_trades[slave_ticket] = (
+            trade, float(pos.get("limit_offset_pct", 0.0) or 0.0))
         return None
 
     async def _closing_order(self, ib_mod, pos, action):
@@ -730,11 +739,73 @@ class IBKRAdapter(BrokerAdapter):
         return None, None
 
     async def await_exit_fill(self, slave_ticket: int):
-        """Wait for the closing order's fill, returning (price, size)."""
-        trade = self._exit_trades.pop(slave_ticket, None)
-        if trade is None:
+        """Wait for the closing order's fill, chasing a limit that rests.
+
+        A resting exit is the one failure this path cannot tolerate: the
+        master is already out, so the copy is left carrying a position
+        nothing is managing. Seen live on SPXL, where the SELL limit went
+        out at 268.14 against a 267.71 market, because the quote it was
+        priced through was a delayed one and 0.36% stale.
+
+        So each step re-prices from the PREVIOUS LIMIT, not from a fresh
+        quote: an unfilled sell at 268.14 is itself evidence that the market
+        is below 268.14, which is more than the stale quote knows. The walk
+        is bounded by exit_chase_steps, so a bad quote costs a known number
+        of ticks rather than an open-ended slide.
+
+        A market order is not substituted after the first failure. Outside
+        regular hours IBKR refuses one, and outside regular hours is when
+        these exits run.
+        """
+        entry = self._exit_trades.pop(slave_ticket, None)
+        if entry is None:
             return None, None
-        return await self._await_fill(trade, "close")
+        trade, offset = entry
+
+        price, size = await self._await_fill(trade, "close")
+        if price is not None:
+            return price, size
+        if getattr(trade.order, "orderType", "") != "LMT":
+            # A market order that did not fill is not a pricing problem,
+            # and re-pricing it is not a thing that exists.
+            return price, size
+
+        step_pct = float(offset or 0.0) or float(self.exit_chase_pct)
+        steps = max(0, int(self.exit_chase_steps))
+        action = trade.order.action
+        symbol = getattr(trade.contract, "symbol", None)
+
+        for step in range(1, steps + 1):
+            status = trade.orderStatus.status
+            if status in ("Cancelled", "ApiCancelled", "Inactive", "Filled"):
+                break
+            through = (1 - step_pct) if action == "SELL" else (1 + step_pct)
+            was = float(trade.order.lmtPrice)
+            now = self._round_to_tick(was * through, symbol)
+            if now == was:
+                # One tick is coarser than the offset; step by a tick so the
+                # chase always actually moves.
+                tick = self._tick_size(symbol)
+                now = self._round_to_tick(
+                    was - tick if action == "SELL" else was + tick, symbol)
+            logger.warning(
+                "IBKRAdapter[%s] exit %s still resting at %s; re-pricing to %s "
+                "(chase %d of %d) -- the quote it was priced through was stale",
+                self.slave_id, trade.order.orderId, was, now, step, steps,
+            )
+            trade.order.lmtPrice = now
+            self._place(trade.contract, trade.order)
+            price, size = await self._await_fill(trade, "close chase")
+            if price is not None:
+                return price, size
+
+        logger.error(
+            "IBKRAdapter[%s] exit %s for %s never filled after %d re-prices; "
+            "the order is still live at the broker and the position is still "
+            "open there -- it needs a look",
+            self.slave_id, trade.order.orderId, symbol, steps,
+        )
+        return None, None
 
     async def preview_margin(self, order: OrderRequest) -> MarginPreview:
         """IBKR's own margin and commission for this order, unplaced.
@@ -978,6 +1049,18 @@ class IBKRAdapter(BrokerAdapter):
         order.tif = self.bracket_tif
         order.outsideRth = outside_rth
         return order
+
+    @staticmethod
+    def _tick_size(symbol: str) -> float:
+        """The contract's minimum price variation, or a cent.
+
+        Shared with _round_to_tick so the exit chase can guarantee it moves:
+        an offset smaller than one tick rounds back to where it started, and
+        a chase that does not move is not a chase.
+        """
+        spec = get_contract_spec(symbol)
+        tick = spec.tick_size if spec else 0.01
+        return tick if tick and tick > 0 else 0.01
 
     @staticmethod
     def _round_to_tick(price: Optional[float], symbol: str) -> Optional[float]:

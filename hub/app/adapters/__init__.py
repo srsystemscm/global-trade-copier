@@ -68,6 +68,8 @@ def create_adapter(slave: SlaveConfig) -> BrokerAdapter:
             bracket_tif=slave.config.get("bracket_tif", "GTC"),
             entry_tif=slave.config.get("entry_tif", "DAY"),
             fill_timeout=float(slave.config.get("fill_timeout", 10.0)),
+            exit_chase_steps=int(slave.config.get("exit_chase_steps", 4)),
+            exit_chase_pct=float(slave.config.get("exit_chase_pct", 0.002)),
             entry_timeout=float(slave.config.get("entry_timeout", 900.0)),
             account=slave.config.get("account"),
         )
