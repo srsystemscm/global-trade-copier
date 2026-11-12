@@ -224,3 +224,35 @@ def test_the_contract_request_names_the_ibkr_symbol():
                    IBKRAdapter._liquid_dated_contracts):
         src = re.sub(r"\s+", " ", inspect.getsource(method))
         assert "spec.ib_symbol or symbol" in src, method.__name__
+
+
+# ---------------- an unqualifiable contract says so ---------------------
+
+def test_an_unqualified_contract_is_dropped_not_dereferenced():
+    """ib_async returns a list the same length as the request, with None
+    where IBKR refused -- so `if not qualified` passes on [None] and the
+    next line raises AttributeError. Preflight caught this: an unroutable
+    MNG reported "'NoneType' object has no attribute 'conId'" instead of
+    saying IBKR has never heard of the contract."""
+    from app.adapters.ibkr import IBKRAdapter
+
+    assert IBKRAdapter._qualified_only([None]) == []
+    assert IBKRAdapter._qualified_only(None) == []
+    assert IBKRAdapter._qualified_only([]) == []
+    keeper = object()
+    assert IBKRAdapter._qualified_only([None, keeper]) == [keeper]
+
+
+def test_every_qualify_call_filters_its_result():
+    """Three call sites, and any one of them left raw turns a clear refusal
+    into an AttributeError."""
+    import inspect
+    import re
+    from app.adapters.ibkr import IBKRAdapter
+
+    src = re.sub(r"\s+", " ", inspect.getsource(IBKRAdapter))
+    raw = len(re.findall(r"(?<!_qualified_only\()(?<!\()await self\.ib\.qualifyContractsAsync", src))
+    wrapped = src.count("_qualified_only(")
+    assert "qualifyContractsAsync" in src
+    # the helper's own definition plus one use per call site
+    assert wrapped >= 4, "a qualifyContracts call site is unfiltered"

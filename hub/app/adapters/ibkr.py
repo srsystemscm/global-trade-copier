@@ -322,9 +322,9 @@ class IBKRAdapter(BrokerAdapter):
         """A specific contract by id -- the roll destination, and anything else
         that must not be re-derived from a slot number that may have shifted."""
         ib_mod = self._require_ib()
-        qualified = await self.ib.qualifyContractsAsync(
+        qualified = self._qualified_only(await self.ib.qualifyContractsAsync(
             ib_mod.Future(conId=contract_id, exchange=get_contract_spec(symbol).exchange)
-        )
+        ))
         if not qualified:
             raise AdapterRejectedError(f"IBKR could not qualify contract_id={contract_id} for {symbol}")
         return qualified[0]
@@ -393,7 +393,8 @@ class IBKRAdapter(BrokerAdapter):
                 f"month_slot={month_slot} requested for {symbol}, which isn't a future "
                 f"-- only futures have contract months"
             )
-        qualified = await self.ib.qualifyContractsAsync(contract)
+        qualified = self._qualified_only(
+            await self.ib.qualifyContractsAsync(contract))
         if not qualified:
             raise AdapterRejectedError(f"IBKR could not qualify a contract for symbol={symbol}")
         resolved = qualified[0]
@@ -408,9 +409,9 @@ class IBKRAdapter(BrokerAdapter):
             # ourselves matters: for GC the nearest expiry is an illiquid
             # serial month (GCX6), while ContFuture follows liquidity and
             # picks GCZ6. Verified against a live Gateway.
-            dated = await self.ib.qualifyContractsAsync(
+            dated = self._qualified_only(await self.ib.qualifyContractsAsync(
                 ib_mod.Future(conId=resolved.conId, exchange=resolved.exchange)
-            )
+            ))
             if not dated:
                 raise AdapterRejectedError(
                     f"IBKR could not resolve a dated front-month contract for symbol={symbol}"
@@ -1109,6 +1110,20 @@ class IBKRAdapter(BrokerAdapter):
         order.tif = self.bracket_tif
         order.outsideRth = outside_rth
         return order
+
+    @staticmethod
+    def _qualified_only(results):
+        """Drop the Nones ib_async leaves in place of a contract it could
+        not qualify.
+
+        It returns a list the same length as the request, with None where
+        IBKR refused, so `if not qualified` passes on [None] and the next
+        line raises AttributeError instead. Preflight surfaced it: an
+        unroutable MNG reported "'NoneType' object has no attribute
+        'conId'" rather than that IBKR has never heard of the contract,
+        which is the whole point of the message.
+        """
+        return [k for k in (results or []) if k is not None]
 
     @staticmethod
     def _tick_size(symbol: str) -> float:
