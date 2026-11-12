@@ -27,9 +27,11 @@
 //|   1.00 2026-10-31 port of SlaveBridge.mq4 1.03                   |
 //|   1.01 2026-11-11 POSITIONS reports each leg's SL/TP            |
 //|   1.02 2026-11-11 CLOSE reports the fill price                  |
+//|   1.03 2026-11-12 SYMBOLS and ACCOUNT commands; volume floors    |
+//|                   to the step instead of rounding to nearest     |
 //+------------------------------------------------------------------+
-#property version   "1.02"
-#define   BRIDGE_VERSION "1.02"
+#property version   "1.03"
+#define   BRIDGE_VERSION "1.03"
 
 #include <Zmq/Zmq.mqh>
 
@@ -38,6 +40,8 @@ input int  HubCommandPort       = 5560;  // this slave's REP port -- must match 
 input int  PollIntervalMs       = 100;   // how often to poll for a command
 input int  Slippage             = 5;     // deviation (points) allowed on market orders
 input long MagicNumber          = 0;     // stamped on every copier position
+input int  SymbolsReplyMax      = 200;   // most symbols one SYMBOLS reply may carry,
+                                         // for the "match" and Market Watch forms
 input bool AllowNettingAccount  = false; // see the OnInit guard -- read it before setting true
 
 Context zmqContext("bridge_ea_slave");
@@ -145,6 +149,10 @@ string HandleCommand(string json)
       return HandleClose(json);
    if(cmd == "POSITIONS")
       return HandlePositions();
+   if(cmd == "SYMBOLS")
+      return HandleSymbols(json);
+   if(cmd == "ACCOUNT")
+      return HandleAccount();
 
    return JsonError("unknown cmd '" + cmd + "'");
   }
@@ -425,6 +433,258 @@ string HandlePositions()
   }
 
 //+------------------------------------------------------------------+
+//| SYMBOLS -- what this broker's instruments actually ARE. Read-only:|
+//| it places nothing and leaves the Market Watch as it found it.     |
+//|                                                                   |
+//| New in 1.03. Contract size, volume min/max/step, tick size and    |
+//| value, expiry, and whether a symbol is a futures CFD at all live  |
+//| only in the terminal, and until now the only way to ask was to    |
+//| send an OPEN and read the refusal. That does work -- OPEN checks  |
+//| the symbol, then the price, then the volume, and builds no order  |
+//| until all three pass -- but it yields one number per round trip   |
+//| and needs a volume small enough to be refused, which is a poor    |
+//| way to learn a contract size.                                     |
+//|                                                                   |
+//| Three forms:                                                      |
+//|   {"cmd":"SYMBOLS","symbols":["US500","XTIUSD"]}                  |
+//|        named symbols; an absent one comes back exists:false        |
+//|        rather than as an error, so one dead name cannot hide the   |
+//|        answer for the rest                                        |
+//|   {"cmd":"SYMBOLS","match":"futures"}                             |
+//|        case-insensitive substring over both the symbol name and   |
+//|        its SYMBOL_PATH, across the server's whole tree            |
+//|   {"cmd":"SYMBOLS"}                                               |
+//|        the Market Watch as it stands                              |
+//|                                                                   |
+//| Two optional fields on any form. "limit" caps the reply below      |
+//| SymbolsReplyMax, and "names_only":true returns bare names with no  |
+//| specification read at all. Use names_only to explore: reading a    |
+//| spec means briefly selecting the symbol, and two hundred of those  |
+//| is two hundred Market Watch mutations and subscriptions, enough to |
+//| stall OnTimer past the hub's request timeout. Explore with         |
+//| names_only, then ask for the handful of specs that matter.         |
+//|                                                                   |
+//| The match form walks SymbolsTotal(false): every symbol the SERVER |
+//| offers this account, not the subset displayed in Market Watch.    |
+//| That distinction is the point of the command. A symbol missing    |
+//| from that tree cannot be traded by this account at all, whereas a |
+//| symbol missing from Market Watch is merely not being shown -- and |
+//| the two are indistinguishable from the hub without this.          |
+//+------------------------------------------------------------------+
+string HandleSymbols(string json)
+  {
+   string names[];
+   int    n     = JsonGetStringArray(json, "symbols", names);
+   string match = JsonGetString(json, "match");
+   bool   truncated = false;
+   bool   namesOnly = JsonGetBool(json, "names_only");
+
+   int limit = (int)JsonGetDouble(json, "limit");
+   if(limit <= 0 || limit > SymbolsReplyMax)
+      limit = SymbolsReplyMax;   // the input stays the hard ceiling
+
+   if(n == 0)
+     {
+      // No explicit list, so either filter the server's whole tree or report
+      // the Market Watch. SymbolsTotal/SymbolName take `selected`, hence the
+      // named flag: passing the wrong one here would quietly answer the
+      // other question.
+      bool   watchOnly = (match == "");
+      string needle    = match;
+      StringToUpper(needle);
+
+      int total = SymbolsTotal(watchOnly);
+      for(int i = 0; i < total; i++)
+        {
+         string s = SymbolName(i, watchOnly);
+         if(s == "")
+            continue;
+         // "*" is the whole tree: there is no other way to ask, since an
+         // empty match is already taken to mean the Market Watch.
+         if(!watchOnly && needle != "*")
+           {
+            // Name and path both, because a futures group is recognisable
+            // from its path ("Futures\Energies\...") long before its symbol
+            // names are. If a path reads empty for an unselected symbol the
+            // name half still matches, so this degrades rather than breaks.
+            string hay = s + "|" + SymbolInfoString(s, SYMBOL_PATH);
+            StringToUpper(hay);
+            if(StringFind(hay, needle) < 0)
+               continue;
+           }
+         if(n >= limit)
+           {
+            truncated = true;    // reported, so a short list is never mistaken
+            break;               // for a complete one
+           }
+         ArrayResize(names, n + 1);
+         names[n] = s;
+         n++;
+        }
+     }
+
+   string items = "";
+   for(int i = 0; i < n; i++)
+     {
+      if(i > 0)
+         items += ",";
+      items += namesOnly ? JsonQuote(names[i]) : SymbolSpecJson(names[i]);
+     }
+
+   return "{\"status\":\"ok\",\"count\":" + IntegerToString(n)
+        + ",\"truncated\":" + (truncated ? "true" : "false")
+        + (namesOnly ? ",\"names\":[" : ",\"symbols\":[") + items + "]}";
+  }
+
+//| True when the SERVER carries this symbol for this account, whether |
+//| or not it is in Market Watch. Walking the tree is the definitive   |
+//| test: SymbolInfo* on an unknown symbol merely sets 4301, which is  |
+//| indistinguishable from a property that happens to be empty.        |
+bool SymbolKnownToServer(const string symbol)
+  {
+   int total = SymbolsTotal(false);
+   for(int i = 0; i < total; i++)
+      if(SymbolName(i, false) == symbol)
+         return true;
+   return false;
+  }
+
+//| One symbol's specification.                                        |
+//|                                                                    |
+//| Properties are only reliably readable for a symbol in the Market   |
+//| Watch, so a symbol that is not there is added, read, and then       |
+//| removed again -- an operator's Market Watch is theirs, and a probe |
+//| that silently grew it by two hundred rows would be its own bug.     |
+string SymbolSpecJson(const string symbol)
+  {
+   if(!SymbolKnownToServer(symbol))
+      return "{\"symbol\":" + JsonQuote(symbol) + ",\"exists\":false}";
+
+   bool wasSelected = (bool)SymbolInfoInteger(symbol, SYMBOL_SELECT);
+   if(!wasSelected)
+      SymbolSelect(symbol, true);
+
+   int    digits  = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   long   expiry  = (long)SymbolInfoInteger(symbol, SYMBOL_EXPIRATION_TIME);
+   double vstep   = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   int    vd      = VolumeDigits(vstep > 0.0 ? vstep : 0.01);
+
+   // Stripped of their enum prefixes because these two are what a human
+   // reads first: CALC_MODE says whether this is a futures CFD, FOREX or a
+   // plain CFD, and TRADE_MODE says whether it can be opened at all (a
+   // CLOSEONLY symbol resolves, quotes, and refuses every entry).
+   string calcName = EnumToString((ENUM_SYMBOL_CALC_MODE)
+                                  SymbolInfoInteger(symbol, SYMBOL_TRADE_CALC_MODE));
+   StringReplace(calcName, "SYMBOL_CALC_MODE_", "");
+   string tradeName = EnumToString((ENUM_SYMBOL_TRADE_MODE)
+                                   SymbolInfoInteger(symbol, SYMBOL_TRADE_MODE));
+   StringReplace(tradeName, "SYMBOL_TRADE_MODE_", "");
+   string fillName = EnumToString(PickFilling(symbol));
+   StringReplace(fillName, "ORDER_FILLING_", "");
+
+   string js = "{\"symbol\":" + JsonQuote(symbol)
+             + ",\"exists\":true"
+             + ",\"in_market_watch\":" + (wasSelected ? "true" : "false")
+             + ",\"path\":" + JsonQuote(SymbolInfoString(symbol, SYMBOL_PATH))
+             + ",\"description\":" + JsonQuote(SymbolInfoString(symbol, SYMBOL_DESCRIPTION))
+             + ",\"calc_mode\":" + JsonQuote(calcName)
+             + ",\"trade_mode\":" + JsonQuote(tradeName)
+             + ",\"contract_size\":"
+             + DoubleToString(SymbolInfoDouble(symbol, SYMBOL_TRADE_CONTRACT_SIZE), 2)
+             + ",\"volume_min\":"
+             + DoubleToString(SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN), vd)
+             + ",\"volume_max\":"
+             + DoubleToString(SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX), vd)
+             + ",\"volume_step\":" + DoubleToString(vstep, vd)
+             + ",\"digits\":" + IntegerToString(digits)
+             + ",\"point\":" + DoubleToString(SymbolInfoDouble(symbol, SYMBOL_POINT), 8)
+             + ",\"tick_size\":"
+             + DoubleToString(SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE), 8)
+             + ",\"tick_value\":"
+             + DoubleToString(SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE), 5)
+             + ",\"stops_level\":"
+             + IntegerToString(SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL))
+             + ",\"filling\":" + JsonQuote(fillName)
+             + ",\"filling_mask\":"
+             + IntegerToString(SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE))
+             + ",\"currency_profit\":"
+             + JsonQuote(SymbolInfoString(symbol, SYMBOL_CURRENCY_PROFIT))
+             + ",\"currency_margin\":"
+             + JsonQuote(SymbolInfoString(symbol, SYMBOL_CURRENCY_MARGIN))
+             // A dated contract's expiry, 0 when the symbol is perpetual.
+             // This is how the hub can tell a rolling CFD from a CFD that
+             // holds one specific futures month.
+             + ",\"expiry_ts\":" + IntegerToString(expiry)
+             + ",\"expiry\":" + JsonQuote(expiry > 0
+                                         ? TimeToString((datetime)expiry, TIME_DATE) : "")
+             + ",\"bid\":" + DoubleToString(SymbolInfoDouble(symbol, SYMBOL_BID), digits)
+             + ",\"ask\":" + DoubleToString(SymbolInfoDouble(symbol, SYMBOL_ASK), digits)
+             + "}";
+
+   // Put the Market Watch back. A symbol that cannot be removed because a
+   // chart or an open position holds it is not worth an error -- the reply
+   // is already correct, and SYMBOL_SELECT above reported the true state.
+   if(!wasSelected)
+      SymbolSelect(symbol, false);
+
+   return js;
+  }
+
+//+------------------------------------------------------------------+
+//| ACCOUNT -- the figures a sizing model needs, plus the two fields  |
+//| that turn a wrong-terminal mistake from a discovery into a check. |
+//|                                                                   |
+//| New in 1.03, and the reason is sizing: mirror mode scales the      |
+//| master's lots by a constant (copy_engine._scaled_lots) because     |
+//| MT4Adapter.get_account_summary raises NotImplementedError -- the   |
+//| bridge had no way to say what the account is worth. Anything       |
+//| phrased as a percentage of balance was therefore uncomputable on   |
+//| an MT bridge, whoever was asking.                                  |
+//|                                                                   |
+//| trade_mode is DEMO, CONTEST or REAL, straight from the server.     |
+//| Reported so that a caller can REFUSE a real account by rule        |
+//| instead of by care, which matters here specifically: the Darwinex  |
+//| demo and the Darwinex live terminal differ by a number in a title  |
+//| bar, and the live one is not to be touched.                        |
+//|                                                                   |
+//| ACCOUNT_NAME is deliberately not reported. The holder's name is    |
+//| personal data, no sizing model needs it, and this reply ends up in |
+//| logs.                                                              |
+//+------------------------------------------------------------------+
+string HandleAccount()
+  {
+   string tradeMode = EnumToString((ENUM_ACCOUNT_TRADE_MODE)
+                                   AccountInfoInteger(ACCOUNT_TRADE_MODE));
+   StringReplace(tradeMode, "ACCOUNT_TRADE_MODE_", "");
+   string marginMode = EnumToString((ENUM_ACCOUNT_MARGIN_MODE)
+                                    AccountInfoInteger(ACCOUNT_MARGIN_MODE));
+   StringReplace(marginMode, "ACCOUNT_MARGIN_MODE_", "");
+
+   return "{\"status\":\"ok\""
+        + ",\"login\":" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN))
+        + ",\"server\":" + JsonQuote(AccountInfoString(ACCOUNT_SERVER))
+        + ",\"company\":" + JsonQuote(AccountInfoString(ACCOUNT_COMPANY))
+        + ",\"trade_mode\":" + JsonQuote(tradeMode)
+        + ",\"margin_mode\":" + JsonQuote(marginMode)
+        + ",\"currency\":" + JsonQuote(AccountInfoString(ACCOUNT_CURRENCY))
+        + ",\"balance\":" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2)
+        + ",\"equity\":" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2)
+        + ",\"margin\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN), 2)
+        + ",\"margin_free\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2)
+        + ",\"margin_level\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_LEVEL), 2)
+        + ",\"leverage\":" + IntegerToString(AccountInfoInteger(ACCOUNT_LEVERAGE))
+        // Two separate switches, and a trade fails with 10027 if either is
+        // off while everything else looks healthy.
+        + ",\"trade_allowed\":"
+        + ((AccountInfoInteger(ACCOUNT_TRADE_ALLOWED)
+            && TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) ? "true" : "false")
+        + ",\"algo_allowed\":"
+        + (MQLInfoInteger(MQL_TRADE_ALLOWED) ? "true" : "false")
+        + ",\"bridge_version\":" + JsonQuote(BRIDGE_VERSION)
+        + "}";
+  }
+
+//+------------------------------------------------------------------+
 //| Trade helpers                                                     |
 //+------------------------------------------------------------------+
 
@@ -443,12 +703,24 @@ ENUM_ORDER_TYPE_FILLING PickFilling(const string symbol)
    return ORDER_FILLING_RETURN;
   }
 
-//| Rounds to the symbol's volume step, and REFUSES anything outside   |
+//| Floors to the symbol's volume step, and REFUSES anything outside   |
 //| its min/max rather than clamping. Clamping is the tempting choice  |
 //| and the wrong one: a master 0.01 against a slave minimum of 0.10   |
 //| would silently trade ten times the intended risk. Mirror mode      |
 //| copies lots 1:1 with no scaling, so the two brokers' contract      |
 //| sizes have to agree for the copy to mean anything anyway.          |
+//|                                                                    |
+//| 1.03: floors where it used to round to NEAREST. Rounding to        |
+//| nearest can round UP, and the hub is explicit that it must not:    |
+//| copy_engine._scaled_lots floors to the 0.01 grid because "this     |
+//| dial's job is to carry LESS risk than the master, so it must never |
+//| hand back more". Those two did not compose. It only bit where the  |
+//| step is coarser than 0.01 -- which is not hypothetical: ICM's      |
+//| US500 has a 0.1 minimum -- and there a risk_scale of 0.5 on a      |
+//| master 0.3 asked for 0.15 and got 0.2, a third more risk than the  |
+//| hub had sized, announced only by a Print. Flooring can reach zero  |
+//| instead, which then lands on the below-minimum refusal below,      |
+//| where an operator sees it.                                         |
 double NormalizeVolume(const string symbol, double lots, string &err)
   {
    double vmin = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
@@ -457,11 +729,18 @@ double NormalizeVolume(const string symbol, double lots, string &err)
    if(step <= 0.0)
       step = 0.01;
 
-   double v = MathRound(lots / step) * step;
+   // Snap before flooring, or binary representation eats a whole step for
+   // volumes that are already exact: 0.03/0.01 is 2.9999999999999996 in
+   // doubles, and a bare MathFloor would turn an exact 0.03 into 0.02. The
+   // tolerance is a millionth of a step, far below any volume a broker
+   // distinguishes, so it can only absorb arithmetic noise.
+   double q  = lots / step;
+   double qr = MathRound(q);
+   double v  = (MathAbs(q - qr) < 1e-6 ? qr : MathFloor(q)) * step;
    v = NormalizeDouble(v, VolumeDigits(step));
 
    if(MathAbs(v - lots) > 1e-8)
-      Print("SlaveBridge: ", symbol, " volume ", lots, " rounded to ", v,
+      Print("SlaveBridge: ", symbol, " volume ", lots, " floored to ", v,
             " (step ", step, ")");
 
    if(v < vmin - 1e-8)
@@ -595,6 +874,67 @@ string JsonError(string message)
    return "{\"status\":\"error\",\"message\":\"" + message + "\"}";
   }
 
+//| A JSON string VALUE, quotes included, with the two characters that |
+//| would break the hub's json.loads() escaped rather than stripped.   |
+//| SYMBOL_PATH is why this exists: every path is backslash-separated  |
+//| ("Futures\Energies\WTI"), and one raw backslash makes the whole    |
+//| reply unparseable -- which would look exactly like a dead bridge.  |
+//| JsonError() mangles instead of escaping, which is right for a      |
+//| human-readable message and wrong for a value the hub keys on.      |
+string JsonQuote(string s)
+  {
+   StringReplace(s, "\\", "\\\\");
+   StringReplace(s, "\"", "\\\"");
+   // Broker descriptions occasionally carry a stray control character;
+   // a literal newline inside a JSON string is as fatal as a backslash.
+   StringReplace(s, "\r", " ");
+   StringReplace(s, "\n", " ");
+   StringReplace(s, "\t", " ");
+   return "\"" + s + "\"";
+  }
+
+//| The string entries of a JSON array value, e.g. "symbols":["A","B"].|
+//| Returns how many were read, so an absent key and an empty array    |
+//| both come back 0 and callers can treat them alike. Non-string      |
+//| entries stop the scan: no command needs one, and silently reading  |
+//| past a number would be worse than returning the prefix.            |
+int JsonGetStringArray(string json, string key, string &out[], int limit = 64)
+  {
+   ArrayResize(out, 0);
+   int p = FindValueStart(json, key);
+   if(p < 0 || p >= StringLen(json) || StringGetCharacter(json, p) != '[')
+      return 0;
+
+   int len = StringLen(json);
+   int n   = 0;
+   p++;
+   while(p < len && n < limit)
+     {
+      p = SkipWhitespace(json, p);
+      if(p >= len)
+         break;
+      ushort c = StringGetCharacter(json, p);
+      if(c == ']')
+         break;
+      if(c == ',')
+        {
+         p++;
+         continue;
+        }
+      if(c != '"')
+         break;
+      p++;
+      int end = StringFind(json, "\"", p);
+      if(end < 0)
+         break;
+      ArrayResize(out, n + 1);
+      out[n] = StringSubstr(json, p, end - p);
+      n++;
+      p = end + 1;
+     }
+   return n;
+  }
+
 int SkipWhitespace(string json, int i)
   {
    int len = StringLen(json);
@@ -655,6 +995,16 @@ string JsonGetNumberToken(string json, string key)
    if(p == start)
       return "";   // JSON null -- the hub sends "sl": null for an unset level
    return StringSubstr(json, start, p - start);
+  }
+
+//| True only for the JSON literal true. Absent, false, null, a number |
+//| and a string all read as false, which is what every flag wants.    |
+bool JsonGetBool(string json, string key)
+  {
+   int p = FindValueStart(json, key);
+   if(p < 0)
+      return false;
+   return (StringSubstr(json, p, 4) == "true");
   }
 
 double JsonGetDouble(string json, string key)
