@@ -99,6 +99,22 @@ class AutonomousCopyEngine(SessionGateMixin):
         # background fill collectors; held so they aren't garbage collected
         # mid-flight and so stop() can cancel them
         self._fill_tasks: set = set()
+        # An exit the broker cannot take yet is held and retried, not
+        # dropped. The equity session is shut for most of the day, so a CFD
+        # stop hit in the evening has to be executed when the market next
+        # opens -- which is what a person would do by hand.
+        #
+        # Separate knobs from the OPEN deferral on purpose: an exit has to
+        # happen eventually, so it waits far longer. The default covers a
+        # weekend, because a Friday evening close legitimately waits for
+        # Monday.
+        dc = slave_config.get("defer_close", {})
+        self.defer_close_enabled = dc.get("enabled", True)
+        self.defer_close_retry_seconds = dc.get("retry_seconds", 60)
+        self.defer_close_max_seconds = dc.get("max_seconds", 259200)   # 72h
+        self.defer_close_poll_seconds = dc.get("poll_seconds", 10)
+        # keyed (master_account, master_ticket, slave_symbol)
+        self._deferred_closes: Dict[tuple, dict] = {}
         self._last_roll_check = 0.0
 
         # Keyed (master_account, master_ticket, slave_symbol): ticket
@@ -142,9 +158,13 @@ class AutonomousCopyEngine(SessionGateMixin):
         self._monitor_task = asyncio.create_task(self._monitor_loop(), name=f"autonomous-monitor-{self.slave_id}")
         self._deferred_task = asyncio.create_task(
             self._deferred_loop(), name=f"autonomous-deferred-{self.slave_id}")
+        self._deferred_close_task = asyncio.create_task(
+            self._deferred_close_loop(),
+            name=f"autonomous-deferred-close-{self.slave_id}")
 
     async def stop(self) -> None:
-        for task in (self._consume_task, self._monitor_task, self._deferred_task):
+        for task in (self._consume_task, self._monitor_task, self._deferred_task,
+                     self._deferred_close_task):
             if task is not None:
                 task.cancel()
                 try:
@@ -738,6 +758,149 @@ class AutonomousCopyEngine(SessionGateMixin):
         self._fill_tasks.add(task)
         task.add_done_callback(self._fill_tasks.discard)
 
+    async def _defer_close(self, signal, mapping, exc) -> None:
+        """Hold an exit the broker refused, to execute at the next open.
+
+        Deliberately does NOT touch the position or the registry row. Until
+        the close succeeds this slave really is still in the trade, and
+        anything that says otherwise would hide a live position from
+        reconciliation.
+        """
+        if not self.defer_close_enabled:
+            logger.error(
+                "slave=%s could not close %s slave_ticket=%s: %s",
+                self.slave_id, mapping.slave_symbol, mapping.slave_ticket, exc,
+            )
+            await self._emit("slave_error", master_ticket=signal.ticket,
+                             action="CLOSE", message=str(exc))
+            return
+
+        key = (signal.account, signal.ticket, mapping.slave_symbol)
+        if key in self._deferred_closes:
+            return
+
+        now = time.time()
+        self._deferred_closes[key] = {
+            "signal": signal, "mapping": mapping, "first_at": now,
+            "next_at": now + self.defer_close_retry_seconds,
+            "attempts": 1, "last_error": str(exc),
+        }
+        logger.warning(
+            "slave=%s deferring the close of %s slave_ticket=%s -- STILL HOLDING "
+            "a position the master has exited. Retrying every %ss for up to %ss: %s",
+            self.slave_id, mapping.slave_symbol, mapping.slave_ticket,
+            self.defer_close_retry_seconds, self.defer_close_max_seconds, exc,
+        )
+        await self._emit("close_deferred", master_ticket=signal.ticket,
+                         slave_symbol=mapping.slave_symbol,
+                         slave_ticket=mapping.slave_ticket, reason=str(exc))
+
+    async def _deferred_close_loop(self) -> None:
+        """Retry held exits until the broker takes them.
+
+        Each attempt goes back through adapter.close(), which re-prices a
+        limit exit from a live quote -- so a close that waits for the open is
+        priced at the open, not at a quote from hours earlier.
+
+        These live in memory. A hub restart mid-wait loses them, and the
+        position is then found by reconciliation against the broker rather
+        than by this loop, which is the honest limit of it.
+        """
+        while True:
+            await asyncio.sleep(self.defer_close_poll_seconds)
+            if not self._deferred_closes:
+                continue
+            if not self.session_up:
+                continue
+
+            now = time.time()
+            for key, item in list(self._deferred_closes.items()):
+                if now < item["next_at"]:
+                    continue
+
+                signal, mapping = item["signal"], item["mapping"]
+                if now - item["first_at"] > self.defer_close_max_seconds:
+                    del self._deferred_closes[key]
+                    await self._abandon_deferred_close(key, item)
+                    continue
+
+                item["attempts"] += 1
+                try:
+                    slave_close = await self.adapter.close(mapping.slave_ticket)
+                except EntryNeverFilled as exc:
+                    # The entry was cancelled in the meantime, so there is
+                    # nothing to exit after all.
+                    del self._deferred_closes[key]
+                    logger.warning("slave=%s %s", self.slave_id, exc)
+                    self._finish_close(signal, mapping, cancelled=True)
+                    continue
+                except AdapterError as exc:
+                    item["last_error"] = str(exc)
+                    item["next_at"] = now + self.defer_close_retry_seconds
+                    logger.warning(
+                        "slave=%s still cannot close %s slave_ticket=%s "
+                        "(attempt %d, holding for %.0fs): %s",
+                        self.slave_id, mapping.slave_symbol, mapping.slave_ticket,
+                        item["attempts"], now - item["first_at"], exc,
+                    )
+                    continue
+
+                del self._deferred_closes[key]
+                waited = now - item["first_at"]
+                logger.info(
+                    "slave=%s closed deferred %s slave_ticket=%s after %.0fs and "
+                    "%d attempt(s)",
+                    self.slave_id, mapping.slave_symbol, mapping.slave_ticket,
+                    waited, item["attempts"],
+                )
+                self._finish_close(signal, mapping, slave_close=slave_close)
+                await self._emit("deferred_close_filled",
+                                 master_ticket=signal.ticket,
+                                 slave_symbol=mapping.slave_symbol,
+                                 waited_seconds=round(waited))
+                if slave_close is None:
+                    self._capture_fill("exit", signal.account, signal.ticket,
+                                       mapping.slave_symbol, mapping.slave_ticket)
+
+    async def _abandon_deferred_close(self, key, item) -> None:
+        """Give up, loudly, and leave every record in place.
+
+        The position is still open as far as this hub knows, and that is the
+        truth: nothing has closed it. Tidying the records away here would
+        turn a position someone has to deal with into one nobody can see.
+        """
+        msg = (
+            f"Slave {self.slave_id} NEVER CLOSED {key[2]} for master_ticket={key[1]} "
+            f"after {self.defer_close_max_seconds}s and {item['attempts']} attempts. "
+            f"The master is OUT of this trade and this slave is STILL IN IT -- "
+            f"close it by hand. Last error: {item['last_error']}"
+        )
+        logger.error(msg)
+        await self._emit("deferred_close_abandoned", master_ticket=key[1],
+                         slave_symbol=key[2], attempts=item["attempts"],
+                         message=item["last_error"])
+        if self.notifier:
+            await self.notifier.notify(
+                "deferred_close_abandoned", msg, slave_id=self.slave_id,
+                master_ticket=key[1], slave_symbol=key[2],
+            )
+
+    def _finish_close(self, signal, mapping, slave_close=None, cancelled=False) -> None:
+        """Write down a close that actually happened, and forget the position."""
+        if cancelled:
+            trade_registry.record_entry_cancelled(
+                self.slave_id, signal.account, signal.ticket, mapping.slave_symbol)
+        else:
+            trade_registry.record_close(
+                self.slave_id, signal.account, signal.ticket, mapping.slave_symbol,
+                master_close_price=signal.price or None,
+                slave_close_price=slave_close,
+            )
+        self._positions.pop(
+            (signal.account, signal.ticket, mapping.slave_symbol), None)
+        position_store.delete(
+            self.slave_id, signal.account, signal.ticket, mapping.slave_symbol)
+
     async def _handle_close(self, signal: Signal) -> None:
         dropped = self._cancel_deferred(signal.account, signal.ticket)
         if dropped:
@@ -774,6 +937,12 @@ class AutonomousCopyEngine(SessionGateMixin):
                 await self._emit("entry_unfilled", master_ticket=signal.ticket,
                                  slave_symbol=mapping.slave_symbol,
                                  slave_ticket=mapping.slave_ticket)
+                continue
+            except AdapterError as exc:
+                # Held, not dropped -- and nothing about the position or its
+                # row is changed, because until this succeeds the slave
+                # really is still in the trade.
+                await self._defer_close(signal, mapping, exc)
                 continue
             trade_registry.record_close(
                 self.slave_id, signal.account, signal.ticket, mapping.slave_symbol,
