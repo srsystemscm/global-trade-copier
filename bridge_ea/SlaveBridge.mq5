@@ -29,9 +29,11 @@
 //|   1.02 2026-11-11 CLOSE reports the fill price                  |
 //|   1.03 2026-11-12 SYMBOLS and ACCOUNT commands; volume floors    |
 //|                   to the step instead of rounding to nearest     |
+//|   1.04 2026-11-12 SL/TP on the tick grid; a volume above the      |
+//|                   symbol's maximum opens as a position group      |
 //+------------------------------------------------------------------+
-#property version   "1.03"
-#define   BRIDGE_VERSION "1.03"
+#property version   "1.04"
+#define   BRIDGE_VERSION "1.04"
 
 #include <Zmq/Zmq.mqh>
 
@@ -43,9 +45,45 @@ input long MagicNumber          = 0;     // stamped on every copier position
 input int  SymbolsReplyMax      = 200;   // most symbols one SYMBOLS reply may carry,
                                          // for the "match" and Market Watch forms
 input bool AllowNettingAccount  = false; // see the OnInit guard -- read it before setting true
+input bool AllowVolumeSplit     = true;  // open a volume above the symbol's maximum as
+                                         // several deals held together as one group
 
 Context zmqContext("bridge_ea_slave");
 Socket  repSocket(zmqContext, ZMQ_REP);
+
+//+------------------------------------------------------------------+
+//| POSITION GROUPS                                                   |
+//|                                                                   |
+//| A symbol's SYMBOL_VOLUME_MAX can be far below a sized position:   |
+//| Darwinex caps MBT_X at 20 lots, and a 1%-of-balance bitcoin trade |
+//| on that account is 200. The volume has to arrive as ten deals.    |
+//|                                                                   |
+//| That collides with the hub, which maps one master ticket to ONE   |
+//| slave ticket -- the Trade Registry is keyed UNIQUE(slave_id,      |
+//| master_ticket, slave_symbol) and get_open_mappings() hands the    |
+//| engine a single slave_ticket. Ten rows would reconcile as one     |
+//| tracked position and nine untracked ones.                         |
+//|                                                                   |
+//| So the legs are held together HERE and the hub is told about one  |
+//| ticket: the first leg's, the group leader. CLOSE and MODIFY on    |
+//| that ticket act on every leg, and POSITIONS reports the group as  |
+//| one aggregated row. The hub's model does not change at all.       |
+//|                                                                   |
+//| Group membership lives in two places on purpose. The arrays below |
+//| are authoritative while this EA runs; the leader's ticket and the |
+//| leg count are also written into each follower's comment, so that  |
+//| a terminal restart or a recompile can rediscover a group from the |
+//| positions themselves instead of orphaning its legs. Brokers are   |
+//| allowed to rewrite comments, which is why the count travels with  |
+//| them: a group that finds fewer legs than it declares says so      |
+//| rather than quietly closing part of itself.                       |
+//+------------------------------------------------------------------+
+#define MAX_LEGS  64
+#define GROUP_TAG "cpg:"
+
+ulong g_leader[];              // leader ticket, one entry per live group
+ulong g_legs[][MAX_LEGS];      // its legs, including the leader at [0]
+int   g_legCount[];
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -187,44 +225,268 @@ string HandleOpen(string json)
                         : SymbolInfoDouble(symbol, SYMBOL_BID);
 
    string volErr = "";
-   double volume = NormalizeVolume(symbol, lots, volErr);
+   // Above-maximum passes the normaliser when splitting is on, because the
+   // split below is what makes it tradeable. Refusing it in both places would
+   // make the two disagree about what this EA can do.
+   double volume = NormalizeVolume(symbol, lots, volErr, AllowVolumeSplit);
    if(volErr != "")
       return JsonError(volErr);
 
-   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   int    digits  = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   double slLevel = (sl > 0.0) ? OnTickGrid(symbol, sl) : 0.0;
+   double tpLevel = (tp > 0.0) ? OnTickGrid(symbol, tp) : 0.0;
+   ENUM_ORDER_TYPE otype = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
 
+   // Checked once, before any clip is sent: a stop the broker will reject
+   // should not cost ten round trips to discover.
+   string stopsErr = CheckStopsDistance(symbol, otype, NormalizeDouble(price, digits),
+                                        slLevel, tpLevel);
+   if(stopsErr != "")
+      return JsonError(stopsErr);
+
+   double clips[];
+   int    nclips = SplitVolume(symbol, volume, clips);
+   if(nclips < 0)
+      return JsonError(StringFormat(
+         "%.2f lots needs more than %d clips of %s's maximum %.2f -- refusing rather "
+         "than opening a position this EA cannot then close as one unit",
+         volume, MAX_LEGS, symbol, SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX)));
+
+   ulong  legs[];
+   int    done     = 0;
+   double filled   = 0.0;
+   double costSum  = 0.0;
+   string lastErr  = "";
+
+   for(int i = 0; i < nclips; i++)
+     {
+      ulong  t  = 0;
+      double fp = 0.0, fl = 0.0;
+      string err = "";
+
+      // The leader's ticket cannot be known before it exists, so the first
+      // clip carries the plain comment and every later clip is tagged with
+      // the leader and the leg count. The group is therefore rediscoverable
+      // from the positions themselves, with no state in this EA to lose
+      // across a restart or a recompile -- see ResolveGroupLegs.
+      string tag = (done == 0)
+                   ? "copier"
+                   : GROUP_TAG + IntegerToString((long)legs[0]) + ":"
+                     + IntegerToString(nclips);
+
+      if(!OpenOneDeal(symbol, otype, clips[i], slLevel, tpLevel, digits, tag,
+                      t, fp, fl, err))
+        {
+         lastErr = err;
+         break;
+        }
+
+      ArrayResize(legs, done + 1);
+      legs[done] = t;
+      done++;
+      filled  += fl;
+      costSum += fp * fl;
+     }
+
+   // Nothing opened at all is the plain failure the caller already knows.
+   if(done == 0)
+      return JsonError(lastErr);
+
+   // Something opened and something did not. Deliberately NOT rolled back:
+   // the hub records the size that filled, exactly as it does for a partial
+   // fill, and unwinding here could fail too and leave a worse mess. It is
+   // reported in the reply so it cannot pass unnoticed.
+   if(lastErr != "")
+      Print("SlaveBridge WARNING: ", symbol, " split short -- ", done, " of ", nclips,
+            " clips opened (", filled, " of ", volume, " lots). Refusal: ", lastErr);
+
+   if(done > 1)
+      GroupRemember(legs[0], legs, done);
+
+   double vwap = (filled > 0.0) ? costSum / filled : 0.0;
+
+   string js = "{\"status\":\"ok\",\"slave_ticket\":" + IntegerToString((long)legs[0])
+             + ",\"price\":" + DoubleToString(vwap, digits)
+             + ",\"lots\":" + DoubleToString(filled, 2)
+             + ",\"legs\":" + IntegerToString(done);
+   if(lastErr != "")
+      js += ",\"warning\":" + JsonQuote(StringFormat(
+               "only %d of %d clips filled (%.2f of %.2f lots): %s",
+               done, nclips, filled, volume, lastErr));
+   return js + "}";
+  }
+
+//| Group bookkeeping. Linear scans over a handful of groups: a slave  |
+//| holds tens of positions, not thousands, and a map would be more    |
+//| machinery than the problem has.                                    |
+int GroupIndex(ulong leader)
+  {
+   for(int i = 0; i < ArraySize(g_leader); i++)
+      if(g_leader[i] == leader)
+         return i;
+   return -1;
+  }
+
+void GroupRemember(ulong leader, ulong &legs[], int n)
+  {
+   if(n > MAX_LEGS)
+      n = MAX_LEGS;
+   int idx = GroupIndex(leader);
+   if(idx < 0)
+     {
+      idx = ArraySize(g_leader);
+      ArrayResize(g_leader, idx + 1);
+      ArrayResize(g_legs, idx + 1);
+      ArrayResize(g_legCount, idx + 1);
+     }
+   g_leader[idx]   = leader;
+   g_legCount[idx] = n;
+   for(int i = 0; i < n; i++)
+      g_legs[idx][i] = legs[i];
+  }
+
+void GroupForget(ulong leader)
+  {
+   int idx = GroupIndex(leader);
+   if(idx < 0)
+      return;
+   int last = ArraySize(g_leader) - 1;
+   if(idx != last)
+     {
+      g_leader[idx]   = g_leader[last];
+      g_legCount[idx] = g_legCount[last];
+      for(int i = 0; i < g_legCount[last]; i++)
+         g_legs[idx][i] = g_legs[last][i];
+     }
+   ArrayResize(g_leader, last);
+   ArrayResize(g_legs, last);
+   ArrayResize(g_legCount, last);
+  }
+
+//| The leader a position belongs to: the ticket encoded in its comment |
+//| for a follower, or its own ticket for anything else. Takes the      |
+//| comment as read, since the caller has the position selected.        |
+ulong GroupLeaderOf(ulong ticket, const string comment)
+  {
+   if(StringFind(comment, GROUP_TAG) != 0)
+      return ticket;
+   int colon = StringFind(comment, ":", StringLen(GROUP_TAG));
+   if(colon < 0)
+      return ticket;
+   string digits = StringSubstr(comment, StringLen(GROUP_TAG),
+                                colon - StringLen(GROUP_TAG));
+   ulong  leader = (ulong)StringToInteger(digits);
+   return (leader > 0) ? leader : ticket;
+  }
+
+//| The legs of a group that still EXIST, leader included. Returns the  |
+//| count, which is 0 when nothing is open -- so a caller can tell an   |
+//| already-closed group from a live one without a second question.     |
+//|                                                                     |
+//| The leader not existing does not end the search: a leader closed by |
+//| hand must not strand the nine legs behind it, which is exactly what |
+//| returning "already closed" here would do.                           |
+int ResolveGroupLegs(ulong leader, ulong &out[])
+  {
+   ArrayResize(out, 0);
+   int n = 0;
+
+   if(PositionSelectByTicket(leader))
+     {
+      ArrayResize(out, 1);
+      out[0] = leader;
+      n = 1;
+     }
+
+   int idx = GroupIndex(leader);
+   if(idx >= 0)
+     {
+      for(int i = 0; i < g_legCount[idx]; i++)
+        {
+         ulong t = g_legs[idx][i];
+         if(t == leader || !PositionSelectByTicket(t))
+            continue;
+         ArrayResize(out, n + 1);
+         out[n] = t;
+         n++;
+        }
+      return n;
+     }
+
+   // Nothing in memory: rediscover from the comments. This is the path after
+   // a terminal restart, a recompile, or a re-attach.
+   string want     = GROUP_TAG + IntegerToString((long)leader) + ":";
+   int    declared = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(t == 0 || t == leader)
+         continue;
+      string comment = PositionGetString(POSITION_COMMENT);
+      if(StringFind(comment, want) != 0)
+         continue;
+      declared = (int)StringToInteger(StringSubstr(comment, StringLen(want)));
+      ArrayResize(out, n + 1);
+      out[n] = t;
+      n++;
+     }
+
+   if(declared > 0 && declared != n)
+      Print("SlaveBridge WARNING: group ", leader, " declares ", declared,
+            " legs but ", n, " were found. A broker may have rewritten the ",
+            "comments; the legs not found are NOT being acted on -- look at ",
+            "this account by hand.");
+   return n;
+  }
+
+//| One deal. Extracted from HandleOpen so a split can send several    |
+//| without the body being written twice, and so a clip that fails can |
+//| say why without unwinding the clips that worked.                    |
+bool OpenOneDeal(const string symbol, ENUM_ORDER_TYPE otype, double volume,
+                 double sl, double tp, int digits, const string comment,
+                 ulong &posTicket, double &fillPrice, double &filledLots,
+                 string &err)
+  {
    MqlTradeRequest req;
    MqlTradeResult  res;
    ZeroMemory(req);
    ZeroMemory(res);
 
+   // Re-read the price for every clip. Ten deals are ten moments, and reusing
+   // the first clip's price for the tenth would aim the deviation window at a
+   // price the market has already left.
+   bool   isBuy = (otype == ORDER_TYPE_BUY);
+   double price = isBuy ? SymbolInfoDouble(symbol, SYMBOL_ASK)
+                        : SymbolInfoDouble(symbol, SYMBOL_BID);
+
    req.action       = TRADE_ACTION_DEAL;
    req.symbol       = symbol;
    req.volume       = volume;
-   req.type         = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   req.type         = otype;
    req.price        = NormalizeDouble(price, digits);
    // A master SL/TP of 0 means "unset", exactly as in MQL4 -- and 0 is also
-   // how MQL5 says "no level", so this passes straight through. Non-zero
-   // levels go onto the tick grid: see OnTickGrid, and MBT_X, whose tick is
-   // 5 whole dollars.
-   req.sl           = (sl > 0.0) ? OnTickGrid(symbol, sl) : 0.0;
-   req.tp           = (tp > 0.0) ? OnTickGrid(symbol, tp) : 0.0;
+   // how MQL5 says "no level". Non-zero levels arrive already on the tick
+   // grid; see OnTickGrid, and MBT_X, whose tick is 5 whole dollars.
+   req.sl           = sl;
+   req.tp           = tp;
    req.deviation    = (ulong)Slippage;
    req.magic        = (ulong)MagicNumber;
-   req.comment      = "copier";
+   req.comment      = comment;
    req.type_filling = PickFilling(symbol);
 
-   string stopsErr = CheckStopsDistance(symbol, req.type, req.price, req.sl, req.tp);
-   if(stopsErr != "")
-      return JsonError(stopsErr);
-
    if(!OrderSend(req, res))
-      return JsonError(StringFormat("OrderSend failed to submit: retcode=%d %s (last_error=%d)",
-                                    (int)res.retcode, res.comment, GetLastError()));
+     {
+      err = StringFormat("OrderSend failed to submit: retcode=%d %s (last_error=%d)",
+                         (int)res.retcode, res.comment, GetLastError());
+      return false;
+     }
 
    if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_DONE_PARTIAL)
-      return JsonError(StringFormat("OrderSend rejected: retcode=%d %s",
-                                    (int)res.retcode, res.comment));
+     {
+      err = StringFormat("OrderSend rejected: retcode=%d %s",
+                         (int)res.retcode, res.comment);
+      return false;
+     }
 
    if(res.retcode == TRADE_RETCODE_DONE_PARTIAL)
       Print("SlaveBridge WARNING: ", symbol, " filled only ", res.volume, " of ",
@@ -236,19 +498,56 @@ string HandleOpen(string json)
    // ticket, but the position can take a moment to appear, and on a netting
    // account it is the pre-existing position's id instead -- so resolve it
    // properly rather than assuming res.order.
-   ulong posTicket = ResolvePositionTicket(res.order, res.deal);
+   posTicket = ResolvePositionTicket(res.order, res.deal);
    if(posTicket == 0)
-      return JsonError(StringFormat(
+     {
+      err = StringFormat(
          "order %s filled but its position ticket could not be resolved -- the "
          "position is OPEN AND UNTRACKED, close it by hand",
-         IntegerToString((long)res.order)));
+         IntegerToString((long)res.order));
+      return false;
+     }
 
-   double fillPrice = (res.price > 0.0) ? res.price : req.price;
+   fillPrice  = (res.price > 0.0) ? res.price : req.price;
+   filledLots = (res.volume > 0.0) ? res.volume : volume;
+   return true;
+  }
 
-   return "{\"status\":\"ok\",\"slave_ticket\":" + IntegerToString((long)posTicket)
-        + ",\"price\":" + DoubleToString(fillPrice, digits)
-        + ",\"lots\":" + DoubleToString((res.volume > 0.0) ? res.volume : volume, 2)
-        + "}";
+//| Cuts a volume into clips the broker will accept one at a time.     |
+//| Returns the clip count, or -1 when it would need more legs than    |
+//| MAX_LEGS -- refused rather than truncated, because a position this |
+//| EA cannot close as one unit is worse than an order that never      |
+//| opened. A volume at or below the maximum is one clip, so the        |
+//| single-order path is just the n=1 case and is not special-cased.    |
+int SplitVolume(const string symbol, double total, double &clips[])
+  {
+   double vmax = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0.0)
+      step = 0.01;
+   int vd = VolumeDigits(step);
+
+   ArrayResize(clips, 0);
+   if(vmax <= 0.0 || total <= vmax + 1e-8)
+     {
+      ArrayResize(clips, 1);
+      clips[0] = NormalizeDouble(total, vd);
+      return 1;
+     }
+
+   double left = total;
+   int    n    = 0;
+   while(left > 1e-8)
+     {
+      if(n >= MAX_LEGS)
+         return -1;
+      double clip = (left > vmax) ? vmax : left;
+      ArrayResize(clips, n + 1);
+      clips[n] = NormalizeDouble(clip, vd);
+      n++;
+      left = NormalizeDouble(left - clip, vd);
+     }
+   return n;
   }
 
 //+------------------------------------------------------------------+
@@ -257,6 +556,20 @@ string HandleModify(string json)
    ulong  ticket = JsonGetTicket(json, "ticket");
    double sl     = JsonGetDouble(json, "sl");
    double tp     = JsonGetDouble(json, "tp");
+
+   // A split position is several tickets wearing one ticket's name, so the
+   // stop has to move on all of them or the group ends up with legs stopping
+   // out at different prices -- which is the one thing a copied stop must
+   // never do.
+   ulong legs[];
+   int   n = ResolveGroupLegs(ticket, legs);
+   if(n > 1)
+      return ModifyEveryLeg(legs, n, sl, tp);
+   if(n == 1)
+      // Possibly a group worn down to one leg, and possibly not the leader
+      // the hub asked for. Move the stop on whatever is actually open, or a
+      // live leg would be reported as already closed and left unprotected.
+      ticket = legs[0];
 
    if(!PositionSelectByTicket(ticket))
      {
@@ -274,8 +587,20 @@ string HandleModify(string json)
       return JsonError("ticket " + IntegerToString((long)ticket) + " not found");
      }
 
+   string err = ModifyOneLeg(ticket, sl, tp);
+   if(err != "")
+      return JsonError(err);
+   return "{\"status\":\"ok\"}";
+  }
+
+//| One leg's SL/TP. Shared by the single-position path and the group   |
+//| path so the two cannot drift apart. Returns "" on success.          |
+string ModifyOneLeg(ulong ticket, double sl, double tp)
+  {
+   if(!PositionSelectByTicket(ticket))
+      return StringFormat("ticket %s not found", IntegerToString((long)ticket));
+
    string symbol = PositionGetString(POSITION_SYMBOL);
-   int    digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
    MqlTradeRequest req;
    MqlTradeResult  res;
@@ -294,20 +619,49 @@ string HandleModify(string json)
                                         PositionGetDouble(POSITION_PRICE_CURRENT),
                                         req.sl, req.tp);
    if(stopsErr != "")
-      return JsonError(stopsErr);
+      return stopsErr;
 
    if(!OrderSend(req, res))
-      return JsonError(StringFormat("SLTP failed to submit: retcode=%d %s (last_error=%d)",
-                                    (int)res.retcode, res.comment, GetLastError()));
+      return StringFormat("SLTP failed to submit: retcode=%d %s (last_error=%d)",
+                          (int)res.retcode, res.comment, GetLastError());
 
    // 10025 means the levels already match what was asked for. MQL4's
    // OrderModify returned false with error 1 for the same case; either way it
    // is the outcome MODIFY wanted, so it is not an error.
    if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_NO_CHANGES)
-      return JsonError(StringFormat("SLTP rejected: retcode=%d %s",
-                                    (int)res.retcode, res.comment));
+      return StringFormat("SLTP rejected: retcode=%d %s", (int)res.retcode, res.comment);
 
-   return "{\"status\":\"ok\"}";
+   return "";
+  }
+
+//| Every leg of a split position, or an error naming the ones that     |
+//| refused. Partial success is reported as an ERROR on purpose: a      |
+//| group whose legs hold different stops is a position whose real risk |
+//| nobody knows, and the hub marking the MODIFY as done would hide it. |
+string ModifyEveryLeg(ulong &legs[], int n, double sl, double tp)
+  {
+   int    moved  = 0;
+   string failed = "";
+   for(int i = 0; i < n; i++)
+     {
+      string err = ModifyOneLeg(legs[i], sl, tp);
+      if(err == "")
+        {
+         moved++;
+         continue;
+        }
+      if(failed != "")
+         failed += "; ";
+      failed += IntegerToString((long)legs[i]) + ": " + err;
+     }
+
+   if(failed != "")
+      return JsonError(StringFormat(
+         "group %s: %d of %d legs took the new levels, %d refused -- the legs now "
+         "hold DIFFERENT stops. %s", IntegerToString((long)legs[0]), moved, n,
+         n - moved, failed));
+
+   return "{\"status\":\"ok\",\"legs\":" + IntegerToString(n) + "}";
   }
 
 //+------------------------------------------------------------------+
@@ -315,22 +669,60 @@ string HandleClose(string json)
   {
    ulong ticket = JsonGetTicket(json, "ticket");
 
-   if(!PositionSelectByTicket(ticket))
+   // Resolved BEFORE the already-closed check, because a leader closed by
+   // hand must not be reported as a finished CLOSE while nine legs behind it
+   // are still open -- the registry row would go to CLOSED and nothing would
+   // be tracking them.
+   ulong legs[];
+   int   n = ResolveGroupLegs(ticket, legs);
+   if(n > 1)
+      return CloseEveryLeg(ticket, legs, n);
+
+   if(n == 0)
      {
       // Already flat -- closed by hand, or its SL/TP fired before the
       // master's CLOSE arrived. That is the outcome CLOSE was asking for, so
       // report success: an error here leaves the registry row stuck at OPEN.
       // See the PORT NOTE in HandleModify for why this needs history.
+      GroupForget(ticket);
       if(PositionExistedAndClosed(ticket))
          return "{\"status\":\"ok\",\"already_closed\":true,\"slave_ticket\":"
               + IntegerToString((long)ticket) + "}";
       return JsonError("ticket " + IntegerToString((long)ticket) + " not found");
      }
 
+   // One leg, which may be the sole survivor of a group rather than the
+   // leader the hub asked for; close what exists either way.
+   ticket = legs[0];
+   if(!PositionSelectByTicket(ticket))
+      return JsonError("ticket " + IntegerToString((long)ticket) + " vanished mid-close");
+
+   GroupForget(legs[0]);
+
+   double price  = 0.0;
+   int    digits = 0;
+   string err    = "";
+   if(!CloseOneLeg(ticket, price, digits, err))
+      return JsonError(err);
+
+   return "{\"status\":\"ok\",\"price\":" + DoubleToString(price, digits) + "}";
+  }
+
+//| One leg closed. Shared by the single-position path and the group    |
+//| path. `digits` comes back because the symbol is gone by the time    |
+//| the caller formats the price.                                        |
+bool CloseOneLeg(ulong ticket, double &price, int &digits, string &err)
+  {
+   if(!PositionSelectByTicket(ticket))
+     {
+      err = StringFormat("ticket %s not found", IntegerToString((long)ticket));
+      return false;
+     }
+
    string symbol = PositionGetString(POSITION_SYMBOL);
    double volume = PositionGetDouble(POSITION_VOLUME);
    bool   isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
-   int    digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
    //--- PORT NOTE: MQL5 has no OrderClose(). A position is closed by sending
    // an opposing deal that names it in `position` -- without that field the
@@ -352,30 +744,81 @@ string HandleClose(string json)
    req.type_filling = PickFilling(symbol);
 
    if(!OrderSend(req, res))
-      return JsonError(StringFormat("close failed to submit: retcode=%d %s (last_error=%d)",
-                                    (int)res.retcode, res.comment, GetLastError()));
+     {
+      err = StringFormat("close failed to submit: retcode=%d %s (last_error=%d)",
+                         (int)res.retcode, res.comment, GetLastError());
+      return false;
+     }
 
    if(res.retcode == TRADE_RETCODE_DONE_PARTIAL)
      {
-      // Deliberately an error. The hub marks the registry row CLOSED on
+      // Deliberately a failure. The hub marks the registry row CLOSED on
       // success, which would abandon the remaining volume with nothing
       // tracking it. Reporting failure keeps the row OPEN and puts the
       // leftover in front of a human.
       double left = PositionSelectByTicket(ticket) ? PositionGetDouble(POSITION_VOLUME) : 0.0;
-      return JsonError(StringFormat(
+      err = StringFormat(
          "close only partially filled: %.2f of %.2f lots remain on ticket %s",
-         left, volume, IntegerToString((long)ticket)));
+         left, volume, IntegerToString((long)ticket));
+      return false;
      }
 
    if(res.retcode != TRADE_RETCODE_DONE)
-      return JsonError(StringFormat("close rejected: retcode=%d %s",
-                                    (int)res.retcode, res.comment));
+     {
+      err = StringFormat("close rejected: retcode=%d %s", (int)res.retcode, res.comment);
+      return false;
+     }
 
    // The deal price, not the price requested: the difference is the exit
    // slippage, and it is reported once or not at all. OPEN already does
    // this via res.price.
-   double closed = (res.price > 0.0) ? res.price : req.price;
-   return "{\"status\":\"ok\",\"price\":" + DoubleToString(closed, digits) + "}";
+   price = (res.price > 0.0) ? res.price : req.price;
+   return true;
+  }
+
+//| Every leg of a split position. Any leg left open is an ERROR, even  |
+//| if nine of ten closed: the hub marks the registry row CLOSED on     |
+//| success, and a row marked closed over a live position is how volume |
+//| ends up on an account with nothing tracking it. Failing keeps the   |
+//| row OPEN and names the tickets.                                      |
+string CloseEveryLeg(ulong leader, ulong &legs[], int n)
+  {
+   GroupForget(leader);
+
+   int    closed  = 0;
+   int    digits  = 0;
+   double costSum = 0.0;
+   double lotsSum = 0.0;
+   string stuck   = "";
+
+   for(int i = 0; i < n; i++)
+     {
+      // Read the size before closing it; afterwards the position is gone.
+      double lots = PositionSelectByTicket(legs[i])
+                    ? PositionGetDouble(POSITION_VOLUME) : 0.0;
+      double price = 0.0;
+      string err   = "";
+      if(CloseOneLeg(legs[i], price, digits, err))
+        {
+         closed++;
+         costSum += price * lots;
+         lotsSum += lots;
+         continue;
+        }
+      if(stuck != "")
+         stuck += "; ";
+      stuck += IntegerToString((long)legs[i]) + ": " + err;
+     }
+
+   if(stuck != "")
+      return JsonError(StringFormat(
+         "group %s: closed %d of %d legs, %d STILL OPEN -- %s",
+         IntegerToString((long)leader), closed, n, n - closed, stuck));
+
+   double vwap = (lotsSum > 0.0) ? costSum / lotsSum : 0.0;
+   return "{\"status\":\"ok\",\"price\":" + DoubleToString(vwap, digits)
+        + ",\"lots\":" + DoubleToString(lotsSum, 2)
+        + ",\"legs\":" + IntegerToString(closed) + "}";
   }
 
 //+------------------------------------------------------------------+
@@ -391,8 +834,21 @@ string HandleClose(string json)
 //+------------------------------------------------------------------+
 string HandlePositions()
   {
-   string items = "";
-   int    n     = 0;
+   // Accumulated per GROUP, not per position: a split position is one thing
+   // the hub is tracking under one ticket, and reporting its ten legs
+   // separately would make reconciliation see nine untracked positions and
+   // warn about volume that is already accounted for.
+   ulong  keys[];      // the group leader's ticket, which is what the hub holds
+   string syms[];
+   double qty[];       // signed, summed
+   double absLots[];   // for the volume-weighted average entry
+   double cost[];
+   double pnl[];
+   double slv[];
+   double tpv[];
+   int    legs[];
+   int    digs[];
+   int    g = 0;
 
    for(int i = 0; i < PositionsTotal(); i++)
      {
@@ -400,35 +856,78 @@ string HandlePositions()
       if(ticket == 0)
          continue;
 
-      string symbol = PositionGetString(POSITION_SYMBOL);
-      double lots   = PositionGetDouble(POSITION_VOLUME);
-      bool   isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
-      int    digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-
-      if(n > 0)
-         items += ",";
-
-      // Signed quantity, matching the hub's Position.quantity convention.
-      double qty = isLong ? lots : -lots;
+      string symbol  = PositionGetString(POSITION_SYMBOL);
+      string comment = PositionGetString(POSITION_COMMENT);
+      double lots    = PositionGetDouble(POSITION_VOLUME);
+      bool   isLong  = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+      double open    = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl      = PositionGetDouble(POSITION_SL);
+      double tp      = PositionGetDouble(POSITION_TP);
 
       //--- PORT NOTE: MQL4 had OrderCommission() on the order itself. In MQL5
       // commission lives on the deals, not the position, so including it
       // would mean a HistorySelectByPosition() per position on a read the
       // dashboard polls every 5s. Profit + swap it is; the figure is a few
       // cents off the realisable amount rather than wrong.
-      double pnl = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
 
-      items += "{\"ticket\":" + IntegerToString((long)ticket)
-             + ",\"symbol\":\"" + symbol + "\""
-             + ",\"quantity\":" + DoubleToString(qty, 2)
-             + ",\"average_price\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN), digits)
+      ulong leader = GroupLeaderOf(ticket, comment);
+
+      int k = -1;
+      for(int j = 0; j < g; j++)
+         if(keys[j] == leader)
+           {
+            k = j;
+            break;
+           }
+      if(k < 0)
+        {
+         k = g;
+         g++;
+         ArrayResize(keys, g);    ArrayResize(syms, g);    ArrayResize(qty, g);
+         ArrayResize(absLots, g); ArrayResize(cost, g);    ArrayResize(pnl, g);
+         ArrayResize(slv, g);     ArrayResize(tpv, g);     ArrayResize(legs, g);
+         ArrayResize(digs, g);
+         keys[k] = leader;
+         syms[k] = symbol;
+         qty[k] = 0.0; absLots[k] = 0.0; cost[k] = 0.0; pnl[k] = 0.0;
+         slv[k] = 0.0; tpv[k] = 0.0; legs[k] = 0;
+         digs[k] = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+        }
+
+      // Signed quantity, matching the hub's Position.quantity convention.
+      qty[k]     += isLong ? lots : -lots;
+      absLots[k] += lots;
+      cost[k]    += open * lots;
+      pnl[k]     += profit;
+      legs[k]    += 1;
+      // The leader's own levels win. A follower fills them in only while they
+      // are unset, so a group mid-MODIFY reports a level rather than nothing.
+      if(ticket == leader || (slv[k] == 0.0 && sl > 0.0))
+         slv[k] = sl;
+      if(ticket == leader || (tpv[k] == 0.0 && tp > 0.0))
+         tpv[k] = tp;
+     }
+
+   string items = "";
+   for(int k = 0; k < g; k++)
+     {
+      if(k > 0)
+         items += ",";
+      double avg = (absLots[k] > 0.0) ? cost[k] / absLots[k] : 0.0;
+      items += "{\"ticket\":" + IntegerToString((long)keys[k])
+             + ",\"symbol\":\"" + syms[k] + "\""
+             + ",\"quantity\":" + DoubleToString(qty[k], 2)
+             + ",\"average_price\":" + DoubleToString(avg, digs[k])
              // Reported so the hub can confirm a MODIFY landed; 0 means "not
              // set", which the hub reads as None rather than a stop at zero.
-             + ",\"sl\":" + DoubleToString(PositionGetDouble(POSITION_SL), digits)
-             + ",\"tp\":" + DoubleToString(PositionGetDouble(POSITION_TP), digits)
-             + ",\"unrealized_pnl\":" + DoubleToString(pnl, 2)
+             + ",\"sl\":" + DoubleToString(slv[k], digs[k])
+             + ",\"tp\":" + DoubleToString(tpv[k], digs[k])
+             + ",\"unrealized_pnl\":" + DoubleToString(pnl[k], 2)
+             // Extra, and ignored by an older hub: how many real positions
+             // this one row stands for.
+             + ",\"legs\":" + IntegerToString(legs[k])
              + "}";
-      n++;
      }
 
    return "{\"status\":\"ok\",\"positions\":[" + items + "]}";
@@ -723,7 +1222,8 @@ ENUM_ORDER_TYPE_FILLING PickFilling(const string symbol)
 //| hub had sized, announced only by a Print. Flooring can reach zero  |
 //| instead, which then lands on the below-minimum refusal below,      |
 //| where an operator sees it.                                         |
-double NormalizeVolume(const string symbol, double lots, string &err)
+double NormalizeVolume(const string symbol, double lots, string &err,
+                       bool allowAboveMax = false)
   {
    double vmin = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    double vmax = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
@@ -752,10 +1252,11 @@ double NormalizeVolume(const string symbol, double lots, string &err)
                          lots, symbol, vmin);
       return 0.0;
      }
-   if(vmax > 0.0 && v > vmax + 1e-8)
+   if(vmax > 0.0 && v > vmax + 1e-8 && !allowAboveMax)
      {
-      err = StringFormat("lots %.4f exceeds %s maximum %.4f -- this EA does not split "
-                         "an order across deals", lots, symbol, vmax);
+      err = StringFormat("lots %.4f exceeds %s maximum %.4f -- set AllowVolumeSplit "
+                         "to open it as several deals held together as one group",
+                         lots, symbol, vmax);
       return 0.0;
      }
    return v;
