@@ -12,6 +12,44 @@ class SizingResult:
     reason: Optional[str] = None
 
 
+# Keys that belong to one sizing mode alone. Dropped when a route switches
+# mode, so a merged config never carries a size instruction from a mode that
+# is no longer in force. Deliberately narrow: capital_base, fixed_offset and
+# fixed_amount are NOT here, because the max_risk_pct ceiling reads them too
+# whatever the mode is.
+_MODE_ONLY_KEYS = {
+    "fixed_contracts": {"contracts"},
+    "lot_multiplier": {"multiplier"},
+    "dollar_notional": {"notional"},
+    "pct_risk": {"risk_pct"},
+}
+
+
+def merge_sizing(base: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Layer a route's sizing over the slave's default.
+
+    The slave's sizing is the default and the route is the exception, so a
+    slave-wide guard such as max_risk_pct stays in force unless the route
+    deliberately changes it. To switch it off, a route sets it to null
+    explicitly -- an absent key means "inherit", which is the whole point,
+    so silence cannot mean "no ceiling".
+
+    When the route changes mode, the previous mode's own size key is
+    dropped: a leftover `contracts` sitting under a dollar_notional config
+    is confusing in a log and one refactor away from being read.
+    """
+    if not override:
+        return dict(base)
+    merged = dict(base)
+    base_mode = base.get("mode")
+    new_mode = override.get("mode", base_mode)
+    if new_mode != base_mode:
+        for key in _MODE_ONLY_KEYS.get(base_mode, ()):  # type: ignore[arg-type]
+            merged.pop(key, None)
+    merged.update(override)
+    return merged
+
+
 def resolve_sizing_config(slave_config: Dict[str, Any], target_symbol: str) -> Dict[str, Any]:
     """Sizing config can be shared across all of a slave's targets, or
     overridden per target symbol, e.g.:
@@ -22,7 +60,10 @@ def resolve_sizing_config(slave_config: Dict[str, Any], target_symbol: str) -> D
     sizing = slave_config.get("sizing", {})
     if target_symbol in sizing:
         return sizing[target_symbol]
-    return sizing
+    # Falling back to the shared block. Strip any per-target entries out of
+    # it: in the per-target form those are sibling symbols' configs, and
+    # merging them in as if they were settings is nonsense.
+    return {k: v for k, v in sizing.items() if not isinstance(v, dict)}
 
 
 def capital_base_amount(
@@ -88,12 +129,24 @@ def compute_size(
     mode = sizing_config.get("mode")
 
     if mode == "fixed_contracts":
+        if "contracts" not in sizing_config:
+            return SizingResult(
+                size=0, skipped=True,
+                reason="fixed_contracts sizing has no `contracts` -- a route "
+                       "switched mode without saying how big the position is",
+            )
         size = float(sizing_config["contracts"])
 
     elif mode == "lot_multiplier":
         size = master_lots * float(sizing_config.get("multiplier", 1.0))
 
     elif mode == "dollar_notional":
+        if "notional" not in sizing_config:
+            return SizingResult(
+                size=0, skipped=True,
+                reason="dollar_notional sizing has no `notional` -- a route "
+                       "switched mode without saying how big the position is",
+            )
         notional = float(sizing_config["notional"])
         if entry_price <= 0:
             return SizingResult(size=0, skipped=True, reason="entry price is zero")
@@ -110,6 +163,12 @@ def compute_size(
             float(sizing_config.get("fixed_offset", 0.0)),
             float(sizing_config.get("fixed_amount", 0.0)),
         )
+        if "risk_pct" not in sizing_config:
+            return SizingResult(
+                size=0, skipped=True,
+                reason="pct_risk sizing has no `risk_pct` -- a route switched "
+                       "mode without saying how much to risk",
+            )
         risk_amount = capital_base * float(sizing_config["risk_pct"])
         stop_distance = abs(entry_price - stop_price)
         if stop_distance <= 0:

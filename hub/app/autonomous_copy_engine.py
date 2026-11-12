@@ -12,7 +12,9 @@ from app.models import Signal
 from app.notifier import Notifier
 from app.risk_controls import is_within_trading_hours
 from app.session_gate import SessionGateMixin
-from app.sizing import compute_size, resolve_risk_scale, resolve_sizing_config
+from app.sizing import (
+    compute_size, merge_sizing, resolve_risk_scale, resolve_sizing_config,
+)
 from app.contract_roll import roll_sequence, volume_crossover
 from app import position_store
 from app.routing import Route, describe_refusal, resolve_routes
@@ -278,7 +280,13 @@ class AutonomousCopyEngine(SessionGateMixin):
         account_type = "futures" if spec else "brokerage"
         account = await self.adapter.get_account_summary(account_type)
 
-        sizing_config = route.sizing or resolve_sizing_config(self.slave_config, target_symbol)
+        # Layered, not replaced: a slave-wide guard such as max_risk_pct
+        # stays in force unless this route deliberately overrides it. The
+        # old `route.sizing or <slave>` dropped the whole slave block the
+        # moment a route mentioned sizing at all, so every new futures route
+        # was a chance to lose the risk gate silently.
+        sizing_config = merge_sizing(
+            resolve_sizing_config(self.slave_config, target_symbol), route.sizing)
         # Resolved separately from the sizing block on purpose: route.sizing
         # REPLACES the slave's, so a scale living inside it would have to be
         # restated by every route that overrides sizing at all.
