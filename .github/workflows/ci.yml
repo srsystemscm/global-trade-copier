@@ -43,6 +43,7 @@ jobs:
           cache-dependency-path: |
             hub/requirements.txt
             hub/requirements-dev.txt
+            hub/constraints.txt
 
       - name: Install dependencies
         working-directory: hub
@@ -57,9 +58,18 @@ jobs:
         # This is the first thing CI found. The claim here used to be that
         # nothing in the suite needed a broker library, which was true only
         # because the development venv happened to have one installed.
+        #
+        # -c constraints.txt is the second thing it found, and the larger
+        # one. requirements.txt asks for `>=` on everything, so without
+        # constraints "install the dependencies" means "install whatever is
+        # newest today" -- and the run that first got this far resolved
+        # anyio 4.16 against 4.14 locally, starlette 1.10 against 1.3 and
+        # fastapi 0.162 against 0.139, then hung until the job timed out.
+        # CI has to install the set the suite is green on, or a red run says
+        # nothing about the code.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -r requirements.txt -r requirements-dev.txt -c constraints.txt
 
       - name: Run the test suite
         working-directory: hub
@@ -68,7 +78,19 @@ jobs:
         # Flex, Schwab, the Operations hub reporter -- is inert without one,
         # and a test that only passed because this machine had a credential
         # would be a test that passes for the wrong reason.
-        run: python -m pytest tests/ -q
+        #
+        # --timeout turns a hung test into a named failure. Without it, the
+        # run that hung reported only that the job was cancelled twenty
+        # minutes later, which says nothing about which test did it. 120s
+        # against a slowest test of ~17s is seven times the headroom
+        # locally and still several times it on a slower runner.
+        #
+        # --durations is how the next person notices the suite getting
+        # slower before it gets slow enough to matter.
+        run: >-
+          python -m pytest tests/ -q -rf
+          --timeout=120 --timeout-method=thread
+          --durations=10
 
   ui:
     name: dashboard build
