@@ -23,7 +23,7 @@ from app.sizing import (
     resolve_sizing_config,
 )
 from app.contract_roll import roll_sequence, volume_crossover
-from app import position_store
+from app import deferred_store, position_store
 from app.routing import (
     Route, configured_targets, describe_refusal, resolve_routes,
 )
@@ -191,7 +191,7 @@ class AutonomousCopyEngine(SessionGateMixin):
         self._deferred_close_task: Optional[asyncio.Task] = None
 
     async def restore(self) -> None:
-        """Reload positions that were open when the hub last stopped.
+        """Reload what was in flight when the hub last stopped.
 
         Called before the engine starts consuming signals, so a restart is
         invisible to a position's lifecycle: the trailing monitor picks it
@@ -217,6 +217,110 @@ class AutonomousCopyEngine(SessionGateMixin):
         if restored:
             logger.info("slave=%s restored %d open position(s) across the restart",
                         self.slave_id, restored)
+
+        self._restore_deferred_opens()
+        self._restore_deferred_closes()
+
+    def _forget_deferred(self, kind: str, key: tuple) -> None:
+        """Drop one held action from disk, given the engine's own key.
+
+        The two queues key differently -- an open by target and month slot,
+        a close by symbol -- so the slot comes off the key for an open and
+        is zero for a close.
+        """
+        account, ticket, slave_symbol = key[0], key[1], key[2]
+        month_slot = key[3] if kind == deferred_store.OPEN and len(key) > 3 else 0
+        deferred_store.delete(self.slave_id, kind, account, ticket,
+                              slave_symbol, month_slot)
+
+    def _restore_deferred_opens(self) -> None:
+        """Rebuild the held-open queue, re-resolving each route from config.
+
+        The route is re-derived rather than restored from disk, so a config
+        edited while the hub was down wins: if the route is gone, so is the
+        deferred open. Opening into a route nobody has any more would be
+        the copier acting on an instruction that has since been withdrawn.
+
+        Nothing is retried here. The deferral loop owns that, and it
+        applies the ceiling on its next pass -- so an entry held past
+        `defer_max_seconds` while the hub was down is abandoned loudly
+        rather than filled hours late at a price nobody chose. Loud is the
+        improvement: before this it was simply lost.
+        """
+        rows = deferred_store.load_all(self.slave_id, deferred_store.OPEN)
+        restored = dropped = 0
+        for row in rows:
+            route = self._route_for(row.signal, row.slave_symbol, row.month_slot)
+            if route is None:
+                logger.warning(
+                    "slave=%s dropping the deferred open of %s for "
+                    "master_ticket=%s: no route to it in this slave's config "
+                    "any more",
+                    self.slave_id, row.slave_symbol, row.signal.ticket,
+                )
+                self._forget_deferred(deferred_store.OPEN, row.key)
+                dropped += 1
+                continue
+            self._deferred[row.key] = row.as_item(route=route)
+            restored += 1
+
+        if restored or dropped:
+            logger.warning(
+                "slave=%s restored %d deferred open(s) across the restart "
+                "(%d dropped as unrouted); the deferral loop will retry or "
+                "abandon each on its next pass",
+                self.slave_id, restored, dropped,
+            )
+
+    def _route_for(self, signal: Signal, target: str, month_slot: int):
+        """The route this signal takes to `target`, as configured NOW."""
+        for route in resolve_routes(self.slave_config, signal):
+            if route.target == target and route.month_slot == month_slot:
+                return route
+        return None
+
+    def _restore_deferred_closes(self) -> None:
+        """Rebuild the held-close queue, re-reading each mapping.
+
+        The mapping comes from the registry rather than from disk: if the
+        row is no longer OPEN, something has already resolved this exit --
+        reconciliation marking it closed, or a later close that succeeded --
+        and retrying would send a closing order for a position that is not
+        there. On a netting account that opens a reverse position rather
+        than closing anything.
+        """
+        rows = deferred_store.load_all(self.slave_id, deferred_store.CLOSE)
+        restored = dropped = 0
+        for row in rows:
+            mapping = next(
+                (m for m in trade_registry.get_open_mappings(
+                    self.slave_id, row.signal.account, row.signal.ticket)
+                 if m.slave_symbol == row.slave_symbol),
+                None,
+            )
+            if mapping is None:
+                logger.info(
+                    "slave=%s dropping the deferred close of %s for "
+                    "master_ticket=%s: the registry no longer holds it open, "
+                    "so something has already resolved it",
+                    self.slave_id, row.slave_symbol, row.signal.ticket,
+                )
+                self._forget_deferred(deferred_store.CLOSE, row.key)
+                dropped += 1
+                continue
+            self._deferred_closes[row.key] = row.as_item(mapping=mapping)
+            restored += 1
+
+        if restored:
+            logger.error(
+                "slave=%s restored %d deferred close(s) across the restart -- "
+                "this slave is STILL HOLDING %d position(s) the master has "
+                "exited, and will keep trying to close them",
+                self.slave_id, restored, restored,
+            )
+        if dropped:
+            logger.info("slave=%s dropped %d deferred close(s) already resolved",
+                        self.slave_id, dropped)
 
     def start(self) -> None:
         self._consume_task = asyncio.create_task(self._run(), name=f"autonomous-engine-{self.slave_id}")
@@ -1125,6 +1229,12 @@ class AutonomousCopyEngine(SessionGateMixin):
             "first_at": now, "next_at": now + self.defer_retry_seconds,
             "attempts": 1, "last_error": str(exc),
         }
+        # To disk as well as to memory. A halt lasts an hour and Gateway
+        # restarts daily, so "the hub was restarted while this was held" is
+        # an ordinary Tuesday rather than a corner case.
+        deferred_store.save(self.slave_id, deferred_store.OPEN, signal,
+                            route.target, self._deferred[key],
+                            month_slot=route.month_slot)
         logger.warning(
             "slave=%s deferring %s for master_ticket=%s, retrying every %ss for up "
             "to %ss: %s",
@@ -1164,6 +1274,7 @@ class AutonomousCopyEngine(SessionGateMixin):
 
                 if now - item["first_at"] > self.defer_max_seconds:
                     del self._deferred[key]
+                    self._forget_deferred(deferred_store.OPEN, key)
                     await self._abandon_deferred(key, item)
                     continue
 
@@ -1174,9 +1285,18 @@ class AutonomousCopyEngine(SessionGateMixin):
                 except AdapterError as exc:
                     item["last_error"] = str(exc)
                     item["next_at"] = now + self.defer_retry_seconds
+                    # Rewritten on every attempt, so a restart resumes the
+                    # retry schedule instead of starting the clock again --
+                    # which would extend the ceiling past what was
+                    # configured, one restart at a time.
+                    deferred_store.save(
+                        self.slave_id, deferred_store.OPEN, item["signal"],
+                        item["route"].target, item,
+                        month_slot=item["route"].month_slot)
                     continue
 
                 del self._deferred[key]
+                self._forget_deferred(deferred_store.OPEN, key)
                 waited = now - item["first_at"]
                 logger.info(
                     "slave=%s opened deferred %s for master_ticket=%s after %.0fs "
@@ -1217,6 +1337,10 @@ class AutonomousCopyEngine(SessionGateMixin):
         stale = [k for k in self._deferred if k[0] == account and k[1] == master_ticket]
         for k in stale:
             del self._deferred[k]
+        # Dropped from disk by ticket rather than per key: a restart must
+        # not resurrect an entry for a trade the master has already closed,
+        # which is the copier putting on risk entirely by itself.
+        deferred_store.delete_for_ticket(self.slave_id, account, master_ticket)
         return len(stale)
 
     async def _abandon_unfilled_entry(self, account: str, master_ticket: int,
@@ -1352,6 +1476,13 @@ class AutonomousCopyEngine(SessionGateMixin):
             "next_at": now + self.defer_close_retry_seconds,
             "attempts": 1, "last_error": str(exc),
         }
+        # The one that matters most. This waits up to 72 hours by default,
+        # because a Friday evening exit legitimately waits for Monday --
+        # and losing it leaves this slave holding a position the master has
+        # exited, which reconciliation cannot find either: the registry
+        # says OPEN and the broker agrees.
+        deferred_store.save(self.slave_id, deferred_store.CLOSE, signal,
+                            mapping.slave_symbol, self._deferred_closes[key])
         logger.warning(
             "slave=%s deferring the close of %s slave_ticket=%s -- STILL HOLDING "
             "a position the master has exited. Retrying every %ss for up to %ss: %s",
@@ -1389,6 +1520,7 @@ class AutonomousCopyEngine(SessionGateMixin):
                 signal, mapping = item["signal"], item["mapping"]
                 if now - item["first_at"] > self.defer_close_max_seconds:
                     del self._deferred_closes[key]
+                    self._forget_deferred(deferred_store.CLOSE, key)
                     await self._abandon_deferred_close(key, item)
                     continue
 
@@ -1399,12 +1531,16 @@ class AutonomousCopyEngine(SessionGateMixin):
                     # The entry was cancelled in the meantime, so there is
                     # nothing to exit after all.
                     del self._deferred_closes[key]
+                    self._forget_deferred(deferred_store.CLOSE, key)
                     logger.warning("slave=%s %s", self.slave_id, exc)
                     self._finish_close(signal, mapping, cancelled=True)
                     continue
                 except AdapterError as exc:
                     item["last_error"] = str(exc)
                     item["next_at"] = now + self.defer_close_retry_seconds
+                    deferred_store.save(
+                        self.slave_id, deferred_store.CLOSE, signal,
+                        mapping.slave_symbol, item)
                     logger.warning(
                         "slave=%s still cannot close %s slave_ticket=%s "
                         "(attempt %d, holding for %.0fs): %s",
@@ -1414,6 +1550,7 @@ class AutonomousCopyEngine(SessionGateMixin):
                     continue
 
                 del self._deferred_closes[key]
+                self._forget_deferred(deferred_store.CLOSE, key)
                 waited = now - item["first_at"]
                 logger.info(
                     "slave=%s closed deferred %s slave_ticket=%s after %.0fs and "

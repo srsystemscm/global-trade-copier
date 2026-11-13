@@ -139,6 +139,49 @@ CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs (ts);
 -- queue time. Rebuilding it at send time would read engine state that has
 -- since moved on, which is how a resend after an outage comes to disagree
 -- with what actually happened.
+-- Opens and closes the broker could not take yet, held for retry.
+--
+-- These lived only in the engine's memory, and the comments where they were
+-- built said so: "a hub restart mid-halt loses them". That is a daily
+-- exposure rather than a rare one. CME halts its whole complex for an hour
+-- every day and an MT4 server on GMT+2/+3 opens its daily bar right on that
+-- boundary, so a D1 strategy's entry lands inside the halt roughly daily --
+-- and IB Gateway forces a restart once a day, which the hub restarts with.
+--
+-- The CLOSE side is the worse loss. A deferred close waits up to 72 hours by
+-- default, because a Friday evening exit legitimately waits for Monday, and
+-- losing one leaves this slave holding a position the master has exited with
+-- nothing left retrying it. Reconciliation cannot find it either: the
+-- registry says OPEN and the broker agrees, since nothing recorded the
+-- master's exit.
+--
+-- What is stored is the SIGNAL plus the key, not the resolved route or the
+-- registry mapping. Both of those are re-derived at restore time, so a route
+-- that gained a field does not leave stale JSON behind, and a config edited
+-- while the hub was down is honoured rather than overridden by a snapshot of
+-- how things used to be.
+--
+-- `slave_symbol` is the route's target for an OPEN and the mapping's own
+-- symbol for a CLOSE; `month_slot` is 0 for a CLOSE. Together they are the
+-- same keys the engine's two in-memory dicts use.
+CREATE TABLE IF NOT EXISTS deferred_actions (
+    slave_id        TEXT    NOT NULL,
+    kind            TEXT    NOT NULL,      -- OPEN | CLOSE
+    master_account  TEXT    NOT NULL DEFAULT '',
+    master_ticket   INTEGER NOT NULL,
+    slave_symbol    TEXT    NOT NULL,
+    month_slot      INTEGER NOT NULL DEFAULT 0,
+    signal_json     TEXT    NOT NULL,
+    sl_mult         REAL,                  -- OPEN only: the master's intent
+    tp_mult         REAL,
+    first_at        REAL    NOT NULL,      -- when it was first deferred
+    next_at         REAL    NOT NULL,      -- when to try again
+    attempts        INTEGER NOT NULL DEFAULT 1,
+    last_error      TEXT,
+    updated_at      REAL    NOT NULL,
+    PRIMARY KEY (slave_id, kind, master_account, master_ticket, slave_symbol, month_slot)
+);
+
 -- The broker's own record of what executed, from an IBKR Activity Flex
 -- statement. Two systems that agree are worth something only if they were
 -- written down separately, and this is the separate one: everything else in
