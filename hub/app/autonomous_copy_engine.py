@@ -262,15 +262,51 @@ class AutonomousCopyEngine(SessionGateMixin):
         return round((at - (signal.received_at or signal.ts)) * 1000)
 
     async def _run(self) -> None:
+        # TEMPORARY INSTRUMENTATION -- do not merge. See the branch
+        # debug/cancel-instrumentation.
+        #
+        # The suite hangs on CI with this task in a state that says the
+        # CancelledError was DELIVERED and then consumed: cancelling()=1,
+        # _must_cancel=False, and suspended on a fresh uncancelled future.
+        # No handler in this repository swallows one, so the question is
+        # whether the error ever reaches this loop at all.
+        #
+        # Every except below logs and RE-RAISES, so behaviour is unchanged.
+        # `_diag_loops` says how many times the loop came round, which is
+        # how a swallow shows up: a loop count that grew after the cancel.
+        self._diag_loops = 0
         while True:
-            signal = await self.queue.get()
+            self._diag_loops += 1
+            logger.error("CANCEL-DIAG slave=%s loop=%d waiting on the queue",
+                         self.slave_id, self._diag_loops)
+            try:
+                signal = await self.queue.get()
+            except asyncio.CancelledError:
+                logger.error("CANCEL-DIAG slave=%s loop=%d cancel seen AT "
+                             "queue.get(), re-raising",
+                             self.slave_id, self._diag_loops)
+                raise
+            logger.error("CANCEL-DIAG slave=%s loop=%d got ticket=%s",
+                         self.slave_id, self._diag_loops, signal.ticket)
             if self.paused:
                 logger.debug("slave=%s paused, dropping %s ticket=%s", self.slave_id, signal.action, signal.ticket)
                 continue
-            if await self.refuse_while_down(signal):
+            try:
+                refused = await self.refuse_while_down(signal)
+            except asyncio.CancelledError:
+                logger.error("CANCEL-DIAG slave=%s loop=%d cancel seen in "
+                             "refuse_while_down, re-raising",
+                             self.slave_id, self._diag_loops)
+                raise
+            if refused:
                 continue
             try:
                 await self._handle(signal)
+            except asyncio.CancelledError:
+                logger.error("CANCEL-DIAG slave=%s loop=%d cancel seen while "
+                             "handling ticket=%s, re-raising",
+                             self.slave_id, self._diag_loops, signal.ticket)
+                raise
             except AdapterError as exc:
                 logger.error(
                     "slave=%s failed to handle %s ticket=%s: %s",
@@ -279,6 +315,8 @@ class AutonomousCopyEngine(SessionGateMixin):
                 await self._emit(
                     "slave_error", signal=signal, action=signal.action, message=str(exc)
                 )
+            logger.error("CANCEL-DIAG slave=%s loop=%d finished ticket=%s",
+                         self.slave_id, self._diag_loops, signal.ticket)
 
     async def _handle(self, signal: Signal) -> None:
         if signal.action == "MODIFY":
