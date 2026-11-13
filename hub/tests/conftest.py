@@ -99,7 +99,7 @@ def _cancel_state(task) -> str:
         bits.append("_fut_waiter=None (so __step must already be scheduled)")
     else:
         try:
-            bits.append(f"_fut_waiter done={waiter.done()} "
+            bits.append(f"_fut_waiter id:{id(waiter)} done={waiter.done()} "
                         f"cancelled={waiter.cancelled()}")
         except Exception:                          # pragma: no cover
             bits.append("_fut_waiter=<unreadable>")

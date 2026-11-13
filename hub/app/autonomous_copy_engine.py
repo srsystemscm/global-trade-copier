@@ -205,15 +205,47 @@ class AutonomousCopyEngine(SessionGateMixin):
         self._preflight_task = asyncio.create_task(
             self._preflight_routes(), name=f"autonomous-preflight-{self.slave_id}")
 
+    @staticmethod
+    def _diag_waiter(task) -> str:
+        """What a task is suspended on, with identity so it can be matched.
+
+        The hang shows a task with cancelling()=1 and _must_cancel=False --
+        which means cancel() took the `_fut_waiter.cancel()` branch and that
+        returned True -- yet the future in the dump is pending and
+        UNCANCELLED. Every path contradicts something, so the thing to
+        establish is whether the future cancel() acted on is the same object
+        still being waited on at hang time.
+        """
+        waiter = getattr(task, "_fut_waiter", None)
+        if waiter is None:
+            return "fut_waiter=None"
+        try:
+            return (f"fut_waiter=id:{id(waiter)} done={waiter.done()} "
+                    f"cancelled={waiter.cancelled()}")
+        except Exception:
+            return f"fut_waiter=id:{id(waiter)} <unreadable>"
+
     async def stop(self) -> None:
+        # TEMPORARY INSTRUMENTATION -- do not merge.
         for task in (self._consume_task, self._monitor_task, self._deferred_task,
                      self._deferred_close_task, self._preflight_task):
             if task is not None:
-                task.cancel()
+                logger.error(
+                    "CANCEL-DIAG stop BEFORE %s: cancelling()=%s _must_cancel=%s %s",
+                    task.get_name(), task.cancelling(),
+                    getattr(task, "_must_cancel", "?"), self._diag_waiter(task))
+                returned = task.cancel()
+                logger.error(
+                    "CANCEL-DIAG stop AFTER  %s: cancel()->%s cancelling()=%s "
+                    "_must_cancel=%s %s",
+                    task.get_name(), returned, task.cancelling(),
+                    getattr(task, "_must_cancel", "?"), self._diag_waiter(task))
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
+                logger.error("CANCEL-DIAG stop AWAITED %s: done=%s",
+                             task.get_name(), task.done())
         for task in list(self._fill_tasks):
             task.cancel()
             try:
