@@ -1,15 +1,32 @@
-fastapi>=0.111
-uvicorn[standard]>=0.30
-pyzmq>=26.0
-pydantic>=2.7
-pydantic-settings>=2.3
-python-dotenv>=1.0
-httpx>=0.27
-pytest>=8.0
-python-multipart>=0.0.9
+# What a hub installs. PINNED, not `>=`.
+#
+# This file asked for `>=` on everything until CI proved why that is not
+# good enough: a clean machine resolved anyio 4.16 against 4.14, starlette
+# 1.10 against 1.3 and fastapi 0.162 against 0.139, and the suite hung
+# until the job timed out. The same `pip install` on the VPS would have
+# done the same thing, silently, to a system that moves real money -- the
+# difference being that nothing there would have told anyone.
+#
+# So an upgrade is now a deliberate act: change a version here, regenerate
+# constraints.txt, run the suite, commit the result together. The pins here
+# must agree with constraints.txt, and tests/test_requirements.py fails if
+# they ever stop agreeing.
+fastapi==0.139.0
+uvicorn[standard]==0.50.0
+pyzmq==27.1.0
+pydantic==2.13.4
+pydantic-settings==2.14.2
+python-dotenv==1.2.2
+httpx==0.28.1
+pytest==9.1.1
+python-multipart==0.0.32
 
 # Optional -- only needed for IBKR slaves (app/adapters/ibkr.py lazy-imports
 # it, so the hub runs fine without it). ib_async is the maintained successor
 # to ib_insync, which was archived in March 2024; the adapter accepts either
 # but new installs should use ib_async.
-# ib_async>=1.0
+#
+# The TEST SUITE does need it -- several tests build a real IBKRAdapter --
+# so it is declared in requirements-dev.txt rather than here. Commented out
+# here on purpose: a deployment with no IBKR slave should not install it.
+# ib_async==2.1.0
