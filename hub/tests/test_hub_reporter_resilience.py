@@ -55,6 +55,50 @@ def _signal(ticket, action="OPEN"):
 # ============================================================ 1. off the path
 
 
+async def _copy_three(url, first_ticket, timeout_s=1.0):
+    """Copy three signals, with or without a reporter, and time it.
+
+    `url=None` means no reporter at all, which is the baseline the
+    with-reporter run is compared against.
+    """
+    events = EventBus()
+    bus = SignalBus(events=events)
+    broker = FakeBroker()
+    queue = bus.register_slave(SLAVE)
+    engine = CopyEngine(SLAVE, broker, queue, {}, events=events)
+
+    reporter = None
+    if url is not None:
+        reporter = HubReporter(
+            events, state(),
+            cfg(url, timeout_s=timeout_s, snapshot_interval_s=0.05,
+                debounce_s=0.0),
+        )
+        await reporter.start()
+        assert reporter.running, "the reporter is genuinely trying"
+
+    engine.start()
+    started = time.monotonic()
+    tickets = [first_ticket + n for n in range(3)]
+    for ticket in tickets:
+        await bus.publish_raw(_signal(ticket))
+    copied = await _until(lambda: len(broker.opened) == 3)
+    elapsed = time.monotonic() - started
+
+    tried = queued = True
+    if reporter is not None:
+        # Only after the copying has been timed, so these assertions are
+        # about a reporter that really ran rather than one that had not
+        # got going yet.
+        tried = await _until(lambda: reporter.consecutive_failures >= 1)
+        queued = await _until(lambda: len(pending_ids()) == 6)
+
+    await engine.stop()
+    if reporter is not None:
+        await reporter.stop()
+    return copied, elapsed, broker, reporter, tried, queued, tickets
+
+
 @pytest.mark.parametrize("hub_state", ["slow", "dead"])
 def test_copying_is_unaffected_by_a_hub_that_does_not_answer(hub_state):
     """Three signals copied in full while the reporter gets nowhere.
@@ -63,66 +107,56 @@ def test_copying_is_unaffected_by_a_hub_that_does_not_answer(hub_state):
     longer than the reporter's whole timeout -- the worse case, because a
     naive implementation blocks there rather than failing fast. "dead" is
     nothing listening at all.
+
+    The timing claim is COMPARATIVE, and it took three attempts to get
+    there. An absolute budget cannot work: the first version allowed 0.5s
+    against a 0.2s timeout and CI failed it at 0.56s; the second allowed
+    1.5s against a 1.0s timeout and CI failed it at 1.516s. Both times the
+    gap between "waited for a report" and "slow shared runner" was smaller
+    than the noise, so the test could not tell them apart in EITHER
+    direction -- it would have passed just as readily with a real
+    regression in it.
+
+    Copying the same three signals twice, once with no reporter at all,
+    removes machine speed from the claim. If the signal path awaited
+    reports, the second run would be about three timeouts slower than the
+    first. Anything inside the allowance below cannot have waited for even
+    one, however slow the machine is.
     """
-    # The hub's own cost of answering, against the reporter's own timeout.
-    # Both are set well above any plausible runner noise, because the
-    # assertion below is the discriminating one: if ANY part of the signal
-    # path awaited a report, one signal alone would cost a full timeout, and
-    # three would cost three. The budget has to be under that and above the
-    # time three copies legitimately take on a cold shared runner.
     with StubHub(delay=3.0) as slow:
         url = slow.url if hub_state == "slow" else f"http://127.0.0.1:{closed_port()}"
 
         async def go():
-            events = EventBus()
-            bus = SignalBus(events=events)
-            broker = FakeBroker()
-            queue = bus.register_slave(SLAVE)
-            engine = CopyEngine(SLAVE, broker, queue, {}, events=events)
-            reporter = HubReporter(
-                events, state(),
-                cfg(url, timeout_s=1.0, snapshot_interval_s=0.05, debounce_s=0.0),
-            )
-            await reporter.start()
-            assert reporter.running, "the reporter is genuinely trying"
-            engine.start()
+            # Both runs share one event loop: a Queue binds to the loop it
+            # is first used on, so two asyncio.run() calls would fail with
+            # "bound to a different event loop".
+            #
+            # Different ticket numbers because the registry keys on them
+            # and the second run must not collide with the first.
+            baseline = await _copy_three(None, 201)
+            measured = await _copy_three(url, 101)
+            return baseline, measured
 
-            started = time.monotonic()
-            for ticket in (101, 102, 103):
-                await bus.publish_raw(_signal(ticket))
-            copied = await _until(lambda: len(broker.opened) == 3)
-            elapsed = time.monotonic() - started
+        baseline, measured = asyncio.run(go())
 
-            # Only now, after the copying has been timed: the reporter is
-            # given long enough to have actually tried and failed, so the
-            # assertions below are about a reporter that was really running
-            # rather than one that had not got going yet.
-            tried = await _until(lambda: reporter.consecutive_failures >= 1)
-            queued = await _until(lambda: len(pending_ids()) == 6)
+    b_copied, b_elapsed, *_ = baseline
+    copied, elapsed, broker, reporter, tried, queued, tickets = measured
 
-            await engine.stop()
-            await reporter.stop()
-            return copied, elapsed, broker, reporter, tried, queued
-
-        copied, elapsed, broker, reporter, tried, queued = asyncio.run(go())
-
-    assert copied, "every signal was copied"
+    assert b_copied and copied, "every signal was copied, both times"
     assert [o["symbol"] for o in broker.opened] == ["US2000"] * 3
     assert [o["size"] for o in broker.opened] == [1.0] * 3
-    # The reporter's timeout is 1.0s, so one awaited report would cost a
-    # second and three would cost three. Anything under 1.5s therefore
-    # cannot have waited for even one of them, while leaving a cold shared
-    # runner more than twice the time three copies actually take.
-    #
-    # The first version of this asserted 0.5s against a 0.2s timeout, which
-    # CI failed at 0.56s -- and it was right to: at those numbers the
-    # difference between "waited for three reports" and "a slow runner" is
-    # 0.1s, so the test could not tell them apart in either direction. The
-    # structural check below this one is the real proof; this is the sanity
-    # bound, and a sanity bound has to be unambiguous rather than tight.
-    assert elapsed < 1.5, f"copying waited on the reporter ({elapsed:.2f}s)"
 
-    for ticket in (101, 102, 103):
+    # One awaited report costs a full timeout, so three cost about 3s. Half
+    # a second of allowance catches that six times over while absorbing any
+    # plausible difference between two runs on the same machine.
+    overhead = elapsed - b_elapsed
+    assert overhead < 0.5, (
+        f"copying took {elapsed:.2f}s with a dead reporter against "
+        f"{b_elapsed:.2f}s without one -- {overhead:.2f}s of it was spent "
+        f"waiting on the reporter"
+    )
+
+    for ticket in tickets:
         assert trade_registry.get_open_mappings(SLAVE, ACCT, ticket), (
             f"ticket {ticket} is not in the registry"
         )
