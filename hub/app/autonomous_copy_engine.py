@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
 import time
@@ -28,6 +29,26 @@ from app.routing import (
 )
 
 logger = logging.getLogger(__name__)
+
+# How long stop() waits for its tasks before abandoning them. Generous
+# enough that a task mid-await finishes unwinding, short enough that a
+# shutdown with several engines behind it still completes promptly.
+STOP_GRACE_SECONDS = 5.0
+
+# How long one cancellation gets before it is asked again.
+#
+# A cancellation can be LOST, and the measured race is specific: when
+# cancel() arrives in the window between a put() resolving the queue's
+# getter future and the consume task waking to take it, `_fut_waiter` is
+# already done. Future.cancel() therefore returns False, Task.cancel()
+# falls back to setting `_must_cancel = True` -- a deferred cancellation --
+# and that one goes missing. The task finishes what it was doing, loops
+# round, and parks on a FRESH future that nothing has cancelled.
+#
+# Asking again fixes it, because by then the task is parked on that new
+# future and Future.cancel() succeeds. Short, because the window closes
+# as soon as the task next parks.
+CANCEL_RETRY_SECONDS = 0.25
 
 
 @dataclass
@@ -163,6 +184,11 @@ class AutonomousCopyEngine(SessionGateMixin):
         self._consume_task: Optional[asyncio.Task] = None
         self._monitor_task: Optional[asyncio.Task] = None
         self._deferred_task: Optional[asyncio.Task] = None
+        # Declared here and not only in start(), because stop() reads it.
+        # An engine built but never started -- one whose restore() raised,
+        # or any caller that changes its mind -- made stop() die with
+        # AttributeError instead of shutting down.
+        self._deferred_close_task: Optional[asyncio.Task] = None
 
     async def restore(self) -> None:
         """Reload positions that were open when the hub last stopped.
@@ -206,20 +232,80 @@ class AutonomousCopyEngine(SessionGateMixin):
             self._preflight_routes(), name=f"autonomous-preflight-{self.slave_id}")
 
     async def stop(self) -> None:
-        for task in (self._consume_task, self._monitor_task, self._deferred_task,
-                     self._deferred_close_task, self._preflight_task):
-            if task is not None:
+        """Stop every background task. Bounded, because shutting down must
+        not be able to hang.
+
+        `stop_engine` is called from the app's lifespan AND from
+        `PATCH /slaves/{id}` and `DELETE /slaves/{id}`, so an unbounded
+        wait here is not only a slow shutdown -- it is an API request that
+        never answers, and a hub that cannot be restarted cleanly on a VPS
+        where IB Gateway forces a restart daily.
+
+        A task that will not stop within the grace period is reported and
+        abandoned. That is the right trade: whatever it is doing, it is not
+        worth holding every other engine's shutdown behind it.
+
+        This does NOT claim to fix the intermittent CI hang in the suite --
+        `asyncio.run()` cancels and awaits leftover tasks itself, so a task
+        that ignores cancellation hangs the teardown whether or not this
+        waited for it. It removes one way for the hub to hang, not that one.
+        """
+        tasks = [
+            task for task in (
+                self._consume_task, self._monitor_task, self._deferred_task,
+                self._deferred_close_task, self._preflight_task,
+            ) if task is not None
+        ]
+        # The background fill collectors too. They are cancelled alongside
+        # the loops rather than after them: nothing in a fill collector
+        # depends on a loop still running, and waiting for the two groups
+        # in sequence doubles the worst case for no gain.
+        tasks += list(self._fill_tasks)
+        if not tasks:
+            return
+
+        # Cancel, wait briefly, and ask again -- for as long as the grace
+        # period allows. Asking once is not enough: a cancellation that
+        # arrives while the task is about to collect a queue item is
+        # deferred and then lost, and the task parks on a fresh future
+        # nothing has cancelled. See CANCEL_RETRY_SECONDS.
+        finished = set()
+        pending = set(tasks)
+        deadline = time.monotonic() + STOP_GRACE_SECONDS
+        rounds = 0
+        while pending and time.monotonic() < deadline:
+            rounds += 1
+            for task in pending:
                 task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-        for task in list(self._fill_tasks):
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+            done, pending = await asyncio.wait(
+                pending, timeout=CANCEL_RETRY_SECONDS)
+            finished |= done
+
+        for task in finished:
+            # Retrieved so a task that died of something other than the
+            # cancellation does not surface later as "exception was never
+            # retrieved", which arrives with no stack worth reading.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                task.result()
+
+        if pending:
+            logger.error(
+                "slave=%s %d background task(s) did not stop within %.0fs and "
+                "have been abandoned: %s. The hub is shutting this engine "
+                "down anyway rather than holding everything behind it.",
+                self.slave_id, len(pending), STOP_GRACE_SECONDS,
+                ", ".join(sorted(t.get_name() for t in pending)),
+            )
+        elif rounds > 1:
+            # Worth a line: it means a cancellation went missing and the
+            # retry is what stopped this engine, which is the behaviour the
+            # retry exists for and the thing to look at if it ever stops
+            # working.
+            logger.warning(
+                "slave=%s stopped after %d cancellation rounds -- a "
+                "cancellation was lost and had to be repeated",
+                self.slave_id, rounds,
+            )
 
     async def _emit(self, event_type: str, signal: Optional[Signal] = None, **fields) -> None:
         """Put an event on the bus, stamped with the trade it belongs to.
