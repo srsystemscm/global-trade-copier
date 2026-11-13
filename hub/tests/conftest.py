@@ -61,10 +61,78 @@ def _dump_asyncio_tasks() -> None:
     for task in alive:
         try:
             print(f"\n  --- {task!r}", file=sys.stderr, flush=True)
+            print(f"      {_cancel_state(task)}", file=sys.stderr, flush=True)
             task.print_stack(limit=15, file=sys.stderr)
         except Exception as exc:                   # pragma: no cover
             print(f"  <could not dump {task}: {exc}>", file=sys.stderr, flush=True)
+
+    _dump_loop_state(alive)
     print("======== end asyncio tasks ========\n", file=sys.stderr, flush=True)
+
+
+def _cancel_state(task) -> str:
+    """The internals that say whether a cancellation was actually delivered.
+
+    A healthy cancel leaves `_fut_waiter` CANCELLED -- verified directly:
+    before, `<Future pending cb=[Task.task_wakeup()]>`; after,
+    `<Future cancelled>`.
+
+    The hang under investigation showed a task whose repr said
+    `cancelling` -- which in CPython means `_must_cancel is True` and
+    nothing else -- while the future it was suspended on was still
+    PENDING. That state should not be reachable: Task.cancel() cancels
+    `_fut_waiter` when it has one, and Task.__step cancels the new one
+    when `_must_cancel` is still set afterwards.
+
+    So print the numbers that separate the possibilities instead of
+    inferring them from a repr.
+    """
+    bits = []
+    try:
+        bits.append(f"cancelling()={task.cancelling()}")
+    except Exception:                              # pragma: no cover
+        bits.append("cancelling()=?")
+    bits.append(f"_must_cancel={getattr(task, '_must_cancel', '?')}")
+
+    waiter = getattr(task, "_fut_waiter", None)
+    if waiter is None:
+        bits.append("_fut_waiter=None (so __step must already be scheduled)")
+    else:
+        try:
+            bits.append(f"_fut_waiter done={waiter.done()} "
+                        f"cancelled={waiter.cancelled()}")
+        except Exception:                          # pragma: no cover
+            bits.append("_fut_waiter=<unreadable>")
+    return "  ".join(bits)
+
+
+def _dump_loop_state(tasks) -> None:
+    """Whether the loop has anything left to run.
+
+    If a task is waiting for a cancellation it has not received, and the
+    loop has no ready callbacks and no timers due, then nothing will ever
+    wake it. That is the difference between a wakeup that was LOST and one
+    that is merely late -- and it is not visible in a task repr.
+    """
+    loops = []
+    for task in tasks:
+        try:
+            loop = task.get_loop()
+        except Exception:                          # pragma: no cover
+            continue
+        if not any(loop is seen for seen in loops):
+            loops.append(loop)
+
+    for loop in loops:
+        ready = getattr(loop, "_ready", None)
+        scheduled = getattr(loop, "_scheduled", None)
+        print(f"\n  loop {loop!r}"
+              f"\n    running={loop.is_running()} closed={loop.is_closed()}"
+              f"\n    ready callbacks="
+              f"{len(ready) if ready is not None else '?'}"
+              f"  scheduled timers="
+              f"{len(scheduled) if scheduled is not None else '?'}",
+              file=sys.stderr, flush=True)
 
 
 def pytest_timeout_set_timer(item, settings):
