@@ -20,6 +20,7 @@ import asyncio
 from app.adapters.base import MarginPreview
 from app.autonomous_copy_engine import AutonomousCopyEngine
 from app.models import Signal
+from tests import engine_harness as harness
 from tests.conftest_fakes import FakeBroker
 
 ACCT = "ICM-44964870"
@@ -76,9 +77,8 @@ def _run(broker, cfg, signals):
     async def go():
         engine.start()
         try:
-            for s in signals:
-                await queue.put(s)
-                await asyncio.sleep(0.15)
+            settled = await harness.feed(engine, signals, broker)
+            assert settled, "the engine was still busy when the test gave up"
         finally:
             await engine.stop()
 

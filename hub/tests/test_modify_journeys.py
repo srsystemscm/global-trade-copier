@@ -25,6 +25,7 @@ from app import trade_registry
 from app.autonomous_copy_engine import AutonomousCopyEngine
 from app.copy_engine import CopyEngine
 from app.models import Signal
+from tests import engine_harness as harness
 from tests.conftest_fakes import FakeBroker
 
 MIRROR = "test-mirror"
@@ -43,14 +44,15 @@ def journey(engine, signals, settle=0.05):
     """
     async def go():
         engine.start()
-        for s in signals:
-            await engine.queue.put(s)
-        for _ in range(400):
-            await asyncio.sleep(0.005)
-            if engine.queue.empty():
-                break
-        await asyncio.sleep(settle)
-        await engine.stop()
+        try:
+            # An empty queue is not a finished signal -- the engine has
+            # taken it and is still working through several awaits. feed()
+            # waits for the work, not for the handover.
+            settled = await harness.feed(engine, signals, engine.adapter,
+                                         quiet=max(settle, 0.05))
+            assert settled, "the engine was still busy when the test gave up"
+        finally:
+            await engine.stop()
 
     asyncio.run(go())
 

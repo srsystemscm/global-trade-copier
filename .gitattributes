@@ -1,0 +1,24 @@
+# Compiled MetaTrader programs and archives are binary. Say so.
+#
+# Without this, git decides by sniffing the first 8000 bytes for a NUL and
+# guessing. `core.autocrlf` is true on the machine this is developed on, so
+# a compiled EA that happened to look like text would have its line endings
+# rewritten on checkout and be silently corrupted -- a .ex4 that no longer
+# loads, with nothing in the diff to show why, because git would still
+# report the file as unchanged.
+#
+# The heuristic has held so far (git reports these as `Bin` in diffs today),
+# which is exactly the problem: it is luck rather than a rule, and the next
+# EA to be compiled is a fresh roll. These are the files that reach a live
+# MT4/MT5 terminal and place real orders, so the guess is not worth keeping.
+*.ex4  binary
+*.ex5  binary
+*.zip  binary
+
+# Deliberately NOT declaring text handling for anything else.
+#
+# Adding `* text=auto` or an eol rule for the .mq4/.mq5 sources would make
+# git renormalise files it has already stored, which shows up as every line
+# of every affected file being modified -- a diff nobody can review, mixed
+# into whatever change happens to be in flight. Nothing here is broken, so
+# there is nothing to fix. This file exists to protect the binaries.

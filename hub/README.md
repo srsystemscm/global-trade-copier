@@ -1,4 +1,4 @@
-# Trade Copier Hub (Phase 7)
+# Trade Copier Hub (Phase 8)
 
 FastAPI + asyncio hub that receives trade signals from MT4 bridge EAs over
 ZeroMQ, deduplicates and persists them, and fans them out to per-slave
@@ -10,6 +10,129 @@ change, not a rewrite. Phase 7 is the first real-world run: IBKR paper
 replaced Schwab as the autonomous slave, several strategies on one master
 got separated by contract month, positions learned to survive a restart,
 and a pile of bugs that only a real broker could surface got fixed.
+Phase 8 is being seen from outside: the copier reports itself to the
+Operations hub, each slave takes a chosen subset of the master's
+strategies, the broker's own statement gets reconciled against the
+registry daily, held orders survive a restart, and CI runs the suite on
+every pull request against a pinned dependency set.
+
+## Architecture (Phase 8: reporting, strategy selection, durability)
+
+**Reporting to the Operations hub.** `app/hub_reporter/` pushes a snapshot
+of what is true now plus a disk-backed queue of what happened, held until
+the hub acknowledges each event by id, so neither a copier restart nor a
+hub outage loses or double-counts one. The contract both sides build
+against is `docs/hub-reporter.md`.
+
+**It is OFF until a key exists**, and with no key it does nothing at all:
+no subscription, no task, no database row, no request. That is the
+feature's most important property -- a copier without a key behaves
+exactly as one built before the reporter existed, and a malformed
+`config/hub_reporter.json` is logged and ignored rather than raised,
+because a typo in JSON must never be why a copier does not start.
+
+To switch it on once the hub has issued a key: put the key in
+`ODH_COPIER_KEY` or in `config/hub_key.txt` (gitignored), set `enabled` to
+true in `config/hub_reporter.json`, and restart.
+
+Reporting can never slow or block copying. The engines emit onto the event
+bus as they always did; a separate task drains it and writes to the
+outbox, and a second task is the only thing that touches the network,
+behind a short timeout. Nothing on the signal path imports the reporter,
+and a test asserts it.
+
+**Per-slave strategy selection.** One master terminal can run thirty or
+forty origin EAs. `magic_filter` on a slave says which of them reach it:
+
+```jsonc
+"magic_filter": [1001, 1002, 1003]
+"magic_filter": {"allow": [1001, 1002, 1003], "deny": [1002]}
+```
+
+A slave with no `magic_filter` takes everything, as every slave did
+before. The selection is applied once in the Signal Bus's fan-out, so a
+signal a slave is not configured for never reaches its queue -- and the
+count the Operations hub is told about means "slaves that took it". It can
+also be imported from the hub's registry with the strategy names attached.
+Full detail, including why this does not live in the EA, is in
+`docs/magic-selection.md`.
+
+**The broker's own record, reconciled daily.** `app/flex.py` could always
+fetch and parse an IBKR Activity Flex statement; nothing called it.
+`app/flex_reconcile.py` now stores it and compares it to the Trade
+Registry on a daily schedule, joining on `ibOrderID` -- which works
+because `IBKRAdapter.open()` records `slave_ticket = trade.order.orderId`,
+so the statement and the registry were already keyed the same way.
+
+It checks the price and size the hub captured at fill time against what
+the broker says, which is the point: a fill price is reported once, over
+the API, and nothing other than the broker's own statement can say it was
+captured wrongly. It also reports orders the broker filled that this hub
+has no record of -- resting stop and target fills excepted, since their
+ids are known.
+
+It deliberately does NOT report registry rows absent from the statement.
+A Flex statement covers completed statement days only, so a position
+opened today is legitimately missing, and telling a real gap from a
+legitimate one would mean comparing this database's epoch timestamps
+against statement dates in the account's own report timezone, which the
+file never states. Inert without `TC_FLEX_TOKEN` and `TC_FLEX_QUERY_ID`.
+
+For the join to work at all, **`ibOrderID` must be ticked in the Flex
+query's Trades section** in Client Portal. Without it every execution is
+counted as `unjoinable` and reported as such, rather than looking like
+nothing to check.
+
+**Held orders survive a restart.** Deferred opens and closes used to live
+only in the engine's memory. That is a daily exposure: CME halts its whole
+complex for an hour every day, an MT4 server on GMT+2/+3 opens its daily
+bar right on that boundary, and IB Gateway forces a restart that the hub
+restarts with. Both queues are now written to `deferred_actions` on every
+change and rebuilt on `restore()`, before the engine consumes signals.
+
+The close side is why it matters most: a deferred close waits up to 72
+hours by default, because a Friday evening exit legitimately waits for
+Monday, and losing one leaves the slave holding a position the master has
+exited -- which reconciliation cannot find either, because the registry
+says OPEN and the broker agrees.
+
+Restore rebuilds the queue and nothing more; the deferral loop still owns
+retrying, so an entry held past its ceiling while the hub was down is
+abandoned loudly rather than filled hours late at a price nobody chose.
+
+### Continuous integration, and pinned dependencies
+
+`.github/workflows/ci.yml` runs the suite on every pull request and on
+`master`, on **Windows** -- the platform this actually runs on, since
+`zmq.asyncio` needs `WindowsSelectorEventLoopPolicy` there and the MT
+terminals exist nowhere else. A green badge earned on Linux would be
+testing a platform nobody deploys to.
+
+`requirements.txt` is **pinned**, and this is not fussiness. It asked for
+`>=` on everything until CI resolved a different set on a clean machine --
+anyio 4.16 against 4.14, starlette 1.10 against 1.3, fastapi 0.162 against
+0.139 -- and the suite hung until the job timed out. The same `pip
+install` here would have done the same thing silently.
+
+Upgrading is therefore deliberate, and all four steps belong in one commit:
+
+```
+# change the version in requirements.txt, then
+.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-dev.txt --upgrade
+.venv\Scripts\python.exe -m pip freeze > constraints.txt
+.venv\Scripts\python.exe -m pytest tests/ -q
+```
+
+`tests/test_requirements.py` fails if `requirements.txt` and
+`constraints.txt` ever stop agreeing, because a drift between them is
+exactly the failure they exist to prevent: CI green against one set of
+versions while this hub runs another.
+
+An **upgrade canary** runs the suite against the newest of everything on a
+Monday schedule and on demand, never on a pull request -- so a library
+released this morning cannot block a merge. Red there is information, not
+an outage. It is what found that a session-recovery test was asserting on
+wall clock rather than on behaviour.
 
 ## Architecture (Phase 7: multi-strategy, rolls, durable positions)
 
@@ -326,8 +449,18 @@ you have one from before Phase 3.
 ```
 python -m venv .venv
 .venv\Scripts\activate        # Windows
-pip install -r requirements.txt
+pip install -r requirements.txt -c constraints.txt
 cp .env.example .env          # then fill in whatever secrets you're using
+```
+
+To run the test suite as well, add the development requirements -- they are
+a different list on purpose, and `ib_async` is the reason: the IBKR adapter
+lazy-imports it so a hub with no IBKR slave need not install it, while
+several tests build a real `IBKRAdapter` and therefore do need it.
+
+```
+pip install -r requirements-dev.txt -c constraints.txt
+.venv\Scripts\python.exe -m pytest tests/ -q
 ```
 
 Secrets (Schwab OAuth client ID/secret, SMTP credentials) only ever come
