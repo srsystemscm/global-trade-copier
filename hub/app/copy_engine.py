@@ -14,8 +14,10 @@ from app.session_gate import SessionGateMixin
 
 logger = logging.getLogger(__name__)
 
-# Matches the autonomous engine's. See AutonomousCopyEngine.stop().
+# Both match the autonomous engine's. See AutonomousCopyEngine.stop() and
+# CANCEL_RETRY_SECONDS there for why one cancellation is not enough.
 STOP_GRACE_SECONDS = 5.0
+CANCEL_RETRY_SECONDS = 0.25
 
 
 def _elapsed_ms(signal: Signal, at: float) -> int:
@@ -236,17 +238,34 @@ class CopyEngine(SessionGateMixin):
         """
         if self._task is None:
             return
-        self._task.cancel()
-        _done, pending = await asyncio.wait([self._task],
-                                            timeout=STOP_GRACE_SECONDS)
-        for task in _done:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                task.result()
+        # Cancel and ask again until it stops or the grace runs out. One
+        # cancellation is not enough: this loop parks on `queue.get()`, and
+        # a cancellation arriving just as an item lands is deferred and
+        # then lost. See the autonomous engine's CANCEL_RETRY_SECONDS.
+        pending = {self._task}
+        deadline = time.monotonic() + STOP_GRACE_SECONDS
+        rounds = 0
+        while pending and time.monotonic() < deadline:
+            rounds += 1
+            self._task.cancel()
+            _done, pending = await asyncio.wait(
+                pending, timeout=CANCEL_RETRY_SECONDS)
+
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            if self._task.done():
+                self._task.result()
+
         if pending:
             logger.error(
                 "slave=%s the consume loop did not stop within %.0fs and has "
                 "been abandoned; shutting this engine down anyway",
                 self.slave_id, STOP_GRACE_SECONDS,
+            )
+        elif rounds > 1:
+            logger.warning(
+                "slave=%s stopped after %d cancellation rounds -- a "
+                "cancellation was lost and had to be repeated",
+                self.slave_id, rounds,
             )
 
     async def _emit(self, event_type: str, signal: Optional[Signal] = None, **fields) -> None:

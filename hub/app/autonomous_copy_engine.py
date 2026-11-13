@@ -35,6 +35,21 @@ logger = logging.getLogger(__name__)
 # shutdown with several engines behind it still completes promptly.
 STOP_GRACE_SECONDS = 5.0
 
+# How long one cancellation gets before it is asked again.
+#
+# A cancellation can be LOST, and the measured race is specific: when
+# cancel() arrives in the window between a put() resolving the queue's
+# getter future and the consume task waking to take it, `_fut_waiter` is
+# already done. Future.cancel() therefore returns False, Task.cancel()
+# falls back to setting `_must_cancel = True` -- a deferred cancellation --
+# and that one goes missing. The task finishes what it was doing, loops
+# round, and parks on a FRESH future that nothing has cancelled.
+#
+# Asking again fixes it, because by then the task is parked on that new
+# future and Future.cancel() succeeds. Short, because the window closes
+# as soon as the task next parks.
+CANCEL_RETRY_SECONDS = 0.25
+
 
 @dataclass
 class Refusal:
@@ -249,11 +264,24 @@ class AutonomousCopyEngine(SessionGateMixin):
         if not tasks:
             return
 
-        for task in tasks:
-            task.cancel()
-        _done, pending = await asyncio.wait(tasks, timeout=STOP_GRACE_SECONDS)
+        # Cancel, wait briefly, and ask again -- for as long as the grace
+        # period allows. Asking once is not enough: a cancellation that
+        # arrives while the task is about to collect a queue item is
+        # deferred and then lost, and the task parks on a fresh future
+        # nothing has cancelled. See CANCEL_RETRY_SECONDS.
+        finished = set()
+        pending = set(tasks)
+        deadline = time.monotonic() + STOP_GRACE_SECONDS
+        rounds = 0
+        while pending and time.monotonic() < deadline:
+            rounds += 1
+            for task in pending:
+                task.cancel()
+            done, pending = await asyncio.wait(
+                pending, timeout=CANCEL_RETRY_SECONDS)
+            finished |= done
 
-        for task in _done:
+        for task in finished:
             # Retrieved so a task that died of something other than the
             # cancellation does not surface later as "exception was never
             # retrieved", which arrives with no stack worth reading.
@@ -267,6 +295,16 @@ class AutonomousCopyEngine(SessionGateMixin):
                 "down anyway rather than holding everything behind it.",
                 self.slave_id, len(pending), STOP_GRACE_SECONDS,
                 ", ".join(sorted(t.get_name() for t in pending)),
+            )
+        elif rounds > 1:
+            # Worth a line: it means a cancellation went missing and the
+            # retry is what stopped this engine, which is the behaviour the
+            # retry exists for and the thing to look at if it ever stops
+            # working.
+            logger.warning(
+                "slave=%s stopped after %d cancellation rounds -- a "
+                "cancellation was lost and had to be repeated",
+                self.slave_id, rounds,
             )
 
     async def _emit(self, event_type: str, signal: Optional[Signal] = None, **fields) -> None:
