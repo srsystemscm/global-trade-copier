@@ -3,7 +3,14 @@ __pycache__/
 *.pyc
 hub/data/
 hub/logs/
-.env
+# Real credentials, in whatever shape a .env ends up saved as --
+# .env.local, .env.bak-before-port, .env.save. The bare `.env` pattern
+# matched that exact name and nothing else, so a backup sitting beside it
+# showed as untracked rather than ignored: one `git add -A` from
+# committing a live Flex token. The example file is the deliberate
+# exception, and is tracked.
+.env*
+!.env.example
 node_modules/
 ui/dist/
 
