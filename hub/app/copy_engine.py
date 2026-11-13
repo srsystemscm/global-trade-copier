@@ -453,6 +453,7 @@ class CopyEngine(SessionGateMixin):
                 slave_lots=result.lots if result.lots is not None else lots,
                 requested_at=requested_at,
                 filled_at=filled_at,
+                broker_order_id=result.broker_order_id,
             )
             logger.info(
                 "slave=%s opened master_ticket=%s as slave_ticket=%s",

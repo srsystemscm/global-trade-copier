@@ -928,6 +928,7 @@ class AutonomousCopyEngine(SessionGateMixin):
             slave_lots=sizing_result.size,
             requested_at=requested_at,
             filled_at=filled_at,
+            broker_order_id=result.broker_order_id,
         )
         if result.price is None:
             # The broker hasn't reported a fill yet. Collect it in the
@@ -1688,7 +1689,11 @@ class AutonomousCopyEngine(SessionGateMixin):
         result = await self.adapter.open(order)
 
         trade_registry.record_open(
-            self.slave_id, master_account, master_ticket, symbol, result.slave_ticket
+            self.slave_id, master_account, master_ticket, symbol, result.slave_ticket,
+            # The roll replaces the order, so the broker's id for this leg
+            # changes with it. Left behind, the registry would reconcile
+            # against an order that no longer exists.
+            broker_order_id=result.broker_order_id,
         )
         pos.update({
             "slave_ticket": result.slave_ticket,
