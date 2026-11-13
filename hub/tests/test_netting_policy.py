@@ -15,6 +15,7 @@ import asyncio
 
 from app.autonomous_copy_engine import AutonomousCopyEngine
 from app.models import Signal
+from tests import engine_harness as harness
 from tests.conftest_fakes import FakeBroker
 
 ACCT = "ICM-44964870"
@@ -66,13 +67,12 @@ def _run(signals, cfg):
     async def go():
         engine.start()
         try:
+            # One at a time, because these tests are about what the SECOND
+            # leg does once the first is on the book -- so each has to be
+            # finished before the next goes in.
             for s in signals:
-                await queue.put(s)
-                for _ in range(120):
-                    await asyncio.sleep(0.01)
-                    if len(broker.opened) >= signals.index(s) + 1:
-                        break
-            await asyncio.sleep(0.15)
+                settled = await harness.feed(engine, [s], broker)
+                assert settled, "the engine was still busy on a signal"
         finally:
             await engine.stop()
 

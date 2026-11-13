@@ -16,6 +16,7 @@ from app.adapters.mt4 import MT4Adapter
 from app.copy_engine import CopyEngine
 from app.db import db_cursor
 from app.models import Signal
+from tests import engine_harness as harness
 from tests.conftest_fakes import FakeBroker
 
 SLAVE = "slave-1"
@@ -38,11 +39,12 @@ def _journey(broker, signals, settle=0.08):
 
     async def go():
         engine.start()
-        for s in signals:
-            await queue.put(s)
-            await asyncio.sleep(0.02)
-        await asyncio.sleep(settle)
-        await engine.stop()
+        try:
+            settled = await harness.feed(engine, signals, broker,
+                                         quiet=max(settle, 0.05))
+            assert settled, "the engine was still busy when the test gave up"
+        finally:
+            await engine.stop()
 
     asyncio.run(go())
 
