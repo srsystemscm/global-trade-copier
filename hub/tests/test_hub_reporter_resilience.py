@@ -64,7 +64,13 @@ def test_copying_is_unaffected_by_a_hub_that_does_not_answer(hub_state):
     naive implementation blocks there rather than failing fast. "dead" is
     nothing listening at all.
     """
-    with StubHub(delay=1.0) as slow:
+    # The hub's own cost of answering, against the reporter's own timeout.
+    # Both are set well above any plausible runner noise, because the
+    # assertion below is the discriminating one: if ANY part of the signal
+    # path awaited a report, one signal alone would cost a full timeout, and
+    # three would cost three. The budget has to be under that and above the
+    # time three copies legitimately take on a cold shared runner.
+    with StubHub(delay=3.0) as slow:
         url = slow.url if hub_state == "slow" else f"http://127.0.0.1:{closed_port()}"
 
         async def go():
@@ -75,7 +81,7 @@ def test_copying_is_unaffected_by_a_hub_that_does_not_answer(hub_state):
             engine = CopyEngine(SLAVE, broker, queue, {}, events=events)
             reporter = HubReporter(
                 events, state(),
-                cfg(url, timeout_s=0.2, snapshot_interval_s=0.05, debounce_s=0.0),
+                cfg(url, timeout_s=1.0, snapshot_interval_s=0.05, debounce_s=0.0),
             )
             await reporter.start()
             assert reporter.running, "the reporter is genuinely trying"
@@ -103,10 +109,18 @@ def test_copying_is_unaffected_by_a_hub_that_does_not_answer(hub_state):
     assert copied, "every signal was copied"
     assert [o["symbol"] for o in broker.opened] == ["US2000"] * 3
     assert [o["size"] for o in broker.opened] == [1.0] * 3
-    # One request at the hub's end takes 1.0s and the reporter's own timeout
-    # is 0.2s. Copying three signals has to finish in far less than either,
-    # or something on the signal path is waiting for the network.
-    assert elapsed < 0.5, f"copying waited on the reporter ({elapsed:.2f}s)"
+    # The reporter's timeout is 1.0s, so one awaited report would cost a
+    # second and three would cost three. Anything under 1.5s therefore
+    # cannot have waited for even one of them, while leaving a cold shared
+    # runner more than twice the time three copies actually take.
+    #
+    # The first version of this asserted 0.5s against a 0.2s timeout, which
+    # CI failed at 0.56s -- and it was right to: at those numbers the
+    # difference between "waited for three reports" and "a slow runner" is
+    # 0.1s, so the test could not tell them apart in either direction. The
+    # structural check below this one is the real proof; this is the sanity
+    # bound, and a sanity bound has to be unambiguous rather than tight.
+    assert elapsed < 1.5, f"copying waited on the reporter ({elapsed:.2f}s)"
 
     for ticket in (101, 102, 103):
         assert trade_registry.get_open_mappings(SLAVE, ACCT, ticket), (

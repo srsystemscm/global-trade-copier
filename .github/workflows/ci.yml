@@ -40,16 +40,26 @@ jobs:
           # the place to discover a minor-version behaviour change from CI.
           python-version: '3.11'
           cache: pip
-          cache-dependency-path: hub/requirements.txt
+          cache-dependency-path: |
+            hub/requirements.txt
+            hub/requirements-dev.txt
 
       - name: Install dependencies
         working-directory: hub
-        # ib_async is commented out in requirements.txt on purpose: the IBKR
-        # adapter lazy-imports it, so the hub and the suite both run without
-        # it. Nothing here needs a live broker library.
+        # Both files. requirements.txt is what a hub installs, where the
+        # IBKR client library is optional on purpose -- the adapter
+        # lazy-imports it, so a deployment with no IBKR slave does not need
+        # it. requirements-dev.txt is what the SUITE needs, which is not the
+        # same thing: several tests construct a real IBKRAdapter and drive
+        # its order-building paths against a fake IB object, so the library
+        # has to be importable even though nothing connects.
+        #
+        # This is the first thing CI found. The claim here used to be that
+        # nothing in the suite needed a broker library, which was true only
+        # because the development venv happened to have one installed.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Run the test suite
         working-directory: hub
