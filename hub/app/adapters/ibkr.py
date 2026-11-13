@@ -20,6 +20,19 @@ from app.contract_specs import get_contract_spec
 
 logger = logging.getLogger(__name__)
 
+# IBKR truncates an over-long orderRef silently, which would make a join on
+# it match nothing with no error anywhere. The documented field is short,
+# so the reference is kept well inside it and trimmed here rather than at
+# the broker -- a trimmed-but-consistent string still joins, because what
+# is stored is what was sent.
+ORDER_REF_MAX = 40
+
+
+def _stamp(order, ref) -> None:
+    """Put the copier's reference on a broker order, if there is one."""
+    if ref:
+        order.orderRef = str(ref)[:ORDER_REF_MAX]
+
 # How long one bar of each IBKR size covers, in seconds.
 _BAR_SECONDS = {
     "secs": 1, "sec": 1, "min": 60, "mins": 60, "hour": 3600, "hours": 3600,
@@ -484,6 +497,12 @@ class IBKRAdapter(BrokerAdapter):
             entry = ib_mod.MarketOrder(action, order.size)
         entry.outsideRth = order.outside_rth
         entry.tif = self.entry_tif
+        # The copier's own reference, which the broker hands back on its
+        # statement. Set on the entry AND on both protective legs below, so
+        # every execution belonging to this position is recognisable as
+        # ours -- including a stop that fires months later, when nothing in
+        # this hub placed a closing order at all.
+        _stamp(entry, order.order_ref)
         trade = self._place(contract, entry)
         slave_ticket = trade.order.orderId
         # permId is IBKR's own permanent id for the order, and the only one
@@ -511,12 +530,14 @@ class IBKRAdapter(BrokerAdapter):
                     ib_mod.StopOrder(closing_action, order.size, sl_price), order.outside_rth)
                 sl_order.ocaGroup = oca_group
                 sl_order.ocaType = 1  # cancel the sibling order(s) once one fills
+                _stamp(sl_order, order.order_ref)
                 sl_order_id = self._place(contract, sl_order).order.orderId
             if tp_price is not None:
                 tp_order = self._protective(
                     ib_mod.LimitOrder(closing_action, order.size, tp_price), order.outside_rth)
                 tp_order.ocaGroup = oca_group
                 tp_order.ocaType = 1
+                _stamp(tp_order, order.order_ref)
                 tp_order_id = self._place(contract, tp_order).order.orderId
 
         self._positions[slave_ticket] = {
@@ -573,6 +594,7 @@ class IBKRAdapter(BrokerAdapter):
             slave_ticket=slave_ticket, sl_order_id=sl_order_id,
             tp_order_id=tp_order_id,
             broker_order_id=None if broker_order_id is None else str(broker_order_id),
+            broker_order_ref=order.order_ref,
         )
 
     def _cancel_tracked_order(self, order_id: Optional[int]) -> None:

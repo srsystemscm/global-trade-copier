@@ -6,6 +6,7 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 from app import trade_registry
+from app.trade_registry import order_ref
 from app.adapters.base import (
     AccountSummary,
     AdapterError, BrokerAdapter, EntryNeverFilled, OrderRequest,
@@ -1007,6 +1008,7 @@ class AutonomousCopyEngine(SessionGateMixin):
             symbol=target_symbol,
             direction=traded_direction,
             size=sizing_result.size,
+            order_ref=order_ref(signal.account, signal.ticket, target_symbol),
             sl=slave_sl,
             tp=slave_tp,
             master_ticket=signal.ticket,
@@ -1033,6 +1035,7 @@ class AutonomousCopyEngine(SessionGateMixin):
             requested_at=requested_at,
             filled_at=filled_at,
             broker_order_id=result.broker_order_id,
+            broker_order_ref=result.broker_order_ref,
         )
         if result.price is None:
             # The broker hasn't reported a fill yet. Collect it in the
@@ -1831,6 +1834,7 @@ class AutonomousCopyEngine(SessionGateMixin):
             # changes with it. Left behind, the registry would reconcile
             # against an order that no longer exists.
             broker_order_id=result.broker_order_id,
+            broker_order_ref=result.broker_order_ref,
         )
         pos.update({
             "slave_ticket": result.slave_ticket,

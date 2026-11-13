@@ -48,6 +48,15 @@ class OrderRequest:
     sl: Optional[float] = None
     tp: Optional[float] = None
     master_ticket: Optional[int] = None
+    # The copier's own reference, stamped on the broker order and read back
+    # off the broker's statement. Built by the engine, which is the only
+    # thing that knows the master account as well as the ticket.
+    #
+    # This is the join that reconciliation wants: a string WE choose comes
+    # back unchanged, where an id the broker assigns has to be guessed at.
+    # It also covers the protective legs, which carry the entry's reference
+    # so a stop fill is recognisable as ours rather than as drift.
+    order_ref: Optional[str] = None
     # "market" or "limit". Outside regular hours a market order is simply
     # refused by IBKR, so an ETF leg meant to fill in the evening session
     # has to be a limit with `outside_rth` set -- both, not either.
@@ -88,6 +97,9 @@ class OrderResult:
     # its Flex statements report a nine-digit broker id -- different
     # numbering spaces, so reconciling the two needs this recorded.
     broker_order_id: Optional[str] = None
+    # Echoed back so the caller records exactly what reached the broker,
+    # rather than rebuilding the string and hoping the two agree.
+    broker_order_ref: Optional[str] = None
 
 
 @dataclass

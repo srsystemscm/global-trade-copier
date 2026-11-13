@@ -11,6 +11,23 @@ class SlaveTradeMapping:
     slave_ticket: int
 
 
+def order_ref(master_account: str, master_ticket: int, slave_symbol: str) -> str:
+    """The copier's reference for one leg, as stamped on the broker order.
+
+    Carries the three things that identify a copy -- which master, which
+    trade of that master, and which instrument it became here -- because
+    those are exactly this table's own key, so a row on the broker's
+    statement can be traced back to the row that caused it.
+
+    Kept short deliberately: IBKR truncates an over-long orderRef
+    silently, and a truncated reference would fail by matching nothing
+    rather than by complaining. The `gtc` tag marks it as this copier's,
+    so an execution placed by hand or by another tool is distinguishable
+    from one of ours rather than merely absent.
+    """
+    return f"gtc:{master_account}:{master_ticket}:{slave_symbol}"
+
+
 def record_open(
     slave_id: str,
     master_account: str,
@@ -24,6 +41,7 @@ def record_open(
     requested_at: Optional[float] = None,
     filled_at: Optional[float] = None,
     broker_order_id: Optional[str] = None,
+    broker_order_ref: Optional[str] = None,
 ) -> None:
     """Record the copy, and what it executed at.
 
@@ -38,8 +56,8 @@ def record_open(
             INSERT INTO slave_trades
                 (slave_id, master_account, master_ticket, slave_symbol, slave_ticket, status,
                  opened_at, master_price, slave_price, slave_lots, requested_at, filled_at,
-                 broker_order_id)
-            VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?)
+                 broker_order_id, broker_order_ref)
+            VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (slave_id, master_account, master_ticket, slave_symbol) DO UPDATE SET
                 slave_ticket = excluded.slave_ticket,
                 status       = 'OPEN',
@@ -53,11 +71,13 @@ def record_open(
                 -- COALESCE, not excluded: a re-record that does not know
                 -- the broker's id must not erase one already captured.
                 broker_order_id = COALESCE(excluded.broker_order_id,
-                                           slave_trades.broker_order_id)
+                                           slave_trades.broker_order_id),
+                broker_order_ref = COALESCE(excluded.broker_order_ref,
+                                            slave_trades.broker_order_ref)
             """,
             (slave_id, master_account, master_ticket, slave_symbol, slave_ticket, time.time(),
              master_price, slave_price, slave_lots, requested_at, filled_at,
-             broker_order_id),
+             broker_order_id, broker_order_ref),
         )
 
 

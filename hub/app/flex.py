@@ -83,6 +83,10 @@ class FlexTrade:
     ib_order_id: Optional[str]   # the join key back to the hub's registry
     exec_id: Optional[str]
     exchange: Optional[str]
+    # What the ORDER was stamped with when it was placed -- the copier's
+    # own reference, round-tripped by the broker. Empty for anything this
+    # hub did not place, which is what makes it a join rather than a guess.
+    order_ref: Optional[str]
     # Naive: IBKR reports these in the ACCOUNT'S configured report timezone,
     # which is not stated in the file and is not necessarily UTC. Anything
     # comparing these to the registry's epoch timestamps has to establish
@@ -179,6 +183,7 @@ def parse_statement(xml_text: str) -> FlexStatement:
             ib_order_id=a.get("ibOrderID") or None,
             exec_id=a.get("ibExecID") or None,
             exchange=a.get("exchange") or None,
+            order_ref=a.get("orderReference") or None,
             trade_time=_dt(a.get("dateTime")),
             order_time=_dt(a.get("orderTime")),
         ))

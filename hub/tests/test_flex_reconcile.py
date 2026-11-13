@@ -19,15 +19,23 @@ from app.db import db_cursor
 from app.flex import FlexError, parse_statement
 from app.flex_reconcile import FlexReconciler, compare, run_once, store
 from app.slaves import insert_slave
+from app.trade_registry import order_ref
 from tests.test_flex import EMPTY, REAL
 
 def execution(trade_id, exec_id, order_id, qty, price, side="BUY",
-              open_close="O", symbol="GCZ6"):
-    """One EXECUTION row, in the shape the real statement uses."""
+              open_close="O", symbol="GCZ6", order_ref=""):
+    """One EXECUTION row, in the shape the real statement uses.
+
+    `order_ref` is what the broker hands back of whatever the copier
+    stamped on the order. Empty is the honest default: it is empty on
+    every execution in the real statement captured before the copier
+    started stamping one.
+    """
     return (
         f'<Trade accountId="DUR314653" currency="USD" assetCategory="FUT" '
         f'symbol="{symbol}" conid="462941472" underlyingSymbol="GC" '
         f'tradeID="{trade_id}" ibExecID="{exec_id}" ibOrderID="{order_id}" '
+        f'orderReference="{order_ref}" '
         f'multiplier="100" expiry="20261229" dateTime="20261029;023253" '
         f'tradeDate="20261029" exchange="COMEX" quantity="{qty}" '
         f'tradePrice="{price}" ibCommission="-2.51" '
@@ -100,7 +108,7 @@ def ibkr_slave(slave_id="ibkr-paper-1"):
 
 
 def registry_row(slave_id, broker_order_id, symbol="GCZ6", price=None,
-                 lots=None, master_ticket=1, slave_ticket=1):
+                 lots=None, master_ticket=1, slave_ticket=1, order_ref=None):
     """A copy this hub made, keyed the way the statement keys it.
 
     `broker_order_id` is the join, NOT `slave_ticket`: the latter is TWS's
@@ -111,10 +119,11 @@ def registry_row(slave_id, broker_order_id, symbol="GCZ6", price=None,
     with db_cursor() as cur:
         cur.execute(
             "INSERT INTO slave_trades (slave_id, master_account, master_ticket, "
-            "slave_symbol, slave_ticket, broker_order_id, status, slave_price, "
-            "slave_lots) VALUES (?, '11558127', ?, ?, ?, ?, 'OPEN', ?, ?)",
+            "slave_symbol, slave_ticket, broker_order_id, broker_order_ref, "
+            "status, slave_price, slave_lots) "
+            "VALUES (?, '11558127', ?, ?, ?, ?, ?, 'OPEN', ?, ?)",
             (slave_id, master_ticket, symbol, slave_ticket,
-             str(broker_order_id), price, lots),
+             str(broker_order_id), order_ref, price, lots),
         )
 
 
@@ -582,3 +591,84 @@ def test_the_reconciler_is_wired_into_the_apps_lifespan():
     assert "FlexReconciler(events=events, notifier=notifier)" in source
     assert "flex.start()" in source
     assert "await flex.stop()" in source
+
+
+# ============================== the copier's own reference on the order
+
+REF = order_ref("11558127", 999031902, "GCZ6")
+
+# An entry and the stop that later closed it. The stop carries the entry's
+# reference and a DIFFERENT order id, because this hub never placed a
+# closing order -- the broker fired a resting one, months later in the
+# worst case.
+ENTRY_AND_STOP = statement(
+    execution("1", "exec-a", "900001", 1, 4040.7, order_ref=REF),
+    execution("2", "exec-b", "900077", -1, 3990.0, side="SELL",
+              open_close="C", order_ref=REF),
+)
+
+
+def test_the_reference_identifies_a_protective_fill_as_ours():
+    """The whole point of stamping it.
+
+    A stop fires under an order id this hub has never seen -- it placed no
+    closing order. Joined on ids alone that fill reads as drift, which is
+    why `untracked` could not be believed. The reference is on every leg,
+    so it resolves.
+    """
+    slave = ibkr_slave()
+    registry_row(slave, 900001, price=4040.7, lots=1.0, order_ref=REF)
+
+    summary = compare(parse_statement(ENTRY_AND_STOP))
+    assert summary.orders == 2
+    assert summary.matched == 2, "the entry AND the stop that closed it"
+    assert summary.untracked == []
+    assert summary.untracked_reliable is True
+    assert summary.clean is True
+
+
+def test_an_execution_with_no_reference_of_ours_is_untracked_and_believed():
+    slave = ibkr_slave()
+    registry_row(slave, 900001, price=4040.7, lots=1.0, order_ref=REF)
+
+    someone_else = statement(
+        execution("1", "exec-a", "900001", 1, 4040.7, order_ref=REF),
+        execution("9", "exec-z", "555555", 3, 101.5, symbol="ZSL"),
+    )
+    summary = compare(parse_statement(someone_else))
+
+    assert summary.matched == 1
+    assert [u["ib_order_id"] for u in summary.untracked] == ["555555"]
+    assert summary.untracked_reliable is True, "the statement carries refs"
+    assert summary.clean is False, "and now it is worth raising"
+
+
+def test_a_statement_with_no_references_at_all_is_not_believed():
+    """Everything predating the stamping. Reported, never raised."""
+    slave = ibkr_slave()
+    registry_row(slave, 900001, price=4040.7, lots=1.0)
+
+    summary = compare(parse_statement(TWO_ORDERS))
+    assert summary.untracked_reliable is False
+    assert summary.clean is True
+
+
+def test_the_reference_wins_over_a_coincidental_order_id():
+    """Two keys, and the reference is the one that identifies the leg."""
+    slave = ibkr_slave()
+    registry_row(slave, 900077, symbol="MGC", price=1.0, lots=1.0,
+                 master_ticket=5)
+    registry_row(slave, 900001, symbol="GCZ6", price=4040.7, lots=1.0,
+                 order_ref=REF, master_ticket=6)
+
+    summary = compare(parse_statement(ENTRY_AND_STOP))
+    stop = [m for m in summary.mismatched if m["ib_order_id"] == "900077"]
+    assert stop == [], "the stop resolved through the reference, not the id"
+    assert summary.matched == 2
+
+
+def test_the_reference_says_which_master_trade_a_leg_came_from():
+    ref = order_ref("11558127", 999031902, "M2K")
+    assert ref == "gtc:11558127:999031902:M2K"
+    assert ref.startswith("gtc:"), "marked as this copier's"
+    assert len(ref) <= 40, "IBKR truncates an over-long orderRef silently"
