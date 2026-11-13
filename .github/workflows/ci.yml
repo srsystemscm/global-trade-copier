@@ -1,0 +1,89 @@
+name: CI
+
+# On pull requests, and on master itself. Deliberately not on every push to
+# every branch: the pull_request trigger already covers a branch that has one
+# open, and running both would double the minutes for no extra information.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# A second push to the same branch makes the first run's answer worthless, so
+# cancel it rather than paying for it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  hub:
+    name: hub tests
+    # Windows, because that is where this runs. The copier lives on a Windows
+    # VPS -- zmq.asyncio needs WindowsSelectorEventLoopPolicy there, MT4/MT5
+    # terminals exist nowhere else, and the suite is only known to pass on
+    # it. A green badge from Linux would be testing a platform nobody
+    # deploys to, which is worse than no badge.
+    runs-on: windows-latest
+    # The suite is ~3.5 minutes locally and does real socket work against
+    # loopback stubs. Twenty is room to spare without a hung job burning an
+    # hour of minutes.
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Pinned to what the venv on the VPS runs. A trading system is not
+          # the place to discover a minor-version behaviour change from CI.
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: hub/requirements.txt
+
+      - name: Install dependencies
+        working-directory: hub
+        # ib_async is commented out in requirements.txt on purpose: the IBKR
+        # adapter lazy-imports it, so the hub and the suite both run without
+        # it. Nothing here needs a live broker library.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run the test suite
+        working-directory: hub
+        # No TC_* environment and no .env, which is the point: the hub has to
+        # start from its declared defaults. Anything that needs a token --
+        # Flex, Schwab, the Operations hub reporter -- is inert without one,
+        # and a test that only passed because this machine had a credential
+        # would be a test that passes for the wrong reason.
+        run: python -m pytest tests/ -q
+
+  ui:
+    name: dashboard build
+    # Linux, because this is a Vite build with nothing platform-specific in
+    # it, and it is the cheaper runner.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Build
+        working-directory: ui
+        # There are no UI tests, so the build IS the check: it catches a
+        # syntax error, a bad import or a component renamed on one side of a
+        # change only -- which is most of what goes wrong in this dashboard,
+        # and all of it currently found by opening the page by hand.
+        run: npm run build
