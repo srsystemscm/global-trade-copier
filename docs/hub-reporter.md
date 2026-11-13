@@ -242,20 +242,30 @@ intended. `info` is for the stream and the counters.
 | `master_disconnected` / `master_reconnected` | notice | `account`, `silent_for_s` |
 | `reconciliation` | alert **only on mismatch** | `checked`, `matched`, `untracked[]`, `stuck[]`, `at` |
 
-### Three sources that do not exist yet
+### Sources that did not exist yet
 
-The copier must grow these for the catalogue above to be complete. They are in
-the spec because the hub builds against this document, and a field added later
-means revisiting both sides.
+The copier had to grow these for the catalogue above to be complete. They are
+in the spec because the hub builds against this document, and a field added
+later means revisiting both sides. **All of these are now built** — see the
+addendum at the end of this document for what each one turned out to be.
 
-1. **`reconciliation`** — `app/reconciliation.py` runs but emits no summary, so
-   "open legs versus the registry, untracked or stuck rows" has nothing to
-   report. Needs an event carrying what it checked and what did not match.
-2. **`signal_received`** — the signal bus logs arrivals but emits nothing, so
-   received cannot be reconciled against copied. Without it a signal that
-   routes nowhere appears only as `signal_unrouted`.
-3. **`magic` on copy events** — `Signal` carries it; `_emit` does not pass it
-   through. Every copy event needs it.
+1. **`reconciliation`** — `app/reconciliation.py` ran but emitted no summary,
+   so "open legs versus the registry, untracked or stuck rows" had nothing to
+   report. It now emits one event per pass, drift or no drift.
+2. **`signal_received`** — the signal bus logged arrivals and emitted nothing
+   that said how far they got, so received could not be reconciled against
+   copied. The arrival event now carries `targets`.
+3. **`magic` on copy events** — `Signal` carries it; `_emit` did not pass it
+   through.
+4. **`master_account` and `master_symbol` on copy events** — not in the
+   original list, and the larger of the two gaps. Every event was emitted with
+   `master_ticket=signal.ticket` and nothing else, so three of the four
+   identity fields this spec makes mandatory were absent from all of them. An
+   MT4 ticket number is per account, so without `master_account` the key at
+   the top of every event is ambiguous the moment a second master exists.
+5. **A hub-side arrival time** — `signal_to_fill_ms` could only have been
+   measured against the master EA's `TimeGMT()`, which is another machine's
+   clock at whole-second resolution. `Signal.received_at` is the hub's own.
 
 ## A full report
 
@@ -380,3 +390,151 @@ means revisiting both sides.
 
 Off by default. A copier with no key configured must behave exactly as one
 built before the reporter existed.
+
+---
+
+# Addendum: what the copier side found
+
+Written while implementing the copier's half (`hub/app/hub_reporter/`). Every
+item is something the hub thread needs, either because this document was
+incomplete or because a decision it left open has now been taken. Nothing
+above has had its **meaning** changed; the transport, identity, ack and queue
+semantics are exactly as agreed.
+
+## Decisions this document left open
+
+**`reconciliation` row shapes.** The catalogue named `untracked[]` and
+`stuck[]` without saying what a row is. They are:
+
+```jsonc
+"detail": {
+  "checked": 3,            // registry rows OPEN for this slave
+  "matched": 2,            // of those, ones the broker also holds
+  "stuck": [               // registry said OPEN, broker does not hold it
+    {"slave_symbol": "M2K", "master_account": "11558127",
+     "master_ticket": 999031902, "slave_ticket": 392,
+     "resolved": "marked_closed"}
+  ],
+  "untracked": [           // broker holds it, registry does not know it
+    {"slave_symbol": "MGC", "quantity": 2.0}
+  ],
+  "at": "2026-11-12T20:05:04Z"
+}
+```
+
+`checked - matched == len(stuck)` always. `resolved: "marked_closed"` is there
+because the copier **fixes** a stuck row — it marks the registry CLOSED and
+drops the durable position — so a tab must not present it as something
+awaiting a human. `untracked` rows are left alone and genuinely do want a
+look: an untracked position cannot safely be assumed to be the copier's.
+
+`quantity` is signed and in the slave broker's own unit, so the `size_unit`
+warning applies to it too.
+
+**`size_unit` is derived, not configured.** Mirror mode speaks to an MT
+terminal, so `"lots"`. Autonomous mode is `"contracts"` when the symbol has a
+futures spec in `contract_specs.py` and `"shares"` when it does not, which is
+how that module already distinguishes a future from an ETF. A slave may
+override with a `size_unit` key in its config. Nothing is ever converted.
+
+**`requested_price` means different things per mode, deliberately.** Mirror
+mode aims at the master's own level — same instrument, or one mapped onto it
+-- so it reports `signal.price`. Autonomous mode is trading a different
+instrument on a different price scale, where the master's entry is context and
+not a slippage reference, so it reports the limit price where a limit was
+placed and otherwise the quote the stops were sized from. `fill_price` is the
+broker's in both cases, and `null` where the broker has not reported one yet.
+
+**`balance_adjustments` lists only the non-zero ones.** The snapshot example
+above shows `{"ibkr-paper-1": 0.0}` and the full report shows `{}`; the
+implementation sends the second. An adjustment of zero is the absence of one,
+and a dictionary of zeros reads as though something were configured.
+
+**`copier.version`** is `"5.1.0"`. The copier had no version string at all --
+this introduced one, numbered from the README's "Phase 5 hardening" as the
+state the reporter was added to.
+
+## Two event types beyond the catalogue
+
+The copier reports these, and the hub should store them like any other rather
+than reject the report:
+
+| type | class | `detail` |
+|---|---|---|
+| `contract_roll` | info | `slave_symbol`, `slave_ticket`, `from_contract`, `to_contract`, `sl`, `tp` |
+| `drawdown_alert` | **alert** | `account_type`, `drawdown_pct`, `peak_equity`, `equity` |
+
+Both are in the copier's vocabulary and neither was in the table. Dropping
+them would leave the tab missing the two events most likely to explain a
+surprise: a roll replaces a live position with a different contract, and a
+drawdown alert is the account itself saying something.
+
+**More generally: the hub must tolerate a `type` it does not know.** The
+copier passes an unmapped bus event through with its own fields as `detail`,
+so a new event added to an engine shows up in the tab as something unlabelled
+rather than silently vanishing. Treat an unknown type as `info`.
+
+## Fields added beyond the catalogue's rows
+
+- `signal_refused.action` — `"OPEN"`, `"MODIFY"` or `"CLOSE"`. A refused
+  CLOSE leaves the slave holding a position the master has exited and needs a
+  human; a refused OPEN is a missed trade. Nothing like each other.
+- `master_disconnected` / `master_reconnected` now carry `silent_for_s`, which
+  the spec asked for and the copier was not measuring.
+- `open_deferred` / `close_deferred` carry `retry_every_s` as specified, and
+  `close_deferred` also carries `slave_ticket`.
+- `deferred_*_abandoned` carry `attempts` alongside `reason` and `waited_s`.
+
+## Fields that are `null` today, and why
+
+Each is a case where the copier does not hold the number at the point the
+event is emitted. None is hard to add later; none was worth changing an
+engine's internals for now.
+
+| field | why |
+|---|---|
+| `deferred_open_filled.slave_ticket`, `.fill_price` | the retry runs the whole open path again and emits its own `slave_open`, which carries both. This event says only that the wait ended. |
+| `entry_unfilled.limit_price`, `.waited_s` | the adapter cancels the order and reports the outcome; neither the original limit nor the elapsed wait is in hand at that point. |
+| `netting_blocked.net_held` on an **autonomous** slave | the refusal is decided inside a per-candidate loop. Mirror slaves do report it, read back off the same positions the refusal was decided from rather than asked for again. |
+| `slave_open.legs` | always `1`. Both engines place one broker order per leg; a size that had to be split would report the number it became. |
+| `slaves[].preflight` | `null` until preflight has finished, and on any adapter that cannot resolve contracts at all. Not the same as "nothing resolved". |
+
+## Counters are a convenience, not the record
+
+`counters.today` and `counters.since_start` are kept in the copier's memory
+and derived from the event stream. `since_start` means what it says.
+**`today` resets when the copier restarts**, which the hub should not inherit:
+the hub has the events themselves and can count a real UTC day from them. Use
+these for a header figure, not for a daily total anyone relies on.
+
+The mapping, so the hub's own counting can agree with the tab's header:
+
+- **received** — `signal_received`
+- **copied** — `slave_open`, `slave_modify`, `slave_close`,
+  `deferred_open_filled`, `deferred_close_filled`
+- **refused** — `trading_hours_blocked`, `netting_blocked`, `margin_blocked`,
+  `route_blocked`, `route_unresolved`, `signal_unrouted`,
+  `duplicate_open_ignored`, `signal_refused`, `kill_switch_blocked`,
+  `deferred_open_cancelled`
+- **failed** — `slave_error`, `slave_start_failed`, `slave_recovery_failed`,
+  `entry_unfilled`, `deferred_open_abandoned`, `deferred_close_abandoned`
+
+`margin_reduced` and the two `*_deferred` events feed none: the copy they
+belong to is counted by its own event, and counting these as well would
+double it.
+
+Note also that the autonomous engine's own name for a netting refusal is
+`netting_refused`; the reporter maps it onto the spec's `netting_blocked`, so
+the hub sees one type for both engines.
+
+## What is NOT deployed
+
+`enabled` is `false` in `hub/config/hub_reporter.json`, there is no key, and
+nothing has been pointed at production. The copier's tests run against a stub
+HTTP server on a loopback port (`hub/tests/stub_hub.py`), and one of them
+asserts that no test file can so much as name the production host.
+
+Switching it on, once the hub has a route and has issued a key: put the key in
+`ODH_COPIER_KEY` or in `hub/config/hub_key.txt` (gitignored), set `enabled` to
+true, and restart the copier. With no key the reporter subscribes to nothing,
+starts no task and writes no row.
