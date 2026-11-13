@@ -10,6 +10,7 @@ from app.config import settings
 from app.db import init_db
 from app.engine_manager import start_engines, stop_engine
 from app.events import EventBus
+from app.hub_reporter import HubReporter
 from app.logging_config import setup_logging
 from app.notifier import Notifier
 from app.schwab_routes import router as schwab_router
@@ -56,9 +57,21 @@ async def lifespan(app: FastAPI):
     app.state.master_watchdog = master_watchdog
     app.state.start_time = START_TIME
 
+    # Last, and reading app.state rather than holding its own copy: the
+    # engines list grows while the copier runs (POST /slaves), and a
+    # snapshot built from a list captured here would stop mentioning new
+    # slaves. Off unless a key is configured, in which case this does
+    # nothing whatever -- see app/hub_reporter.
+    reporter = HubReporter(events, app.state)
+    await reporter.start()
+    app.state.hub_reporter = reporter
+
     yield
 
     logger.info("shutting down trade copier hub")
+    # Stopped first, so a report in flight cannot be holding the event bus
+    # open while the engines are being torn down beneath it.
+    await reporter.stop()
     await master_watchdog.stop()
     for engine in engines:
         await stop_engine(engine, bus)
