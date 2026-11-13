@@ -110,6 +110,28 @@ CREATE TABLE IF NOT EXISTS logs (
     message         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs (ts);
+
+-- The Operations hub reporter's outbox. A table rather than a file because
+-- an append interrupted mid-write must not corrupt the backlog: these rows
+-- are the only record that an event happened at all once the live feed has
+-- moved on, and they have to survive a restart intact.
+--
+-- `event_id` is assigned when the event is queued and stored WITH it, so
+-- the id survives a restart along with the event it belongs to and the same
+-- occurrence is never given two ids. UNIQUE because the hub deduplicates on
+-- it, and an id issued twice here would defeat that.
+--
+-- `payload` is the whole event as the hub will receive it, built once at
+-- queue time. Rebuilding it at send time would read engine state that has
+-- since moved on, which is how a resend after an outage comes to disagree
+-- with what actually happened.
+CREATE TABLE IF NOT EXISTS hub_outbox (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    TEXT NOT NULL UNIQUE,
+    at          TEXT NOT NULL,      -- when it happened: ISO-8601 UTC, Z
+    queued_at   REAL NOT NULL,      -- hub clock, for the queue's own age
+    payload     TEXT NOT NULL       -- the complete event JSON
+);
 """
 
 
