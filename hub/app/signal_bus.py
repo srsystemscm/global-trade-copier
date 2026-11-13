@@ -106,6 +106,9 @@ class SignalBus:
             return
 
         self._seen[self._dedup_key(signal)] = time.time()
+        # Stamped before anything is told about the signal, so every
+        # consumer measures its own latency from the same moment.
+        signal.received_at = time.time()
         self._persist(signal, raw)
 
         logger.info(
@@ -114,11 +117,25 @@ class SignalBus:
             signal.lots, signal.price, signal.sl, signal.tp,
         )
 
+        # Decided before the arrival is announced so the announcement can
+        # say how many slaves this signal actually reached. "Received" is
+        # only worth reporting next to "copied" if a signal that routed
+        # nowhere is distinguishable from one that was never sent.
+        blocked = is_kill_switch_active()
+
         if self.events:
             await self.events.emit(
                 {
                     "type": "signal",
                     "ticket": signal.ticket,
+                    # The hub reporter's identity fields, under the names
+                    # every other event on this bus uses. `ticket`/`symbol`
+                    # stay as they were: the dashboard's activity feed reads
+                    # them.
+                    "master_ticket": signal.ticket,
+                    "master_account": signal.account,
+                    "master_symbol": signal.symbol,
+                    "magic": signal.magic,
                     "symbol": signal.symbol,
                     "action": signal.action,
                     "direction": signal.direction,
@@ -126,15 +143,24 @@ class SignalBus:
                     "price": signal.price,
                     "sl": signal.sl,
                     "tp": signal.tp,
+                    "atr": signal.atr,
                     "account": signal.account,
                     "ts": signal.ts,
+                    "targets": 0 if blocked else len(self._slave_queues),
                 }
             )
 
-        if is_kill_switch_active():
+        if blocked:
             logger.warning("kill switch active, not fanning out ticket=%s to any slave", signal.ticket)
             if self.events:
-                await self.events.emit({"type": "kill_switch_blocked", "ticket": signal.ticket})
+                await self.events.emit({
+                    "type": "kill_switch_blocked",
+                    "ticket": signal.ticket,
+                    "master_ticket": signal.ticket,
+                    "master_account": signal.account,
+                    "master_symbol": signal.symbol,
+                    "magic": signal.magic,
+                })
             return
 
         for slave_id, queue in self._slave_queues.items():

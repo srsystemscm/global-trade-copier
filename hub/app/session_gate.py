@@ -55,7 +55,7 @@ class SessionGateMixin:
         )
         await self._emit(
             "signal_refused",
-            master_ticket=signal.ticket,
+            signal=signal,
             action=signal.action,
             reason="session_down",
         )

@@ -119,9 +119,15 @@ async def start_engines(
     for slave in slaves:
         try:
             engines.append(await start_engine_for_slave(slave, bus, events, notifier))
-        except Exception:
+        except Exception as exc:
             logger.exception("slave=%s failed to start; the hub is running WITHOUT it", slave.id)
-            await events.emit({"type": "slave_start_failed", "slave_id": slave.id})
+            # With the reason. A slave that is simply absent from the hub's
+            # stream looks the same as one that was never configured, and
+            # the reason is the only thing that says which.
+            await events.emit({
+                "type": "slave_start_failed", "slave_id": slave.id,
+                "message": str(exc) or type(exc).__name__,
+            })
             await notifier.notify(
                 "slave_start_failed",
                 f"Slave {slave.id} did not start and is NOT copying -- check the hub log",

@@ -123,9 +123,17 @@ class SlaveWatchdog:
             self.connected = False
             self.on_session_state(False)
             logger.warning("slave=%s disconnected", self.slave_id)
-            await self.events.emit({"type": "slave_disconnected", "slave_id": self.slave_id})
+            msg = f"Slave {self.slave_id} disconnected"
+            # The message rides on the event as well as the notification.
+            # IB Gateway's forced daily restart is what this normally is,
+            # and a reader of the Operations hub's stream can only tell
+            # that from an ordinary outage if the text comes with it.
+            await self.events.emit({
+                "type": "slave_disconnected", "slave_id": self.slave_id,
+                "message": msg,
+            })
             await self.notifier.notify(
-                "slave_disconnected", f"Slave {self.slave_id} disconnected", slave_id=self.slave_id
+                "slave_disconnected", msg, slave_id=self.slave_id
             )
             if self.recover is not None:
                 await self._recover_session()
@@ -134,7 +142,10 @@ class SlaveWatchdog:
         self.connected = True
         self.on_session_state(True)
         logger.info("slave=%s %s", self.slave_id, event_type)
-        await self.events.emit({"type": event_type, "slave_id": self.slave_id, **fields})
+        await self.events.emit({
+            "type": event_type, "slave_id": self.slave_id,
+            "message": message, **fields,
+        })
         await self.notifier.notify(event_type, message, slave_id=self.slave_id, **fields)
 
     async def _recover_session(self) -> None:
@@ -207,7 +218,8 @@ class SlaveWatchdog:
         )
         logger.error(msg)
         await self.events.emit(
-            {"type": "slave_recovery_failed", "slave_id": self.slave_id, "attempts": attempts}
+            {"type": "slave_recovery_failed", "slave_id": self.slave_id,
+             "attempts": attempts, "message": msg}
         )
         await self.notifier.notify("slave_recovery_failed", msg, slave_id=self.slave_id)
 
@@ -304,14 +316,25 @@ class MasterWatchdog:
                 if fresh and not prev:
                     self._known_state[account] = True
                     logger.info("master account=%s reconnected", account)
-                    await self.events.emit({"type": "master_reconnected", "account": account})
+                    # How long the silence lasted. A SUB socket cannot tell
+                    # a dead publisher from a quiet one, so the heartbeat
+                    # gap is the only measurement of a master's outage
+                    # there is -- and a reader needs the length of it, not
+                    # just the fact.
+                    await self.events.emit({
+                        "type": "master_reconnected", "account": account,
+                        "silent_for_s": round(now - last_seen),
+                    })
                     await self.notifier.notify(
                         "master_reconnected", f"Master account {account} reconnected", account=account
                     )
                 elif not fresh and prev:
                     self._known_state[account] = False
                     logger.warning("master account=%s heartbeat stale (disconnected)", account)
-                    await self.events.emit({"type": "master_disconnected", "account": account})
+                    await self.events.emit({
+                        "type": "master_disconnected", "account": account,
+                        "silent_for_s": round(now - last_seen),
+                    })
                     await self.notifier.notify(
                         "master_disconnected", f"Master account {account} stopped sending heartbeats", account=account
                     )

@@ -146,6 +146,10 @@ class AutonomousCopyEngine(SessionGateMixin):
         # {symbol: reason}. Treated as a per-candidate refusal, so a tier
         # steps past a blocked one and a single-target route says why.
         self.blocked_targets: Dict[str, str] = {}
+        # What preflight found, once it has run: {targets, resolved, at}.
+        # None means it has not finished (or this adapter cannot resolve
+        # contracts at all), which is not the same as "nothing resolved".
+        self.preflight: Optional[Dict[str, Any]] = None
         self._preflight_done = asyncio.Event()
         self._preflight_task: Optional[asyncio.Task] = None
         self.preflight_wait_seconds = float(
@@ -217,9 +221,45 @@ class AutonomousCopyEngine(SessionGateMixin):
             except (asyncio.CancelledError, Exception):
                 pass
 
-    async def _emit(self, event_type: str, **fields) -> None:
-        if self.events:
-            await self.events.emit({"type": event_type, "slave_id": self.slave_id, **fields})
+    async def _emit(self, event_type: str, signal: Optional[Signal] = None, **fields) -> None:
+        """Put an event on the bus, stamped with the trade it belongs to.
+
+        `signal=` fills master_ticket, master_account, magic and
+        master_symbol from one place. All four identify the trade on the
+        Operations hub's side and three of them were missing from every
+        event this engine emitted, because each call site passed
+        `master_ticket=signal.ticket` and stopped there. `magic` matters
+        most here of all: this engine already routes on it, so an event
+        without it cannot be attributed to the strategy its own routing
+        decision was made from.
+
+        Call sites that hold a key rather than a signal -- the trailing
+        monitor, the roll, preflight -- pass the fields they have by hand.
+        """
+        if not self.events:
+            return
+        payload: Dict[str, Any] = {"type": event_type, "slave_id": self.slave_id}
+        if signal is not None:
+            payload.update(
+                master_ticket=signal.ticket,
+                master_account=signal.account,
+                magic=signal.magic,
+                master_symbol=signal.symbol,
+            )
+        payload.update(fields)
+        await self.events.emit(payload)
+
+    @staticmethod
+    def _elapsed_ms(signal: Signal, at: float) -> int:
+        """Milliseconds from the hub first seeing this signal to `at`.
+
+        Measured from `received_at`, the hub's own clock, and never from the
+        master EA's `ts`: that is another machine's clock at whole-second
+        resolution, and differences against it are mostly skew. Falls back
+        to `ts` only for a signal that never went through the bus, which in
+        practice means one a test constructed by hand.
+        """
+        return round((at - (signal.received_at or signal.ts)) * 1000)
 
     async def _run(self) -> None:
         while True:
@@ -237,7 +277,7 @@ class AutonomousCopyEngine(SessionGateMixin):
                     self.slave_id, signal.action, signal.ticket, exc,
                 )
                 await self._emit(
-                    "slave_error", master_ticket=signal.ticket, action=signal.action, message=str(exc)
+                    "slave_error", signal=signal, action=signal.action, message=str(exc)
                 )
 
     async def _handle(self, signal: Signal) -> None:
@@ -257,15 +297,20 @@ class AutonomousCopyEngine(SessionGateMixin):
                 "slave=%s skipping OPEN ticket=%s: outside configured trading hours",
                 self.slave_id, signal.ticket,
             )
-            await self._emit("trading_hours_blocked", master_ticket=signal.ticket)
+            await self._emit("trading_hours_blocked", signal=signal)
             return
 
         routes = resolve_routes(self.slave_config, signal)
         if not routes:
+            # Described once and both logged and reported. A signal that
+            # routed nowhere is the case where "received" and "copied"
+            # legitimately disagree, so the reason has to travel with it
+            # rather than live only in this hub's log file.
+            refusal = describe_refusal(self.slave_config, signal)
             logger.warning("slave=%s refusing signal ticket=%s: %s",
-                           self.slave_id, signal.ticket, describe_refusal(self.slave_config, signal))
-            await self._emit("signal_unrouted", master_ticket=signal.ticket,
-                             symbol=signal.symbol, magic=signal.magic)
+                           self.slave_id, signal.ticket, refusal)
+            await self._emit("signal_unrouted", signal=signal,
+                             symbol=signal.symbol, reason=refusal)
             return
 
         if not signal.atr or signal.atr <= 0:
@@ -371,12 +416,22 @@ class AutonomousCopyEngine(SessionGateMixin):
                     "route still works",
                     self.slave_id, symbol, slot, exc,
                 )
-                await self._emit("route_unresolved", slave_symbol=symbol,
-                                 month_slot=slot, reason=exc)
+                await self._emit("route_unresolved", target=symbol,
+                                 slave_symbol=symbol, month_slot=slot,
+                                 reason=exc)
             for symbol, reason in blocked.items():
                 logger.error("slave=%s %s", self.slave_id, reason)
-                await self._emit("route_blocked", slave_symbol=symbol,
-                                 reason=reason)
+                await self._emit("route_blocked", target=symbol,
+                                 slave_symbol=symbol, reason=reason)
+            # Kept, not only logged: the Operations hub reports it per
+            # slave, and "12 of 12 targets resolved, at 20:29" is the
+            # difference between a slave that is quiet and one whose routes
+            # never came up at all.
+            self.preflight = {
+                "targets": len(targets),
+                "resolved": len(targets) - len(unresolved),
+                "at": time.time(),
+            }
             if not unresolved and not blocked:
                 logger.info(
                     "slave=%s preflight: all %d route targets resolve, and "
@@ -703,8 +758,9 @@ class AutonomousCopyEngine(SessionGateMixin):
                 # policy, not by arithmetic, and that is the thing worth
                 # seeing in the ledger.
                 await self._emit(
-                    "netting_refused", master_ticket=signal.ticket,
-                    slave_symbol=candidates[0], reason="; ".join(refused))
+                    "netting_refused", signal=signal,
+                    slave_symbol=candidates[0], direction=signal.direction,
+                    reason="; ".join(refused))
             return
 
         if rejected:
@@ -742,7 +798,7 @@ class AutonomousCopyEngine(SessionGateMixin):
                 "ignoring a repeat OPEN",
                 self.slave_id, target_symbol, signal.ticket, already[0].slave_ticket,
             )
-            await self._emit("duplicate_open_ignored", master_ticket=signal.ticket,
+            await self._emit("duplicate_open_ignored", signal=signal,
                              slave_symbol=target_symbol, slave_ticket=already[0].slave_ticket)
             return
 
@@ -844,12 +900,29 @@ class AutonomousCopyEngine(SessionGateMixin):
             logger.info("slave=%s   (magic=%s -> month_slot=%s)", self.slave_id, signal.magic, route.month_slot)
         await self._emit(
             "slave_open",
-            master_ticket=signal.ticket,
+            signal=signal,
             slave_symbol=target_symbol,
             slave_ticket=result.slave_ticket,
-            size=sizing_result.size,
+            # What actually went on, where the broker says so.
+            size=result.lots if result.lots is not None else sizing_result.size,
+            # The sizing engine's own sentence. It names the mode, the stop
+            # distance, the capital it measured and the size that came out,
+            # which is the whole of "why is this leg this big".
+            sizing=sizing_result.reason,
+            # The level the order aimed at: the limit where one was placed,
+            # otherwise the quote the stops were sized from. NOT the
+            # master's price -- this is a different instrument on a
+            # different price scale, so the master's entry is context, not
+            # a slippage reference.
+            requested_price=limit_price if limit_price is not None else quote,
+            fill_price=result.price,
             sl=slave_sl,
             tp=slave_tp,
+            # One broker order per leg. A size that had to be split across
+            # several would be reported as the number it became.
+            legs=1,
+            latency_ms=round((filled_at - requested_at) * 1000),
+            signal_to_fill_ms=self._elapsed_ms(signal, filled_at),
         )
 
     async def _handle_modify(self, signal: Signal) -> None:
@@ -936,11 +1009,12 @@ class AutonomousCopyEngine(SessionGateMixin):
             )
             await self._emit(
                 "slave_modify",
-                master_ticket=signal.ticket,
+                signal=signal,
                 slave_symbol=target_symbol,
                 slave_ticket=pos["slave_ticket"],
                 sl=slave_sl,
                 tp=slave_tp,
+                legs_moved=1,
             )
 
     async def _defer_open(self, signal, route, sl_mult, tp_mult, exc) -> None:
@@ -950,7 +1024,7 @@ class AutonomousCopyEngine(SessionGateMixin):
                 "slave=%s could not open %s for master_ticket=%s: %s",
                 self.slave_id, route.target, signal.ticket, exc,
             )
-            await self._emit("slave_error", master_ticket=signal.ticket,
+            await self._emit("slave_error", signal=signal,
                              action="OPEN", message=str(exc))
             return
 
@@ -970,8 +1044,9 @@ class AutonomousCopyEngine(SessionGateMixin):
             self.slave_id, route.target, signal.ticket,
             self.defer_retry_seconds, self.defer_max_seconds, exc,
         )
-        await self._emit("open_deferred", master_ticket=signal.ticket,
-                         slave_symbol=route.target, reason=str(exc))
+        await self._emit("open_deferred", signal=signal,
+                         slave_symbol=route.target, reason=str(exc),
+                         retry_every_s=self.defer_retry_seconds)
 
     async def _deferred_loop(self) -> None:
         """Retry held opens until the broker takes them, or time runs out.
@@ -1021,8 +1096,9 @@ class AutonomousCopyEngine(SessionGateMixin):
                     "and %d attempt(s)",
                     self.slave_id, key[2], key[1], waited, item["attempts"],
                 )
-                await self._emit("deferred_open_filled", master_ticket=key[1],
-                                 slave_symbol=key[2], waited_seconds=round(waited))
+                await self._emit("deferred_open_filled", signal=item["signal"],
+                                 slave_symbol=key[2], waited_seconds=round(waited),
+                                 attempts=item["attempts"])
 
     async def _abandon_deferred(self, key, item) -> None:
         """Give up, loudly. The master is in this trade and this leg is not."""
@@ -1033,9 +1109,10 @@ class AutonomousCopyEngine(SessionGateMixin):
             f"Last error: {item['last_error']}"
         )
         logger.error(msg)
-        await self._emit("deferred_open_abandoned", master_ticket=key[1],
+        await self._emit("deferred_open_abandoned", signal=item["signal"],
                          slave_symbol=key[2], attempts=item["attempts"],
-                         message=item["last_error"])
+                         reason=item["last_error"], message=item["last_error"],
+                         waited_seconds=round(self.defer_max_seconds))
         if self.notifier:
             await self.notifier.notify(
                 "deferred_open_abandoned", msg, slave_id=self.slave_id,
@@ -1099,7 +1176,8 @@ class AutonomousCopyEngine(SessionGateMixin):
             f"NOT."
         )
         logger.error(msg)
-        await self._emit("entry_unfilled", master_ticket=master_ticket,
+        await self._emit("entry_unfilled", master_account=account,
+                         master_ticket=master_ticket,
                          slave_symbol=slave_symbol, slave_ticket=slave_ticket)
         if self.notifier:
             await self.notifier.notify(
@@ -1173,7 +1251,7 @@ class AutonomousCopyEngine(SessionGateMixin):
                 "slave=%s could not close %s slave_ticket=%s: %s",
                 self.slave_id, mapping.slave_symbol, mapping.slave_ticket, exc,
             )
-            await self._emit("slave_error", master_ticket=signal.ticket,
+            await self._emit("slave_error", signal=signal,
                              action="CLOSE", message=str(exc))
             return
 
@@ -1193,9 +1271,10 @@ class AutonomousCopyEngine(SessionGateMixin):
             self.slave_id, mapping.slave_symbol, mapping.slave_ticket,
             self.defer_close_retry_seconds, self.defer_close_max_seconds, exc,
         )
-        await self._emit("close_deferred", master_ticket=signal.ticket,
+        await self._emit("close_deferred", signal=signal,
                          slave_symbol=mapping.slave_symbol,
-                         slave_ticket=mapping.slave_ticket, reason=str(exc))
+                         slave_ticket=mapping.slave_ticket, reason=str(exc),
+                         retry_every_s=self.defer_close_retry_seconds)
 
     async def _deferred_close_loop(self) -> None:
         """Retry held exits until the broker takes them.
@@ -1257,8 +1336,10 @@ class AutonomousCopyEngine(SessionGateMixin):
                 )
                 self._finish_close(signal, mapping, slave_close=slave_close)
                 await self._emit("deferred_close_filled",
-                                 master_ticket=signal.ticket,
+                                 signal=signal,
                                  slave_symbol=mapping.slave_symbol,
+                                 slave_ticket=mapping.slave_ticket,
+                                 fill_price=slave_close,
                                  waited_seconds=round(waited))
                 if slave_close is None:
                     self._capture_fill("exit", signal.account, signal.ticket,
@@ -1278,9 +1359,10 @@ class AutonomousCopyEngine(SessionGateMixin):
             f"close it by hand. Last error: {item['last_error']}"
         )
         logger.error(msg)
-        await self._emit("deferred_close_abandoned", master_ticket=key[1],
+        await self._emit("deferred_close_abandoned", signal=item["signal"],
                          slave_symbol=key[2], attempts=item["attempts"],
-                         message=item["last_error"])
+                         reason=item["last_error"], message=item["last_error"],
+                         waited_seconds=round(self.defer_close_max_seconds))
         if self.notifier:
             await self.notifier.notify(
                 "deferred_close_abandoned", msg, slave_id=self.slave_id,
@@ -1311,8 +1393,10 @@ class AutonomousCopyEngine(SessionGateMixin):
                 "fill; dropping them rather than opening into a closed trade",
                 self.slave_id, signal.ticket, dropped,
             )
-            await self._emit("deferred_open_cancelled", master_ticket=signal.ticket,
-                             dropped=dropped)
+            await self._emit("deferred_open_cancelled", signal=signal,
+                             dropped=dropped,
+                             reason=f"the master closed this ticket before "
+                                    f"{dropped} deferred open(s) could fill")
 
         mappings = trade_registry.get_open_mappings(self.slave_id, signal.account, signal.ticket)
         if not mappings:
@@ -1321,6 +1405,7 @@ class AutonomousCopyEngine(SessionGateMixin):
             )
             return
         for mapping in mappings:
+            requested_at = time.time()
             try:
                 slave_close = await self.adapter.close(mapping.slave_ticket)
             except EntryNeverFilled as exc:
@@ -1336,7 +1421,7 @@ class AutonomousCopyEngine(SessionGateMixin):
                     (signal.account, signal.ticket, mapping.slave_symbol), None)
                 position_store.delete(
                     self.slave_id, signal.account, signal.ticket, mapping.slave_symbol)
-                await self._emit("entry_unfilled", master_ticket=signal.ticket,
+                await self._emit("entry_unfilled", signal=signal,
                                  slave_symbol=mapping.slave_symbol,
                                  slave_ticket=mapping.slave_ticket)
                 continue
@@ -1366,9 +1451,11 @@ class AutonomousCopyEngine(SessionGateMixin):
             )
             await self._emit(
                 "slave_close",
-                master_ticket=signal.ticket,
+                signal=signal,
                 slave_symbol=mapping.slave_symbol,
                 slave_ticket=mapping.slave_ticket,
+                fill_price=slave_close,
+                latency_ms=round((time.time() - requested_at) * 1000),
             )
             if self.notifier:
                 await self.notifier.notify(
@@ -1538,6 +1625,7 @@ class AutonomousCopyEngine(SessionGateMixin):
         )
         await self._emit(
             "contract_roll",
+            master_account=master_account,
             master_ticket=master_ticket,
             slave_symbol=symbol,
             from_contract=old_local,
@@ -1588,9 +1676,14 @@ class AutonomousCopyEngine(SessionGateMixin):
             )
             await self._emit(
                 "slave_modify",
+                # No signal here: the trailing monitor moved this stop on
+                # its own, so there is no master action to attribute it to
+                # and `magic` is genuinely unknown rather than dropped.
+                master_account=key[0],
                 master_ticket=key[1],
                 slave_symbol=target_symbol,
                 slave_ticket=pos["slave_ticket"],
                 sl=new_sl,
                 tp=pos["tp"],
+                legs_moved=1,
             )

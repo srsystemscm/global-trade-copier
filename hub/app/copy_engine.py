@@ -14,6 +14,18 @@ from app.session_gate import SessionGateMixin
 logger = logging.getLogger(__name__)
 
 
+def _elapsed_ms(signal: Signal, at: float) -> int:
+    """Milliseconds from the hub first seeing this signal to `at`.
+
+    Measured from `received_at`, the hub's own clock, and never from the
+    master EA's `ts`: that is another machine's clock at whole-second
+    resolution, and differences against it are mostly skew. Falls back to
+    `ts` only for a signal that never went through the bus, which in
+    practice means one a test constructed by hand.
+    """
+    return round((at - (signal.received_at or signal.ts)) * 1000)
+
+
 class CopyEngine(SessionGateMixin):
     """Mirror-mode copy engine: one instance per slave.
 
@@ -168,9 +180,21 @@ class CopyEngine(SessionGateMixin):
         if note:
             logger.warning("slave=%s ticket=%s %s: %s",
                            self.slave_id, signal.ticket, plan.symbol, note)
+            asked = plan.lots
             plan.how += f" -- {note}"
-            await self._emit("margin_reduced", master_ticket=signal.ticket,
-                             slave_symbol=plan.symbol, size=lots, message=note)
+            # The numbers, not only the sentence. A reduction is the one
+            # case where the size on the account is not the size the risk
+            # model chose, so "how much of the asked risk is this leg
+            # actually carrying" has to be answerable without parsing prose.
+            await self._emit(
+                "margin_reduced", signal=signal,
+                slave_symbol=plan.symbol, size=lots, message=note,
+                asked=asked, sent=lots,
+                margin_required=getattr(preview, "initial_change", None),
+                margin_free=getattr(preview, "free_before", None),
+                ceiling_pct=policy.get("max_pct_of_free"),
+                risk_fraction_carried=(round(lots / asked, 6) if asked else None),
+            )
         return lots, None
 
     async def _slave_positions(self):
@@ -208,9 +232,33 @@ class CopyEngine(SessionGateMixin):
             except asyncio.CancelledError:
                 pass
 
-    async def _emit(self, event_type: str, **fields) -> None:
-        if self.events:
-            await self.events.emit({"type": event_type, "slave_id": self.slave_id, **fields})
+    async def _emit(self, event_type: str, signal: Optional[Signal] = None, **fields) -> None:
+        """Put an event on the bus, stamped with the trade it belongs to.
+
+        `signal=` fills master_ticket, master_account, magic and
+        master_symbol from one place. All four identify the trade on the
+        Operations hub's side and three of them were missing from every
+        event this engine emitted, because each call site passed
+        `master_ticket=signal.ticket` and stopped there. `magic` matters
+        most: it is how a copy is attributed to the strategy that produced
+        it, and the master EAs set it precisely so that attribution is
+        possible downstream.
+
+        Call sites that hold a key rather than a signal -- the trailing
+        monitor, the roll -- still pass the fields they have by hand.
+        """
+        if not self.events:
+            return
+        payload: Dict[str, Any] = {"type": event_type, "slave_id": self.slave_id}
+        if signal is not None:
+            payload.update(
+                master_ticket=signal.ticket,
+                master_account=signal.account,
+                magic=signal.magic,
+                master_symbol=signal.symbol,
+            )
+        payload.update(fields)
+        await self.events.emit(payload)
 
     async def _run(self) -> None:
         while True:
@@ -228,7 +276,7 @@ class CopyEngine(SessionGateMixin):
                     self.slave_id, signal.action, signal.ticket, exc,
                 )
                 await self._emit(
-                    "slave_error", master_ticket=signal.ticket, action=signal.action, message=str(exc)
+                    "slave_error", signal=signal, action=signal.action, message=str(exc)
                 )
 
     async def _handle(self, signal: Signal) -> None:
@@ -238,7 +286,7 @@ class CopyEngine(SessionGateMixin):
                     "slave=%s skipping OPEN ticket=%s: outside configured trading hours",
                     self.slave_id, signal.ticket,
                 )
-                await self._emit("trading_hours_blocked", master_ticket=signal.ticket)
+                await self._emit("trading_hours_blocked", signal=signal)
                 return
 
             # Already copied. The dedup in SignalBus keys on the EA's
@@ -259,7 +307,7 @@ class CopyEngine(SessionGateMixin):
                     "ignoring a repeat OPEN",
                     self.slave_id, signal.ticket, existing[0].slave_ticket,
                 )
-                await self._emit("duplicate_open_ignored", master_ticket=signal.ticket,
+                await self._emit("duplicate_open_ignored", signal=signal,
                                  slave_ticket=existing[0].slave_ticket)
                 return
 
@@ -269,7 +317,7 @@ class CopyEngine(SessionGateMixin):
                     "slave=%s refusing OPEN ticket=%s: %s",
                     self.slave_id, signal.ticket, reason,
                 )
-                await self._emit("slave_error", master_ticket=signal.ticket,
+                await self._emit("slave_error", signal=signal,
                                  action="OPEN", message=reason)
                 return
             target, lots = plan, plan.lots
@@ -283,8 +331,9 @@ class CopyEngine(SessionGateMixin):
                     "slave=%s refusing OPEN ticket=%s on %s: %s",
                     self.slave_id, signal.ticket, plan.symbol, reason,
                 )
-                await self._emit("margin_blocked", master_ticket=signal.ticket,
-                                 slave_symbol=plan.symbol, message=reason)
+                await self._emit("margin_blocked", signal=signal,
+                                 slave_symbol=plan.symbol, message=reason,
+                                 reason=reason)
                 return
 
             # Checked against what the account actually holds, not against what
@@ -314,8 +363,22 @@ class CopyEngine(SessionGateMixin):
                         "slave=%s refusing OPEN ticket=%s on %s: %s",
                         self.slave_id, signal.ticket, target.symbol, refusal,
                     )
-                    await self._emit("netting_blocked", master_ticket=signal.ticket,
-                                     slave_symbol=target.symbol, message=refusal)
+                    await self._emit(
+                        "netting_blocked", signal=signal,
+                        slave_symbol=target.symbol, message=refusal,
+                        reason=refusal, direction=signal.direction,
+                        # What the account was already holding when the leg
+                        # was turned away. Read back off the same positions
+                        # the refusal was decided from, rather than asked
+                        # for again: a second POSITIONS round trip could
+                        # answer differently and then the reason and the
+                        # number beside it would disagree.
+                        net_held=sum(
+                            float(getattr(p, "quantity", 0.0) or 0.0)
+                            for p in positions
+                            if getattr(p, "symbol", None) == target.symbol
+                        ),
+                    )
                     return
 
             logger.info(
@@ -361,12 +424,29 @@ class CopyEngine(SessionGateMixin):
             )
             await self._emit(
                 "slave_open",
-                master_ticket=signal.ticket,
+                signal=signal,
                 slave_symbol=target.symbol,
                 slave_ticket=result.slave_ticket,
-                size=lots,
-                sl=signal.sl,
-                tp=signal.tp,
+                # What actually went on, where the broker says so. The
+                # requested size is what was asked for, not what is held.
+                size=result.lots if result.lots is not None else lots,
+                # One line saying how the size was arrived at, so a figure
+                # on the hub can be explained without the hub log.
+                sizing=target.how,
+                # Mirror mode aims at the master's own level: same
+                # instrument, or one mapped onto it. It is the reference
+                # the fill is worth comparing against.
+                requested_price=signal.price,
+                fill_price=result.price,
+                # plan's levels, not the master's: where the slave trades a
+                # different instrument these are the translated ones, and
+                # they are what was actually placed.
+                sl=plan.sl,
+                tp=plan.tp,
+                # One order per copy here -- mirror mode never splits.
+                legs=1,
+                latency_ms=round((filled_at - requested_at) * 1000),
+                signal_to_fill_ms=_elapsed_ms(signal, filled_at),
             )
             return
 
@@ -384,14 +464,17 @@ class CopyEngine(SessionGateMixin):
                 logger.info("slave=%s modified slave_ticket=%s", self.slave_id, mapping.slave_ticket)
                 await self._emit(
                     "slave_modify",
-                    master_ticket=signal.ticket,
+                    signal=signal,
                     slave_symbol=mapping.slave_symbol,
                     slave_ticket=mapping.slave_ticket,
                     sl=signal.sl,
                     tp=signal.tp,
+                    legs_moved=1,
                 )
             elif signal.action == "CLOSE":
+                requested_at = time.time()
                 slave_close = await self.adapter.close(mapping.slave_ticket)
+                closed_at = time.time()
                 trade_registry.record_close(
                     self.slave_id, signal.account, signal.ticket, mapping.slave_symbol,
                     # 0 means the EA could not determine the exit; recorded as
@@ -402,9 +485,11 @@ class CopyEngine(SessionGateMixin):
                 logger.info("slave=%s closed slave_ticket=%s", self.slave_id, mapping.slave_ticket)
                 await self._emit(
                     "slave_close",
-                    master_ticket=signal.ticket,
+                    signal=signal,
                     slave_symbol=mapping.slave_symbol,
                     slave_ticket=mapping.slave_ticket,
+                    fill_price=slave_close,
+                    latency_ms=round((closed_at - requested_at) * 1000),
                 )
                 if self.notifier:
                     await self.notifier.notify(

@@ -30,6 +30,15 @@ class Signal(BaseModel):
     # would silently disable the uniqueness it exists to provide.
     account: str = ""
     ts: float = Field(default_factory=lambda: time.time())
+    # When the HUB first saw this signal, stamped by SignalBus.publish_raw().
+    #
+    # Separate from `ts`, which is the master EA's own TimeGMT(): that clock
+    # belongs to another machine, has whole-second resolution, and on a VPS
+    # pair routinely sits a second or two off this one. Measuring copy
+    # latency against it produces differences that are mostly clock skew --
+    # negative ones included -- so signal-to-fill is measured from here
+    # instead, and both halves stay on one clock.
+    received_at: Optional[float] = None
 
     @field_validator("account", mode="before")
     @classmethod
