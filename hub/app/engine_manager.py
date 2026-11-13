@@ -1,6 +1,7 @@
 import logging
 from typing import List, Optional, Union
 
+from app import magic_filter
 from app.adapters import create_adapter
 from app.autonomous_copy_engine import AutonomousCopyEngine
 from app.config import settings
@@ -30,13 +31,18 @@ async def start_engine_for_slave(slave: SlaveConfig, bus: SignalBus, events: Eve
     route, so a new slave added through the UI starts copying immediately
     without a hub restart.
     """
+    # Read first, before a broker connection exists to be left dangling:
+    # an unreadable magic selection has to stop this slave, and stopping it
+    # a step later would mean doing so with a live adapter in hand.
+    takes = magic_filter.parse(slave.config)
+
     adapter = create_adapter(slave)
     await adapter.connect()
 
     account_types = account_types_for(slave)
     await reconcile_slave(slave.id, adapter, account_types, events)
 
-    queue = bus.register_slave(slave.id)
+    queue = bus.register_slave(slave.id, takes)
 
     mode = slave.config.get("mode", "mirror")
     engine: Engine

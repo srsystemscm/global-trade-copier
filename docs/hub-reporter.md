@@ -454,6 +454,44 @@ and a dictionary of zeros reads as though something were configured.
 this introduced one, numbered from the README's "Phase 5 hardening" as the
 state the reporter was added to.
 
+## One snapshot field beyond the spec: `slaves[].magic_filter`
+
+A master terminal running thirty or forty origin EAs sends every strategy
+down one socket, and each slave takes a selection of them by magic number
+(`docs/magic-selection.md`). The snapshot reports that selection:
+
+```jsonc
+"magic_filter": {
+  "allow": [1001, 1002],
+  "deny": [],
+  "labels": {"1001": "US2000 trend", "1002": "GC breakout"},
+  "source": {"kind": "ops_hub_registry", "portfolio": "Trend",
+             "imported_at": "2026-11-12T20:05:02Z", "revision": 7}
+}
+```
+
+`null` means the slave takes every strategy, which is NOT the same as an
+empty selection; the tab has to tell those apart. `labels` and `source` are
+present only where the selection was imported with them.
+
+This is the field that closes the loop with the hub's own registry — the
+portfolio manager is what names a magic number, so the tab can render
+"this slave takes the trend-following book" rather than five integers,
+using its own names and not the copier's. `source` says which portfolio a
+selection was resolved from and at what revision, so a tab can show one
+that has drifted from the registry since.
+
+The copier never resolves a portfolio itself: the reporter is push-only,
+and a copier that fetched its own risk configuration from a web service
+would have the market open while a failed GET decided which strategies it
+was copying. Resolving is an offline step that writes the resolved list
+through the copier's own `PATCH /slaves/{id}`.
+
+**`targets` on `signal_received` counts the slaves that actually took the
+signal**, not the number of slaves registered. On a hub where each slave
+takes a selection those differ for nearly every signal, and the smaller
+number is the one that makes received comparable with copied.
+
 ## Two event types beyond the catalogue
 
 The copier reports these, and the hub should store them like any other rather

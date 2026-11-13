@@ -2,13 +2,15 @@ import asyncio
 import json
 import logging
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from pydantic import ValidationError
 
 from app.config import settings
 from app.db import db_cursor
 from app.events import EventBus
+from app.magic_filter import ALL as EVERY_MAGIC
+from app.magic_filter import MagicFilter
 from app.models import Signal
 from app.risk_controls import is_kill_switch_active
 
@@ -23,17 +25,63 @@ class SignalBus:
     def __init__(self, events: Optional[EventBus] = None) -> None:
         self._slave_queues: Dict[str, "asyncio.Queue[Signal]"] = {}
         self._seen: Dict[str, float] = {}  # f"{ticket}:{ts}" -> received_at
+        # Which strategies each slave takes, by magic number. See
+        # app/magic_filter.py for why the selection lives on the slave and
+        # is applied here rather than in the engines.
+        self._magic: Dict[str, MagicFilter] = {}
         self.events = events
 
-    def register_slave(self, slave_id: str) -> "asyncio.Queue[Signal]":
+    def register_slave(
+        self, slave_id: str, magic_filter: Optional[MagicFilter] = None
+    ) -> "asyncio.Queue[Signal]":
         queue: "asyncio.Queue[Signal]" = asyncio.Queue()
         self._slave_queues[slave_id] = queue
-        logger.info("registered slave queue: %s", slave_id)
+        self._magic[slave_id] = magic_filter or EVERY_MAGIC
+        logger.info("registered slave queue: %s (takes %s)",
+                    slave_id, self._magic[slave_id].describe())
         return queue
+
+    def set_magic_filter(
+        self, slave_id: str, magic_filter: Optional[MagicFilter] = None
+    ) -> None:
+        """Change which strategies a running slave takes, without a restart.
+
+        PATCH /slaves/{id} already live-updates symbol maps and sizing; a
+        magic selection that needed a hub restart would be the one piece of
+        a slave's config you could not adjust while the market was open.
+        """
+        if slave_id not in self._slave_queues:
+            return
+        self._magic[slave_id] = magic_filter or EVERY_MAGIC
+        logger.info("slave=%s now takes %s",
+                    slave_id, self._magic[slave_id].describe())
 
     def unregister_slave(self, slave_id: str) -> None:
         self._slave_queues.pop(slave_id, None)
+        self._magic.pop(slave_id, None)
         logger.info("unregistered slave queue: %s", slave_id)
+
+    def _recipients(self, signal: Signal) -> List[str]:
+        """The slaves configured to take this signal.
+
+        Decided before the arrival is announced, because the announcement
+        reports how many slaves it fanned to -- and a count of every
+        registered slave would be wrong for every signal on a hub where
+        each slave takes a selection of the strategies.
+        """
+        taking = []
+        for slave_id in self._slave_queues:
+            accepts, why = self._magic.get(slave_id, EVERY_MAGIC).accepts(signal)
+            if accepts:
+                taking.append(slave_id)
+            else:
+                # Debug, not a warning, and never an event: a slave not
+                # taking a strategy is this working, not a problem, and on
+                # a master running forty EAs the warning would be most of
+                # the log.
+                logger.debug("slave=%s not taking ticket=%s: %s",
+                             slave_id, signal.ticket, why)
+        return taking
 
     def _dedup_key(self, signal: Signal) -> str:
         # `ts` comes from the master EA's TimeGMT(), which has whole-second
@@ -117,11 +165,12 @@ class SignalBus:
             signal.lots, signal.price, signal.sl, signal.tp,
         )
 
-        # Decided before the arrival is announced so the announcement can
-        # say how many slaves this signal actually reached. "Received" is
-        # only worth reporting next to "copied" if a signal that routed
+        # Both decided before the arrival is announced so the announcement
+        # can say how many slaves this signal actually reached. "Received"
+        # is only worth reporting next to "copied" if a signal that routed
         # nowhere is distinguishable from one that was never sent.
         blocked = is_kill_switch_active()
+        recipients = self._recipients(signal)
 
         if self.events:
             await self.events.emit(
@@ -146,7 +195,7 @@ class SignalBus:
                     "atr": signal.atr,
                     "account": signal.account,
                     "ts": signal.ts,
-                    "targets": 0 if blocked else len(self._slave_queues),
+                    "targets": 0 if blocked else len(recipients),
                 }
             )
 
@@ -163,6 +212,14 @@ class SignalBus:
                 })
             return
 
-        for slave_id, queue in self._slave_queues.items():
-            await queue.put(signal)
+        if not recipients:
+            logger.info(
+                "ticket=%s magic=%s reached no slave: none of %d is configured "
+                "to take that strategy",
+                signal.ticket, signal.magic, len(self._slave_queues),
+            )
+            return
+
+        for slave_id in recipients:
+            await self._slave_queues[slave_id].put(signal)
             logger.debug("fanned out ticket=%s to slave=%s", signal.ticket, slave_id)

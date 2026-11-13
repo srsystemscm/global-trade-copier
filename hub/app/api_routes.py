@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from app import trade_registry
+from app import magic_filter, trade_registry
 from app.adapters.base import AdapterError
 from app.config import settings
 from app.db import db_cursor, get_config_value, list_logs, set_config_value
@@ -50,6 +50,22 @@ class RiskUpdate(BaseModel):
     trading_hours_enabled: Optional[bool] = None
     trading_hours_start: Optional[str] = None  # "HH:MM", UTC
     trading_hours_end: Optional[str] = None
+
+
+def _validated_magic_filter(config: Optional[Dict[str, Any]]):
+    """Parse a config's magic selection, or answer 400 saying what is wrong.
+
+    Called before anything is written. A selection that cannot be read must
+    not reach the database: persisted, it would stop the slave from
+    starting on the next restart rather than on the request that broke it,
+    and the connection between the two would be a day old by then.
+    """
+    if config is None:
+        return None
+    try:
+        return magic_filter.parse(config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 def _find_engine(request: Request, slave_id: str):
@@ -114,6 +130,7 @@ async def create_slave(payload: SlaveCreate, request: Request):
         raise HTTPException(400, f"unknown broker_type {payload.broker_type!r}")
     if get_slave(payload.id) is not None:
         raise HTTPException(409, f"slave id {payload.id!r} already exists")
+    _validated_magic_filter(payload.config)
 
     slave = insert_slave(payload.id, payload.name, payload.broker_type, payload.config, payload.enabled)
 
@@ -136,6 +153,8 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
     if slave is None:
         raise HTTPException(404, f"no slave with id={slave_id!r}")
 
+    takes = _validated_magic_filter(payload.config)
+
     if payload.name is not None or payload.config is not None:
         slave = update_slave(slave_id, name=payload.name, config=payload.config)
         engine = _find_engine(request, slave_id)
@@ -148,6 +167,11 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
             engine.risk_config = slave.config.get("risk_management", {})
             if hasattr(engine, "roll_config"):
                 engine.roll_config = slave.config.get("contract_roll", {})
+        if payload.config is not None:
+            # Held by the bus, not the engine: the selection decides what
+            # reaches this slave's queue in the first place. Updated even
+            # when no engine is running, which is a no-op the bus ignores.
+            request.app.state.bus.set_magic_filter(slave_id, takes)
 
     if payload.paused is not None:
         set_paused(slave_id, payload.paused)

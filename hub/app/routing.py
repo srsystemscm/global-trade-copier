@@ -98,11 +98,38 @@ def routing_is_strict(slave_config: Dict[str, Any]) -> bool:
     return slave_config.get("routes") is not None
 
 
+def _magic_match(declared: Any, actual: Optional[int]) -> Tuple[Optional[int], bool]:
+    """Does this route's magic accept the signal's, and which one matched?
+
+    `magic` may be one number or a list of them. The list form is what a
+    master running thirty or forty origin EAs needs: several strategies
+    routinely want the same instrument on the same slave, and writing a
+    near-identical route for each is how one of them comes to differ by a
+    typo nobody notices.
+
+    The matched magic is returned rather than the declaration, so a Route
+    built from a list still says which strategy it was built for.
+    """
+    if declared is None:
+        return None, True       # an explicit catch-all for that symbol
+    if isinstance(declared, (list, tuple, set, frozenset)):
+        wanted = {int(m) for m in declared}
+        return actual, actual is not None and actual in wanted
+    declared_int = int(declared)
+    return declared_int, actual == declared_int
+
+
 def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
     """Destinations for this signal on this slave, or [] if it isn't routed.
 
     An entry with no `magic` matches any strategy for that symbol -- an
-    explicit catch-all, opted into rather than implied.
+    explicit catch-all, opted into rather than implied. One with a list of
+    magics matches any of them.
+
+    This decides which INSTRUMENT a signal becomes. Whether the slave hears
+    the signal at all is `magic_filter`, applied once in the Signal Bus;
+    the two are deliberately separate, because a mirror slave has no routes
+    and still needs to take a selection of strategies.
     """
     routes_cfg = slave_config.get("routes")
     if routes_cfg is None:
@@ -112,8 +139,8 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
     for entry in routes_cfg:
         if entry.get("symbol") != signal.symbol:
             continue
-        magic = entry.get("magic")
-        if magic is not None and signal.magic != int(magic):
+        magic, magic_ok = _magic_match(entry.get("magic"), signal.magic)
+        if not magic_ok:
             continue
         account = entry.get("account")
         if account is not None and signal.account != str(account):
@@ -150,7 +177,7 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                 Route(
                     target=target,
                     month_slot=int(entry.get("month_slot", 0)),
-                    magic=None if magic is None else int(magic),
+                    magic=magic,
                     account=None if account is None else str(account),
                     sizing=entry.get("sizing"),
                     risk_management=entry.get("risk_management"),
@@ -207,16 +234,22 @@ def configured_targets(slave_config: Dict[str, Any]) -> List[Tuple[str, int]]:
 def describe_refusal(slave_config: Dict[str, Any], signal: Signal) -> str:
     """Why a signal wasn't routed, phrased so the fix is obvious."""
     if routing_is_strict(slave_config):
-        known = sorted(
-            {
-                (e.get("symbol"), e.get("magic"), e.get("account"), e.get("direction"))
-                for e in slave_config.get("routes", [])
-            }
-        )
+        # Rendered as text before being sorted and de-duplicated. A `magic`
+        # may now be a list, which is unhashable -- and even as tuples,
+        # sorting raised the moment one entry on a symbol had a magic and
+        # another had the catch-all, because None and an int do not compare.
+        # Either way the message that explains a refusal would itself raise.
+        known = sorted({
+            "symbol=%s magic=%s account=%s direction=%s" % (
+                e.get("symbol"), e.get("magic"),
+                e.get("account"), e.get("direction"),
+            )
+            for e in slave_config.get("routes", [])
+        })
         return (
             f"no route for symbol={signal.symbol} magic={signal.magic} "
             f"account={signal.account!r} -- unrouted signals are "
             f"refused so an unknown strategy can't land on another strategy's contract. "
-            f"Configured routes (symbol, magic, account, direction): {known}"
+            f"Configured routes: {'; '.join(known)}"
         )
     return f"no symbol_map entry for master symbol={signal.symbol}"

@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from app import __version__
+from app import __version__, magic_filter
 from app.config import settings
 from app.contract_specs import get_contract_spec
 from app.db import db_cursor, get_config_value
@@ -196,6 +196,24 @@ def _slave_account(slave: SlaveConfig, engine: Any) -> Optional[str]:
     return None
 
 
+def _takes_magic(slave: SlaveConfig) -> Optional[Dict[str, Any]]:
+    """Which strategies this slave takes, for the hub to show by name.
+
+    Reported because the hub's own registry is what names a magic number,
+    so this is the field that lets its Copier tab say "this slave takes the
+    trend-following book" rather than listing five integers. Any names an
+    imported selection brought with it ride along.
+
+    Swallows a bad selection: a snapshot is not the place to discover that
+    a config is unreadable. The slave itself fails to start and says so.
+    """
+    try:
+        return magic_filter.parse(slave.config).as_dict()
+    except ValueError as exc:
+        logger.debug("slave=%s magic selection is unreadable: %s", slave.id, exc)
+        return {"error": str(exc)}
+
+
 def _session_state(engine: Any, connected: Optional[bool]) -> str:
     if engine is None:
         return "not_running"
@@ -231,6 +249,9 @@ def _slaves(engines: List[Any], facts: SlaveFacts) -> List[Dict[str, Any]]:
             "account": _slave_account(slave, engine),
             "session_state": _session_state(engine, connected),
             "blocked_targets": dict(getattr(engine, "blocked_targets", {}) or {}),
+            # null means "every strategy", which is not the same as an
+            # empty selection and the hub has to tell them apart.
+            "magic_filter": _takes_magic(slave),
             "preflight": (
                 {"targets": preflight["targets"], "resolved": preflight["resolved"],
                  "at": iso(preflight["at"])}
