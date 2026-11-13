@@ -671,6 +671,19 @@ class IBKRAdapter(BrokerAdapter):
                     self.slave_id, slave_ticket, filled, pos["size"],
                 )
                 self._cancel_tracked_order(entry.order.orderId)
+                # Same race as abandon_unfilled_entry: the remainder can
+                # fill inside the cancel round trip, and closing only the
+                # part known a moment ago leaves the rest held under a row
+                # about to be marked CLOSED.
+                settled_price, settled = await self._settle_cancel(
+                    entry, "entry remainder")
+                if settled is not None and settled > filled:
+                    logger.warning(
+                        "IBKRAdapter[%s] entry %s filled a further %s inside the "
+                        "cancel round trip (%s total); closing all of it",
+                        self.slave_id, slave_ticket, settled - filled, settled,
+                    )
+                    filled = settled
                 pos["size"] = filled
 
         closing_action = "SELL" if pos["direction"] == "BUY" else "BUY"
@@ -794,16 +807,76 @@ class IBKRAdapter(BrokerAdapter):
             self._entry_trades.pop(slave_ticket, None)
         return price, size
 
+    async def _settle_cancel(self, trade, label: str, timeout: float = 5.0):
+        """Wait for a cancel REQUEST to resolve, and report what filled.
+
+        `cancelOrder` is a request, not an outcome. When the fill lands
+        inside the round trip IBKR answers error 10148 -- "OrderId N that
+        needs to be cancelled cannot be cancelled, state: Filled" -- and
+        the position is real. Returning before that answer arrives is how
+        the copier came to hold 1889 UGL and 641 TQQQ it had recorded as
+        CANCELLED: untracked volume that nothing downstream can ever
+        reconcile, because reconciliation works from open rows and there
+        is no open row.
+
+        Returns (price, size) of whatever actually exists at the broker, or
+        (None, None) if the cancel really did take. A PARTIAL fill followed
+        by a successful cancel still returns that part: those shares are as
+        real as a full fill, and they are where the stray M2K and MBT
+        contracts came from.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = trade.orderStatus
+            filled = float(status.filled or 0.0)
+            remaining = float(status.remaining or 0.0)
+            has_fill = filled > 0 and status.avgFillPrice
+
+            if has_fill and remaining <= 0:
+                return float(status.avgFillPrice), filled
+            if status.status in ("Cancelled", "ApiCancelled", "Inactive"):
+                # Terminal. Anything that filled before it stands.
+                if has_fill:
+                    return float(status.avgFillPrice), filled
+                return None, None
+            await asyncio.sleep(0.05)
+
+        # No terminal answer in time. Believe the fills, not the request:
+        # claiming a cancel we never saw confirmed is the failure this
+        # method exists to stop.
+        status = trade.orderStatus
+        filled = float(status.filled or 0.0)
+        if filled > 0 and status.avgFillPrice:
+            logger.warning(
+                "IBKRAdapter[%s] %s cancel for order %s did not settle in %.1fs; "
+                "%s already filled, treating the position as real",
+                self.slave_id, label, trade.order.orderId, timeout, filled,
+            )
+            return float(status.avgFillPrice), filled
+        logger.warning(
+            "IBKRAdapter[%s] %s cancel for order %s did not settle in %.1fs and "
+            "nothing filled; treating it as cancelled",
+            self.slave_id, label, trade.order.orderId, timeout,
+        )
+        return None, None
+
     async def abandon_unfilled_entry(self, slave_ticket: int):
         """Cancel an entry that never filled, and its protective legs.
 
-        Returns (price, size): a price means the order filled after all, in
-        the gap between the timeout and this call, and the position stands.
+        Returns (price, size): a price means the order filled after all --
+        either before the cancel was sent, or inside its round trip -- and
+        the position stands.
+
+        ORDER OF OPERATIONS MATTERS. The entry's fate is settled BEFORE the
+        protective legs are touched, because tearing them down first and
+        then discovering the entry filled leaves a live position with no
+        stop and no target: strictly worse than either outcome this method
+        is choosing between.
 
         The legs matter as much as the entry. They are placed alongside it
-        and carry GTC, so leaving them would strand a live stop and target
-        with no position behind them -- either able to execute later and open
-        a position nobody asked for.
+        and carry GTC, so leaving them behind a genuinely cancelled entry
+        would strand a stop and target able to execute later and open a
+        position nobody asked for.
         """
         trade = self._entry_trades.pop(slave_ticket, None)
         pos = self._positions.get(slave_ticket)
@@ -819,7 +892,21 @@ class IBKRAdapter(BrokerAdapter):
                     "keeping the position", self.slave_id, slave_ticket,
                 )
                 return float(status.avgFillPrice), float(status.filled)
+
             self._cancel_tracked_order(trade.order.orderId)
+            price, size = await self._settle_cancel(trade, "entry")
+            if price is not None:
+                # It filled anyway. Keep the position AND its protective
+                # legs -- they are correct for it, and they have not been
+                # cancelled yet precisely so that this case can keep them.
+                logger.warning(
+                    "IBKRAdapter[%s] entry %s filled inside the cancel round trip "
+                    "(%s @ %s); keeping the position and its protective legs "
+                    "rather than recording a cancel that did not happen",
+                    self.slave_id, slave_ticket, size, price,
+                )
+                self._entry_trades[slave_ticket] = trade
+                return price, size
 
         if pos is not None:
             self._cancel_tracked_order(pos.get("sl_order_id"))
