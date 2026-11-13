@@ -512,6 +512,53 @@ copier passes an unmapped bus event through with its own fields as `detail`,
 so a new event added to an engine shows up in the tab as something unlabelled
 rather than silently vanishing. Treat an unknown type as `info`.
 
+## A third reconciliation event: `flex_reconciliation`
+
+Same idea as `reconciliation`, against a different authority.
+`reconciliation` compares the registry to what the broker says it **holds**;
+this compares it to what the broker says it **executed**, from an IBKR
+Activity Flex statement. It is the only number in a report that did not
+come through the Gateway API, which is the whole value of it. Class is
+`mismatch`: alert only when something disagrees.
+
+```jsonc
+"detail": {
+  "account": "DUR314653",
+  "period": "20261012 -> 20261110",
+  "checked": 2,          // executions in the statement
+  "orders": 1,           // distinct broker orders among them
+  "matched": 1,          // orders with a registry row
+  "protective": 0,       // orders that are a resting stop or target
+  "unjoinable": 0,       // executions with no ibOrderID in the query
+  "stored": 2, "already_had": 0,
+  "mismatched": [
+    {"ib_order_id": "900001", "slave_id": "ibkr-paper-1",
+     "slave_symbol": "GCZ6", "executions": 2,
+     "price": {"hub": 4040.70, "broker": 4038.95}}
+  ],
+  "untracked": [],
+  "absence_checked": false
+}
+```
+
+**`absence_checked` is always `false`, and the tab must respect it.** A
+clean pass does NOT mean the broker executed everything the registry
+expected. A Flex statement covers completed statement days only, so a
+registry row with no execution in it is usually legitimate — and telling a
+real gap from a legitimate one means comparing this hub's epoch timestamps
+against statement dates in the account's configured report timezone, which
+the file does not state. The copier reports only what the statement
+positively says.
+
+`mismatched` is the valuable one: the hub captures a fill price once, over
+the API, at the moment it happens, and nothing other than the broker's own
+statement can say it was captured wrongly. `untracked` means the broker
+filled an order this copier has no record of; resting stop and target fills
+are NOT untracked (their order ids are known), so an entry here is real.
+`unjoinable` counts executions the Flex query did not report an `ibOrderID`
+for — reported as a number so an empty reconciliation shows its cause
+rather than looking like "nothing to check".
+
 ## Fields added beyond the catalogue's rows
 
 - `signal_refused.action` — `"OPEN"`, `"MODIFY"` or `"CLOSE"`. A refused

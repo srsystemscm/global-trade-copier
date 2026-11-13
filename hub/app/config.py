@@ -61,6 +61,18 @@ class Settings(BaseSettings):
     flex_token: str = ""
     flex_query_id: str = ""
 
+    # How often to fetch the statement and reconcile against it. Daily,
+    # because that is as often as there is anything new: a statement
+    # reports from completed statement days, so a second fetch the same day
+    # returns the same file. The token is rate limited (Flex error 1018),
+    # so this is a schedule and not a poll.
+    flex_poll_interval_seconds: float = 86_400.0
+    # Startup is busy -- adapters connecting, positions restoring, preflight
+    # resolving every route target -- and a Flex fetch can sit waiting on
+    # IBKR generating the report. It can wait a minute.
+    flex_initial_delay_seconds: float = 60.0
+    flex_retry_base_seconds: float = 300.0
+
     model_config = SettingsConfigDict(env_prefix="TC_", env_file=".env")
 
 

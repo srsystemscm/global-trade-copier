@@ -125,6 +125,51 @@ CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs (ts);
 -- queue time. Rebuilding it at send time would read engine state that has
 -- since moved on, which is how a resend after an outage comes to disagree
 -- with what actually happened.
+-- The broker's own record of what executed, from an IBKR Activity Flex
+-- statement. Two systems that agree are worth something only if they were
+-- written down separately, and this is the separate one: everything else in
+-- this database came through the Gateway API at the moment it happened.
+--
+-- Keyed on the execution, not the order: an order can fill in several
+-- executions and each is its own row here. `exec_key` is IBKR's ibExecID,
+-- or its tradeID where the query does not report one -- both identify an
+-- execution uniquely, and INSERT OR IGNORE on it is what makes re-importing
+-- an overlapping statement period harmless. Flex periods DO overlap
+-- routinely: a query configured for "last 30 days" re-sends 29 of them
+-- every time it runs.
+--
+-- `trade_time` and `order_time` are stored exactly as IBKR wrote them,
+-- which is NAIVE and in the account's configured report timezone -- stated
+-- nowhere in the file and not necessarily UTC. They are kept for a human to
+-- read and must not be compared against this database's epoch timestamps
+-- without establishing that offset first.
+CREATE TABLE IF NOT EXISTS flex_trades (
+    exec_key        TEXT PRIMARY KEY,
+    account         TEXT NOT NULL,
+    symbol          TEXT NOT NULL,      -- the contract, e.g. MGCZ6
+    underlying      TEXT,               -- e.g. MGC
+    conid           TEXT,
+    -- The join back to this hub's registry: for an IBKR slave,
+    -- slave_trades.slave_ticket IS the IB order id (see IBKRAdapter.open).
+    -- NULL when the Flex query does not report ibOrderID, in which case
+    -- nothing can be joined and reconciliation says so rather than
+    -- guessing from tradeID, which identifies an execution and not an order.
+    ib_order_id     TEXT,
+    direction       TEXT NOT NULL,      -- BUY | SELL
+    quantity        REAL NOT NULL,      -- signed: negative is a sale
+    price           REAL NOT NULL,
+    proceeds        REAL,
+    commission      REAL,               -- negative, as IBKR reports it
+    net_cash        REAL,
+    open_close      TEXT,               -- O | C | NULL
+    exchange        TEXT,
+    trade_time      TEXT,               -- see the note above
+    order_time      TEXT,
+    statement_to    TEXT,               -- the statement period it arrived in
+    imported_at     REAL NOT NULL       -- hub clock
+);
+CREATE INDEX IF NOT EXISTS idx_flex_trades_order ON flex_trades (ib_order_id);
+
 CREATE TABLE IF NOT EXISTS hub_outbox (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id    TEXT NOT NULL UNIQUE,

@@ -209,6 +209,22 @@ TYPES: Dict[str, Reported] = {
         "untracked": "untracked", "stuck": "stuck", "at": _at,
     }),
 
+    # The same idea against a different authority: `reconciliation` compares
+    # the registry to what the broker says it HOLDS, this compares it to what
+    # the broker says it EXECUTED. Independent of the Gateway API that every
+    # other number here came through, which is the whole value of it.
+    "flex_reconciliation": Reported(None, MISMATCH, None, {
+        "account": "account", "period": "period",
+        "checked": "checked", "orders": "orders", "matched": "matched",
+        "protective": "protective", "unjoinable": "unjoinable",
+        "stored": "stored", "already_had": "already_had",
+        "mismatched": "mismatched", "untracked": "untracked",
+        # False, always: a clean pass does NOT mean the broker executed
+        # everything the registry expected. See app/flex_reconcile.py for
+        # why absence cannot be computed honestly from a Flex statement.
+        "absence_checked": "absence_checked",
+    }),
+
     # ---------------------------------- beyond the spec's catalogue (see docs)
     # Both are in the copier's vocabulary and neither is in the spec's table.
     # Reported rather than dropped: a roll replaces a live position with a

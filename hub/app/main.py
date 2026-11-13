@@ -10,6 +10,7 @@ from app.config import settings
 from app.db import init_db
 from app.engine_manager import start_engines, stop_engine
 from app.events import EventBus
+from app.flex_reconcile import FlexReconciler
 from app.hub_reporter import HubReporter
 from app.logging_config import setup_logging
 from app.notifier import Notifier
@@ -49,12 +50,19 @@ async def lifespan(app: FastAPI):
 
     engines = await start_engines(load_enabled_slaves(), bus, events, notifier)
 
+    # The broker's own end-of-day record, checked against this hub's
+    # registry on a daily schedule. Inert unless a Flex token and query are
+    # configured, which is how the hub has always run.
+    flex = FlexReconciler(events=events, notifier=notifier)
+    flex.start()
+
     app.state.bus = bus
     app.state.receiver = receiver
     app.state.engines = engines
     app.state.events = events
     app.state.notifier = notifier
     app.state.master_watchdog = master_watchdog
+    app.state.flex = flex
     app.state.start_time = START_TIME
 
     # Last, and reading app.state rather than holding its own copy: the
@@ -72,6 +80,7 @@ async def lifespan(app: FastAPI):
     # Stopped first, so a report in flight cannot be holding the event bus
     # open while the engines are being torn down beneath it.
     await reporter.stop()
+    await flex.stop()
     await master_watchdog.stop()
     for engine in engines:
         await stop_engine(engine, bus)
