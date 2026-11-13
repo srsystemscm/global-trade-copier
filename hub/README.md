@@ -1,4 +1,4 @@
-# Trade Copier Hub (Phase 6)
+# Trade Copier Hub (Phase 7)
 
 FastAPI + asyncio hub that receives trade signals from MT4 bridge EAs over
 ZeroMQ, deduplicates and persists them, and fans them out to per-slave
@@ -6,7 +6,139 @@ queues. Phase 3 added cross-asset autonomous copying, Phase 4 added the
 REST/WebSocket API and React dashboard, Phase 5 hardened the hub against
 real-world conditions. Phase 6 is deployment: running always-on on a VPS,
 plus a dormant IBKR adapter so migrating off Schwab later is a config
-change, not a rewrite.
+change, not a rewrite. Phase 7 is the first real-world run: IBKR paper
+replaced Schwab as the autonomous slave, several strategies on one master
+got separated by contract month, positions learned to survive a restart,
+and a pile of bugs that only a real broker could surface got fixed.
+
+## Architecture (Phase 7: multi-strategy, rolls, durable positions)
+
+Phase 7 exists because the first live IBKR fill behaved differently from
+every simulator. See `bridge_ea/README.md` for the MQL4-side findings.
+
+- `app/routing.py` -- `(symbol, magic) -> target + month_slot`, with
+  optional per-route `sizing` and `risk_management`. Several strategies run
+  on one master account and trade the same symbol; on MT4 they're separate
+  tickets, but **IBKR nets to one position per contract**, so two strategies
+  long GC become a single 2-lot position and long+short cancel outright.
+  Worse, the autonomous engine manages a stop per *tracked* position, so two
+  stops against one netted position can fire and flip the account.
+
+  The separation axis is the contract month: same root, same contract size
+  (so strategies stay risk-equivalent), different conId, cannot net.
+
+  A slave with a `routes` key is **strict** -- a signal matching no route is
+  refused, including one with no magic at all. On a live account, an
+  unrecognised strategy silently landing on slot 0 and netting against a
+  known one is the worst available outcome. A slave without `routes` keeps
+  the old `symbol_map` behaviour, so mirror slaves are untouched.
+
+- `app/contract_specs.py` -- `ContractSpec` gained `exchange` and
+  `liquid_months`. Both matter more than they look. IBKR rejects a contract
+  qualified on the wrong exchange outright, and the CME micro complex spans
+  four of them (MGC is COMEX, MCL NYMEX, MYM CBOT). Liquid months are not a
+  convention but a cliff: measured through the Gateway on COMEX gold, cycle
+  months carried 100-29,000 contracts/day while the serial months between
+  them carried 0-23. Routing a strategy to "the next expiry" rather than
+  "the next *liquid* expiry" parks it in one of those.
+
+- `app/contract_roll.py` + `AutonomousCopyEngine._check_rolls` -- positions
+  held across an expiry move to the next contract. The trigger is the volume
+  crossover, not a calendar rule: the market's own answer to "is this
+  contract dying" is whether the next month out-trades it. The order is
+  **outermost expiry first** -- rolling the front position first would land
+  it on the month the next strategy still holds. A failure mid-sweep halts
+  that symbol rather than moving the next position into a contract the
+  previous one failed to vacate. Stops are re-derived from the new
+  contract's own ATR rather than carried across; the calendar spread is real
+  money and shift errors would compound over repeated rolls.
+
+- `app/position_store.py` + the `engine_positions` table -- everything
+  needed to manage a position after it opens (ATR multiples, breakeven flag,
+  the concrete contract, the bracket order ids) used to live only in memory.
+  A hub restart therefore orphaned every open position: the trailing monitor
+  stopped managing it and `close()` raised "no tracked position". That stops
+  being an annoyance on a VPS, where IB Gateway forces a daily restart.
+  Reconciliation clears stored rows when it marks a registry row CLOSED --
+  without that, making the state durable would make a stale position
+  permanent, and the monitor would place a stop for something the broker
+  doesn't hold.
+
+- `app/sizing.py` -- master lots rarely map to a whole number of contracts,
+  so rounding is explicit: `"nearest_min1"` (default) rounds half up and
+  never goes below one unit; `"floor"` is the old skip-under-one behaviour.
+  The floor is sharp -- a model asking for 0.3 contracts gets 1, which on GC
+  (100oz, ~$430k notional) is a real risk difference. `max_risk_pct` is the
+  guard: when even the smallest tradeable size risks more than that fraction
+  of the capital base, the trade is skipped rather than taken at the wrong
+  size.
+
+- `app/adapters/ibkr.py` -- now the primary autonomous adapter, on
+  `ib_async` (`ib_insync` was archived in 2024 after its author died).
+  Protective legs default to **GTC**: IBKR's account-level order preset
+  supplies DAY whenever an order doesn't say otherwise, which expires a stop
+  at the session close and leaves the position naked overnight. Order prices
+  are snapped to the contract tick, because ATR arithmetic produces
+  arbitrary floats and IBKR rejects those with Error 110 -- asynchronously,
+  so `placeOrder` returns happily and the cancellation arrives moments
+  later. `open()` verifies each bracket leg afterwards rather than assuming
+  it stuck.
+
+### Schema change from Phase 6
+
+New `engine_positions` table. No migration -- delete
+`hub/data/tradecopier.db` if you have one from before Phase 7.
+
+### Running an IBKR slave
+
+`pip install ib_async` on the hub, then run IB Gateway (not TWS -- headless
+and built for always-on) logged into the paper account, with **IBC** to
+handle its forced daily restart. In Configure -> Settings -> API -> Settings:
+enable ActiveX and Socket Clients, **uncheck Read-Only API** (otherwise
+orders are silently refused), trust `127.0.0.1`, and note the port (4002 for
+Gateway paper, 7497 for TWS paper).
+
+A fresh account has no market data subscriptions, so set
+`"market_data_type": 3` (delayed, free) in the slave config or `get_quote()`
+returns nothing. Note also that IBKR allows **one session per username**: a
+second login elsewhere takes the market data line and everything returns
+empty with `Error 162`. Running TWS alongside Gateway needs a second
+username on the account.
+
+Multiple API clients may share one Gateway on different `clientId`s -- that
+is not a second login. When inspecting the hub's orders from a separate
+script, use `reqAllOpenOrdersAsync()`; `openTrades()` only shows the calling
+client's own orders, which makes a protected position look naked.
+
+### Several IBKR accounts behind one Gateway
+
+One Gateway login can hold several accounts, and that is the supported shape
+for a fleet of masters: one Gateway, one slave per account, each slave on its
+own `clientId`. Separate IBKR *logins* are a different matter and still need
+their own Gateway instance on its own port.
+
+Each such slave must say which account it trades:
+
+```json
+{ "id": "ibkr-strat-a", "broker_type": "ibkr",
+  "config": { "host": "127.0.0.1", "port": 4002, "client_id": 1,
+              "account": "DU1234567" } }
+```
+
+`connect()` refuses to start a slave that leaves `account` unset on a login
+holding more than one, because only the first of the three consequences is
+visible:
+
+- IBKR rejects an order that does not name an account.
+- `accountSummary()` returns every account's rows together, keyed by tag, so
+  the last one silently wins -- and that equity is what `max_risk_pct`
+  sizing and the drawdown watchdog read. Sizing off a sibling account's
+  equity produces perfectly plausible orders of the wrong size.
+- `positions()` likewise spans all accounts, so reconciliation reads a
+  sibling account's positions as untracked positions on this slave.
+
+A single-account login needs no `account` and gets pinned to the one it
+finds, so the reads name an account rather than relying on IBKR's default.
 
 ## Architecture (Phase 6 additions: deployment + IBKR)
 
@@ -49,8 +181,9 @@ change, not a rewrite.
   client side (MT4 EA, Schwab HTTP client) reconnects on its own.
 - `app/reconciliation.py` -- on every engine start (hub startup or a slave
   added live), compares `slave_trades` OPEN rows against the broker's
-  `get_open_positions()` (skipped gracefully for MT4, which doesn't support
-  it). If the registry says OPEN but the broker doesn't have it, the
+  `get_open_positions()` (supported by every adapter as of the bridge EA's
+  POSITIONS command; an MT4 slave running an EA built before it degrades to
+  being skipped, with a log line telling you to recompile). If the registry says OPEN but the broker doesn't have it, the
   registry is corrected to CLOSED. If the broker has a position the
   registry doesn't know about, it's logged and left alone -- can't safely
   assume an untracked position is the copier's to touch.
@@ -102,8 +235,9 @@ New `logs` table (id, ts, level, logger, message). No migration -- delete
   keeps managing already-open positions regardless of pause state.
 - `app/adapters/base.py` gained a 10th method, `get_open_positions()`
   (+ a `Position` dataclass), for the dashboard's live P&L. Implemented in
-  `SchwabAdapter`; `MT4Adapter` raises `NotImplementedError` (mirror-mode
-  slave cards show position count without live P&L).
+  `SchwabAdapter`, `IBKRAdapter`, and -- since the bridge EA gained a
+  `POSITIONS` command -- `MT4Adapter` too, so mirror-mode slave cards now
+  show live P&L (net of swap and commission) like any other slave.
 - `/ui` -- Vite + React (see `ui/README.md`).
 
 ### Schema change from Phase 3
@@ -122,7 +256,7 @@ New `logs` table (id, ts, level, logger, message). No migration -- delete
   balances): `connect`, `disconnect`, `open`, `modify`, `close`,
   `get_status`, `get_account_summary`, `get_price_history`, `get_quote`.
 - `app/adapters/mt4.py` -- `MT4Adapter`: one ZMQ REQ socket per slave,
-  sends `{"cmd": "OPEN"|"MODIFY"|"CLOSE"|"PING", ...}` and waits for a JSON
+  sends `{"cmd": "OPEN"|"MODIFY"|"CLOSE"|"PING"|"POSITIONS", ...}` and waits for a JSON
   ACK. REQ/REP allows only one request in flight; a timeout rebuilds the
   socket since a REQ socket that never got its reply is stuck. Doesn't
   implement the Phase 3 market-data/account methods (mirror mode never

@@ -5,12 +5,20 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from app import trade_registry
+from app import magic_filter, trade_registry
 from app.adapters.base import AdapterError
 from app.config import settings
 from app.db import db_cursor, get_config_value, list_logs, set_config_value
 from app.engine_manager import start_engine_for_slave, stop_engine
-from app.slaves import delete_slave, get_slave, insert_slave, list_all_slaves, set_paused, update_slave
+from app.slaves import (
+    delete_slave,
+    get_slave,
+    insert_slave,
+    list_all_slaves,
+    set_enabled,
+    set_paused,
+    update_slave,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +39,10 @@ class SlaveUpdate(BaseModel):
     name: Optional[str] = None
     config: Optional[Dict[str, Any]] = None
     paused: Optional[bool] = None
+    # Was missing, so PATCH {"enabled": false} was silently dropped by
+    # pydantic and the route answered 200 with the slave still enabled --
+    # a no-op that reported success.
+    enabled: Optional[bool] = None
 
 
 class RiskUpdate(BaseModel):
@@ -38,6 +50,22 @@ class RiskUpdate(BaseModel):
     trading_hours_enabled: Optional[bool] = None
     trading_hours_start: Optional[str] = None  # "HH:MM", UTC
     trading_hours_end: Optional[str] = None
+
+
+def _validated_magic_filter(config: Optional[Dict[str, Any]]):
+    """Parse a config's magic selection, or answer 400 saying what is wrong.
+
+    Called before anything is written. A selection that cannot be read must
+    not reach the database: persisted, it would stop the slave from
+    starting on the next restart rather than on the request that broke it,
+    and the connection between the two would be a day old by then.
+    """
+    if config is None:
+        return None
+    try:
+        return magic_filter.parse(config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 def _find_engine(request: Request, slave_id: str):
@@ -102,6 +130,7 @@ async def create_slave(payload: SlaveCreate, request: Request):
         raise HTTPException(400, f"unknown broker_type {payload.broker_type!r}")
     if get_slave(payload.id) is not None:
         raise HTTPException(409, f"slave id {payload.id!r} already exists")
+    _validated_magic_filter(payload.config)
 
     slave = insert_slave(payload.id, payload.name, payload.broker_type, payload.config, payload.enabled)
 
@@ -124,6 +153,8 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
     if slave is None:
         raise HTTPException(404, f"no slave with id={slave_id!r}")
 
+    takes = _validated_magic_filter(payload.config)
+
     if payload.name is not None or payload.config is not None:
         slave = update_slave(slave_id, name=payload.name, config=payload.config)
         engine = _find_engine(request, slave_id)
@@ -134,12 +165,33 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
             engine.slave_config = slave.config
             engine.atr_period = slave.config.get("atr_period", 14)
             engine.risk_config = slave.config.get("risk_management", {})
+            if hasattr(engine, "roll_config"):
+                engine.roll_config = slave.config.get("contract_roll", {})
+        if payload.config is not None:
+            # Held by the bus, not the engine: the selection decides what
+            # reaches this slave's queue in the first place. Updated even
+            # when no engine is running, which is a no-op the bus ignores.
+            request.app.state.bus.set_magic_filter(slave_id, takes)
 
     if payload.paused is not None:
         set_paused(slave_id, payload.paused)
         engine = _find_engine(request, slave_id)
         if engine is not None:
             engine.paused = payload.paused
+        slave = get_slave(slave_id)
+
+    if payload.enabled is not None and payload.enabled != slave.enabled:
+        set_enabled(slave_id, payload.enabled)
+        engine = _find_engine(request, slave_id)
+        if payload.enabled and engine is None:
+            slave = get_slave(slave_id)
+            engine = await start_engine_for_slave(
+                slave, request.app.state.bus, request.app.state.events, request.app.state.notifier
+            )
+            request.app.state.engines.append(engine)
+        elif not payload.enabled and engine is not None:
+            await stop_engine(engine, request.app.state.bus)
+            request.app.state.engines.remove(engine)
         slave = get_slave(slave_id)
 
     return await _slave_summary(request, slave)
@@ -161,8 +213,8 @@ async def remove_slave(slave_id: str, request: Request):
 
 
 @router.get("/trades")
-async def get_trades(limit: int = 200):
-    return {"trades": trade_registry.list_trades_with_copies(limit)}
+async def get_trades(limit: int = 200, since: float | None = None):
+    return {"trades": trade_registry.list_trades_with_copies(limit, since)}
 
 
 @router.get("/config")

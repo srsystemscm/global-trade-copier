@@ -35,11 +35,43 @@ class Settings(BaseSettings):
     watchdog_stale_heartbeat_seconds: float = 30.0
     drawdown_alert_pct: float = 0.05
 
+    # Broker session recovery, for adapters with requires_session_recovery.
+    # IB Gateway force-restarts once a day and takes a minute or two to come
+    # back, so the schedule has to outlast that -- otherwise every scheduled
+    # restart reports as an outage. 5s doubling to a 60s ceiling over 8
+    # attempts spans ~5 minutes.
+    session_recovery_max_attempts: int = 8
+    session_recovery_base_delay: float = 5.0
+    session_recovery_max_delay: float = 60.0
+
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_user: str = ""
     smtp_password: str = ""
     smtp_from: str = ""
+
+    # IBKR Flex Web Service, for the independent statement of record that
+    # live positions get reconciled against. Empty means "not configured",
+    # which is a normal state -- the hub runs fine without it.
+    #
+    # These must be DECLARED, not merely present in .env: Settings forbids
+    # extra inputs, so an undeclared TC_* key in .env stops the hub from
+    # starting at all, and does it on the next restart rather than when the
+    # key was added.
+    flex_token: str = ""
+    flex_query_id: str = ""
+
+    # How often to fetch the statement and reconcile against it. Daily,
+    # because that is as often as there is anything new: a statement
+    # reports from completed statement days, so a second fetch the same day
+    # returns the same file. The token is rate limited (Flex error 1018),
+    # so this is a schedule and not a poll.
+    flex_poll_interval_seconds: float = 86_400.0
+    # Startup is busy -- adapters connecting, positions restoring, preflight
+    # resolving every route target -- and a Flex fetch can sit waiting on
+    # IBKR generating the report. It can wait a minute.
+    flex_initial_delay_seconds: float = 60.0
+    flex_retry_base_seconds: float = 300.0
 
     model_config = SettingsConfigDict(env_prefix="TC_", env_file=".env")
 

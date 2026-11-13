@@ -6,3 +6,7 @@ hub/logs/
 .env
 node_modules/
 ui/dist/
+
+# The Operations hub reporter's API key. Never in the repository --
+# ODH_COPIER_KEY in the environment is the other way to supply it.
+hub/config/hub_key.txt

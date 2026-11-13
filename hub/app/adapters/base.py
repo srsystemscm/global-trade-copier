@@ -17,6 +17,16 @@ class AdapterTimeoutError(AdapterError):
     """The broker/slave terminal did not reply in time."""
 
 
+class EntryNeverFilled(AdapterError):
+    """A close was asked for on an entry that never filled.
+
+    Not a failure: the order and its protective legs have been cancelled and
+    nothing is left at the broker. It is raised rather than returned so the
+    caller cannot mistake it for an ordinary close and record a position that
+    never existed as one that was closed.
+    """
+
+
 class AdapterRejectedError(AdapterError):
     """The broker/slave terminal rejected the command (e.g. OrderSend failed)."""
 
@@ -38,18 +48,130 @@ class OrderRequest:
     sl: Optional[float] = None
     tp: Optional[float] = None
     master_ticket: Optional[int] = None
+    # "market" or "limit". Outside regular hours a market order is simply
+    # refused by IBKR, so an ETF leg meant to fill in the evening session
+    # has to be a limit with `outside_rth` set -- both, not either.
+    order_type: str = "market"
+    limit_price: Optional[float] = None
+    outside_rth: bool = False
+    # How far through the quote to price a limit, carried so the EXIT can be
+    # priced the same way as the entry. Without it the adapter would have to
+    # guess, and a market exit cannot fill outside regular hours.
+    limit_offset_pct: float = 0.0
+    # Whether to place broker-side stop/target orders at all. ETF legs set
+    # this false: those orders do not execute in extended hours, so resting
+    # them achieves nothing while leaving GTC orders to strand. Those legs
+    # are closed by the master's CLOSE signal instead.
+    broker_brackets: bool = True
+    # Futures contract month: 0 = front, 1 = next liquid month, etc. Used to
+    # keep strategies on one netting account from merging into one position.
+    # Ignored by brokers/instruments that have no contract months.
+    month_slot: int = 0
+    # An exact contract to trade, overriding month_slot. Set when rolling: the
+    # destination is a specific contract, not "whatever slot N is right now".
+    contract_id: Optional[int] = None
 
 
 @dataclass
 class OrderResult:
     slave_ticket: int
     price: Optional[float] = None
+    # What actually went on, after the broker's own volume rounding. None
+    # when the broker doesn't say, in which case the requested size stands.
+    lots: Optional[float] = None
+    # Broker-side bracket legs, recorded so they survive a hub restart --
+    # without them a restored position can't have its stop moved or cancelled.
+    sl_order_id: Optional[int] = None
+    tp_order_id: Optional[int] = None
+
+
+@dataclass
+class MarginPreview:
+    """What an order would do to margin, before it is placed.
+
+    `initial_after` is the broker's own total once the order is in, which is
+    the figure to compare against a ceiling: on a netting account it already
+    accounts for the order offsetting or combining with what is held.
+    """
+
+    initial_change: Optional[float] = None
+    initial_after: Optional[float] = None
+    maintenance_after: Optional[float] = None
+    # The broker's commission estimate, free alongside the margin.
+    commission: Optional[float] = None
+    # Margin for ONE unit, where the broker charges it linearly. An MT
+    # bridge reports this, and it is what lets a caller work out the largest
+    # size it can afford from a single enquiry instead of asking again for
+    # every candidate size. None where the broker does not say.
+    per_unit: Optional[float] = None
+    # Free margin BEFORE the order, so a caller can express a ceiling as a
+    # fraction of what is actually available rather than of equity.
+    free_before: Optional[float] = None
 
 
 @dataclass
 class AccountSummary:
     balance: float
     equity: float
+
+
+@dataclass
+class BrokerSymbolSpec:
+    """What an instrument IS at the broker, as the broker states it.
+
+    Deliberately not an abstract method on BrokerAdapter: only the MT
+    bridges can answer it today, through SlaveBridge.mq5 1.03's SYMBOLS
+    command, and a caller checks for the method rather than every adapter
+    growing a stub that raises.
+
+    `point_value` is derived rather than reported because brokers do not
+    agree on how to express it. On Darwinex's futures CFDs contract_size is
+    1.0 and the whole multiplier lives in the tick figures, so
+    tick_value / tick_size is the only trustworthy way to ask what a
+    one-point move on one lot is worth.
+    """
+
+    symbol: str
+    digits: int
+    tick_size: float
+    tick_value: float
+    volume_step: float
+    volume_min: float
+    volume_max: float
+    bid: float = 0.0
+    ask: float = 0.0
+    trade_mode: str = ""
+    contract_size: float = 0.0
+    expiry: str = ""
+
+    @property
+    def point_value(self) -> float:
+        return (self.tick_value / self.tick_size) if self.tick_size else 0.0
+
+    def price_for(self, direction: str) -> float:
+        """The side this order would have to cross."""
+        return self.ask if direction == "BUY" else self.bid
+
+
+@dataclass
+class ContractInfo:
+    """One dated futures contract, identified concretely rather than by slot.
+
+    Positions store this so a roll targets an exact contract: slot numbering
+    shifts under you when the front month rolls, an expiry does not.
+    """
+
+    symbol: str          # root, e.g. "GC"
+    contract_id: int     # broker contract id (IBKR conId)
+    local_symbol: str    # e.g. "GCZ6"
+    expiry: str          # YYYYMMDD
+    # The broker's own contract value per point. Carried so startup can
+    # check it against the spec: a root that resolves to the wrong contract
+    # SIZE is otherwise completely silent -- SIL resolved to the 5,000 ounce
+    # silver contract and quoted happily at five times the intended size.
+    # None where the broker does not say (equities, which have no spec to
+    # disagree with anyway).
+    multiplier: Optional[float] = None
 
 
 @dataclass
@@ -64,6 +186,14 @@ class Position:
     average_price: float
     market_value: Optional[float] = None
     unrealized_pnl: Optional[float] = None
+    # The protective levels the broker is actually holding, which is the only
+    # way to confirm a MODIFY landed -- nothing else reads a leg's stop back.
+    # 0 from MT4/MT5 means "no level set" and arrives here as None, so None
+    # is "unprotected or unknown", never "a stop at zero". Left None by
+    # adapters that cannot report it (IBKR holds its stops as separate
+    # bracket orders rather than attributes of the position).
+    sl: Optional[float] = None
+    tp: Optional[float] = None
 
 
 class BrokerAdapter(abc.ABC):
@@ -76,6 +206,14 @@ class BrokerAdapter(abc.ABC):
     market data and account balances to compute its own SL/TP and size, and
     the dashboard needs live position P&L.
     """
+
+    # True for adapters holding a stateful broker session that, once dropped,
+    # cannot be re-established by the adapter's own next call. The watchdog
+    # rebuilds those; everything else is left alone. MT4Adapter rebuilds its
+    # REQ socket on timeout and Schwab is stateless HTTP, so only IBKR --
+    # whose single TCP session dies on IB Gateway's forced daily restart --
+    # sets this.
+    requires_session_recovery: bool = False
 
     @abc.abstractmethod
     async def connect(self) -> None: ...
@@ -90,7 +228,19 @@ class BrokerAdapter(abc.ABC):
     async def modify(self, slave_ticket: int, sl: Optional[float], tp: Optional[float]) -> None: ...
 
     @abc.abstractmethod
-    async def close(self, slave_ticket: int) -> None: ...
+    async def close(self, slave_ticket: int) -> Optional[float]: ...
+
+    async def preview_margin(self, order: "OrderRequest") -> "MarginPreview":
+        """What this order would cost in margin, without placing it.
+
+        Not abstract: most brokers cannot answer this. The netting policy
+        treats "cannot measure" as a refusal rather than as zero, so an
+        adapter without it simply cannot use the margin cap -- and says so
+        instead of appearing to enforce one.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot preview margin"
+        )
 
     @abc.abstractmethod
     async def get_status(self) -> bool: ...
@@ -99,10 +249,45 @@ class BrokerAdapter(abc.ABC):
     async def get_account_summary(self, account_type: str) -> AccountSummary: ...
 
     @abc.abstractmethod
-    async def get_price_history(self, symbol: str, period: int) -> List[Bar]: ...
+    async def get_price_history(
+        self, symbol: str, period: int, month_slot: int = 0,
+        contract_id: Optional[int] = None, bar_size: Optional[str] = None
+    ) -> List[Bar]: ...
 
     @abc.abstractmethod
-    async def get_quote(self, symbol: str) -> float: ...
+    async def get_quote(
+        self, symbol: str, month_slot: int = 0, contract_id: Optional[int] = None
+    ) -> float: ...
+
+    # --- contract months (futures only) ---------------------------------
+    # Default to NotImplementedError so brokers and instruments without
+    # contract months are simply skipped by the roller rather than special
+    # -cased at every call site.
+
+    async def resolve_contract(self, symbol: str, month_slot: int = 0) -> "ContractInfo":
+        """The concrete contract a (symbol, month_slot) currently resolves to."""
+        raise NotImplementedError(f"{type(self).__name__} has no contract months")
+
+    async def next_contract_after(self, symbol: str, contract_id: int) -> Optional["ContractInfo"]:
+        """The next liquid contract after `contract_id`, or None if it's the last."""
+        raise NotImplementedError(f"{type(self).__name__} has no contract months")
+
+    async def restore_position(self, slave_ticket: int, state: dict) -> None:
+        """Rebuild this adapter's in-memory bookkeeping for a position that
+        was open before the hub restarted.
+
+        Without it an adapter that tracks positions in memory (IBKR, Schwab)
+        can't modify or close anything it didn't open this process lifetime.
+        Default is a no-op: MT4 holds no per-position state -- it addresses
+        orders by the terminal's own ticket.
+        """
+        return None
+
+    async def get_contract_volume(
+        self, symbol: str, month_slot: int = 0, contract_id: Optional[int] = None
+    ) -> Optional[float]:
+        """Session volume for one contract. None when no figure is available."""
+        raise NotImplementedError(f"{type(self).__name__} has no contract months")
 
     @abc.abstractmethod
     async def get_open_positions(self, account_type: str) -> List[Position]: ...

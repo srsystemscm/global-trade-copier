@@ -16,8 +16,16 @@
 //| - Copy Zmq.mqh (and its dependencies) into MQL4/Include/Zmq/       |
 //| - Copy libzmq.dll + libsodium.dll into MQL4/Libraries/              |
 //| - Enable "Allow DLL imports" for this EA                           |
+//|                                                                    |
+//| Versions (bump both lines below with every change):                |
+//|   1.00 2026-08-26 initial build                                    |
+//|   1.01 2026-09-10 fixes from the first real terminal shakeout      |
+//|   1.02 2026-10-29 magic number carried through the signal          |
+//|   1.03 2026-11-11 CLOSE publishes the exit price, not the entry    |
 //+------------------------------------------------------------------+
 #property strict
+#property version   "1.03"
+#define   BRIDGE_VERSION "1.03"
 
 #include <Zmq/Zmq.mqh>
 
@@ -43,10 +51,17 @@ struct OrderSnapshot
    double price;
    double sl;
    double tp;
+   int    magic;    // OrderMagicNumber() -- identifies which strategy opened it
+   string comment;  // OrderComment() -- secondary identifier, free-form
   };
 
 OrderSnapshot knownOrders[];
-datetime lastHeartbeatSent = 0;
+// GetTickCount() ms, not a datetime: TimeCurrent() is the last *quote*
+// time for the chart symbol and stops advancing when no ticks arrive
+// (weekend, closed market, illiquid symbol), which would stall the
+// heartbeat and make MasterWatchdog report a healthy master as down.
+// uint arithmetic wraps correctly across GetTickCount()'s ~49.7d rollover.
+uint lastHeartbeatSent = 0;
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -54,10 +69,16 @@ int OnInit()
    string pubAddr  = StringFormat("tcp://%s:%d", HubHost, HubPubPort);
    string pushAddr = StringFormat("tcp://%s:%d", HubHost, HubPushPort);
 
+   // LINGER=0 so OnDeinit can't block MT4's shutdown trying to flush queued
+   // frames to a hub that isn't there. Observed as "shutdown by timeout" in
+   // the Experts log (uninit reason 9) when closing the terminal.
+   pubSocket.setLinger(0);
+   pushSocket.setLinger(0);
+
    pubSocket.connect(pubAddr);
    pushSocket.connect(pushAddr);
 
-   Print("TradeCopierBridge connected: PUB->", pubAddr, "  PUSH->", pushAddr);
+   Print("TradeCopierBridge ", BRIDGE_VERSION, " connected: PUB->", pubAddr, "  PUSH->", pushAddr);
 
    TakeSnapshot(knownOrders);
    EventSetMillisecondTimer(PollIntervalMs);
@@ -78,12 +99,12 @@ void OnTimer()
    OrderSnapshot current[];
    TakeSnapshot(current);
    DiffAndPublish(knownOrders, current);
-   knownOrders = current;
+   CopySnapshots(knownOrders, current);
 
-   if(TimeCurrent() - lastHeartbeatSent >= HeartbeatIntervalMs / 1000)
+   if(GetTickCount() - lastHeartbeatSent >= (uint)HeartbeatIntervalMs)
      {
       SendHeartbeat();
-      lastHeartbeatSent = TimeCurrent();
+      lastHeartbeatSent = GetTickCount();
      }
   }
 
@@ -110,7 +131,25 @@ void TakeSnapshot(OrderSnapshot &out[])
       out[n].price  = OrderOpenPrice();
       out[n].sl     = OrderStopLoss();
       out[n].tp     = OrderTakeProfit();
+      // Several strategies can run on one master account and trade the same
+      // symbol. The magic number is what tells them apart, and the hub routes
+      // on it -- without this every strategy's signals are indistinguishable.
+      out[n].magic   = OrderMagicNumber();
+      out[n].comment = OrderComment();
      }
+  }
+
+//+------------------------------------------------------------------+
+//| MQL4 has no whole-array assignment, and ArrayCopy() refuses any   |
+//| struct containing a string (OrderSnapshot.symbol), so the previous |
+//| snapshot has to be rebuilt element by element.                     |
+//+------------------------------------------------------------------+
+void CopySnapshots(OrderSnapshot &dst[], OrderSnapshot &src[])
+  {
+   int n = ArraySize(src);
+   ArrayResize(dst, n);
+   for(int i = 0; i < n; i++)
+      dst[i] = src[i];
   }
 
 //+------------------------------------------------------------------+
@@ -143,8 +182,28 @@ void DiffAndPublish(OrderSnapshot &prev[], OrderSnapshot &curr[])
    // closed
    for(int i = 0; i < ArraySize(prev); i++)
      {
-      if(FindByTicket(curr, prev[i].ticket) < 0)
-         PublishSignal("CLOSE", prev[i]);
+      if(FindByTicket(curr, prev[i].ticket) >= 0)
+         continue;
+
+      // prev[i].price is OrderOpenPrice() -- the ENTRY. Publishing that on a
+      // CLOSE reported every exit as its own entry, which is worse than
+      // useless because it looks plausible: every round trip appears to have
+      // made exactly nothing, and the copy's round-trip variance cannot be
+      // measured at all. Found on the first live MT4 -> MT5 run.
+      //
+      // OrderSelect(SELECT_BY_TICKET) searches the history pool as well as
+      // open trades, so once the order is gone from the open list its real
+      // exit is there to be read.
+      OrderSnapshot closed;
+      closed = prev[i];
+      closed.price = 0.0;   // 0 = "unknown", which the hub stores as NULL
+      if(OrderSelect(prev[i].ticket, SELECT_BY_TICKET) && OrderCloseTime() > 0)
+         closed.price = OrderClosePrice();
+      else
+         Print("TradeCopierBridge: no close price for ticket ", prev[i].ticket,
+               " -- reporting it as unknown rather than guessing");
+
+      PublishSignal("CLOSE", closed);
      }
   }
 
@@ -155,10 +214,12 @@ void PublishSignal(string action, OrderSnapshot &o)
    double atr = iATR(o.symbol, AtrTimeframe, AtrPeriod, 0);
    string json = StringFormat(
       "{\"ticket\":%d,\"symbol\":\"%s\",\"action\":\"%s\",\"direction\":\"%s\"," +
-      "\"lots\":%.2f,\"price\":%.5f,\"sl\":%.5f,\"tp\":%.5f,\"atr\":%.5f,\"account\":\"%d\",\"ts\":%.3f}",
+      "\"lots\":%.2f,\"price\":%.5f,\"sl\":%.5f,\"tp\":%.5f,\"atr\":%.5f," +
+      "\"magic\":%d,\"comment\":\"%s\",\"account\":\"%d\",\"ts\":%.3f}",
       o.ticket, o.symbol, action, direction,
       o.lots, o.price, o.sl, o.tp, atr,
-      AccountNumber(), TimeGMT());
+      o.magic, JsonEscape(o.comment),
+      AccountNumber(), (double)TimeGMT());
 
    ZmqMsg msg(json);
    pubSocket.send(msg);
@@ -166,9 +227,33 @@ void PublishSignal(string action, OrderSnapshot &o)
   }
 
 //+------------------------------------------------------------------+
+//| OrderComment() is broker-controlled text and can contain quotes or |
+//| backslashes (brokers append things like "[sl]" or "to #123456"),   |
+//| which would produce malformed JSON the hub silently drops.         |
+//+------------------------------------------------------------------+
+string JsonEscape(string raw)
+  {
+   string out = "";
+   int n = StringLen(raw);
+   for(int i = 0; i < n; i++)
+     {
+      ushort ch = StringGetCharacter(raw, i);
+      if(ch == '"' || ch == '\\')
+         out += "\\";
+      else if(ch < 32)   // control chars: drop rather than emit raw
+        {
+         out += " ";
+         continue;
+        }
+      out += ShortToString(ch);
+     }
+   return out;
+  }
+
+//+------------------------------------------------------------------+
 void SendHeartbeat()
   {
-   string json = StringFormat("{\"account\":\"%d\",\"ts\":%.3f}", AccountNumber(), TimeGMT());
+   string json = StringFormat("{\"account\":\"%d\",\"ts\":%.3f}", AccountNumber(), (double)TimeGMT());
    ZmqMsg msg(json);
    pushSocket.send(msg);
   }

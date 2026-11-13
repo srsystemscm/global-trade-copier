@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "Copier -> Operations hub reporter. The contract is docs/hub-reporter.md.",
+    "OFF until the hub issues a key. With no key this block is read and then",
+    "nothing happens: no subscription, no task, no database row. Set",
+    "ODH_COPIER_KEY in the environment, or put the key in the file named by",
+    "key_file (one line, nothing else), and set enabled to true.",
+    "copier_id is configured, never derived, so moving this copier to",
+    "another host does not look like a new copier to the hub."
+  ],
+  "hub_reporter": {
+    "enabled": false,
+    "url": "https://srsystems.duckdns.org",
+    "copier_id": "gtc-vps2",
+    "key_file": "config/hub_key.txt",
+    "snapshot_interval_s": 15,
+    "timeout_s": 5,
+    "queue_max": 10000,
+    "max_events_per_report": 200
+  }
+}

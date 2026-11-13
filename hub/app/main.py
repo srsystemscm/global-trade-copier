@@ -8,8 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api_routes import router as api_router
 from app.config import settings
 from app.db import init_db
-from app.engine_manager import start_engine_for_slave, stop_engine
+from app.engine_manager import start_engines, stop_engine
 from app.events import EventBus
+from app.flex_reconcile import FlexReconciler
+from app.hub_reporter import HubReporter
 from app.logging_config import setup_logging
 from app.notifier import Notifier
 from app.schwab_routes import router as schwab_router
@@ -46,9 +48,13 @@ async def lifespan(app: FastAPI):
     )
     master_watchdog.start()
 
-    engines = [
-        await start_engine_for_slave(slave, bus, events, notifier) for slave in load_enabled_slaves()
-    ]
+    engines = await start_engines(load_enabled_slaves(), bus, events, notifier)
+
+    # The broker's own end-of-day record, checked against this hub's
+    # registry on a daily schedule. Inert unless a Flex token and query are
+    # configured, which is how the hub has always run.
+    flex = FlexReconciler(events=events, notifier=notifier)
+    flex.start()
 
     app.state.bus = bus
     app.state.receiver = receiver
@@ -56,11 +62,25 @@ async def lifespan(app: FastAPI):
     app.state.events = events
     app.state.notifier = notifier
     app.state.master_watchdog = master_watchdog
+    app.state.flex = flex
     app.state.start_time = START_TIME
+
+    # Last, and reading app.state rather than holding its own copy: the
+    # engines list grows while the copier runs (POST /slaves), and a
+    # snapshot built from a list captured here would stop mentioning new
+    # slaves. Off unless a key is configured, in which case this does
+    # nothing whatever -- see app/hub_reporter.
+    reporter = HubReporter(events, app.state)
+    await reporter.start()
+    app.state.hub_reporter = reporter
 
     yield
 
     logger.info("shutting down trade copier hub")
+    # Stopped first, so a report in flight cannot be holding the event bus
+    # open while the engines are being torn down beneath it.
+    await reporter.stop()
+    await flex.stop()
     await master_watchdog.stop()
     for engine in engines:
         await stop_engine(engine, bus)

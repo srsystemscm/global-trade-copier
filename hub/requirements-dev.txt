@@ -1,0 +1,29 @@
+# What the TEST SUITE needs on top of requirements.txt.
+#
+# These are deliberately not in requirements.txt. That file is what gets
+# installed on a hub, and the IBKR client library is optional there on
+# purpose: app/adapters/ibkr.py lazy-imports it, so a deployment with no
+# IBKR slave does not need it and does not install it.
+#
+# The suite is a different matter. Several tests construct a real
+# IBKRAdapter and drive its order-building, bracket and fill-capture paths
+# against a fake IB object -- the library has to be importable for that,
+# even though no connection is ever made. Without it 21 tests fail at
+# `_require_ib()`, which is exactly what CI found the first time it ran:
+# the development venv had ib_async installed and nothing declared it, so
+# "the suite needs no broker library" looked true for as long as nobody
+# checked on a clean machine.
+#
+# Pinned to the major version the venv runs. ib_async is the maintained
+# successor to the archived ib_insync, and the adapter accepts either.
+ib_async>=2.1,<3
+
+# So a hung test names itself instead of eating the whole job. The first CI
+# run that got this far stopped dead partway through and was killed by the
+# job timeout twenty minutes later, which says a test hung and nothing
+# whatever about which one. With this, that is a named failure in the
+# summary.
+#
+# thread method rather than signal: SIGALRM does not exist on Windows, and
+# Windows is where this suite runs.
+pytest-timeout>=2.4,<3

@@ -38,6 +38,16 @@ def create_adapter(slave: SlaveConfig) -> BrokerAdapter:
             host=slave.config.get("host", "127.0.0.1"),
             port=slave.config["port"],
             timeout_ms=slave.config.get("timeout_ms", 5000),
+            # Per slave, because the right answer depends on how that EA is
+            # configured. A volume above the symbol's maximum opens as
+            # several deals inside ONE OPEN command (SlaveBridge.mq5 1.04),
+            # which can keep the EA busy for ten seconds or more -- and an
+            # OPEN is not idempotent, so retrying one that had in fact
+            # executed opens a SECOND position while the hub records only the
+            # first. A slave that splits wants max_retries 0 and a timeout
+            # covering the whole split; one that never splits is better off
+            # retrying through an EA restart. None keeps the global default.
+            max_retries=slave.config.get("max_retries"),
         )
 
     if slave.broker_type == "schwab":
@@ -62,6 +72,16 @@ def create_adapter(slave: SlaveConfig) -> BrokerAdapter:
             host=slave.config.get("host", "127.0.0.1"),
             port=slave.config.get("port", 7497),  # TWS paper trading default; 7496 live, 4002/4001 for Gateway
             client_id=slave.config.get("client_id", 1),
+            market_data_type=slave.config.get("market_data_type"),
+            quote_timeout=float(slave.config.get("quote_timeout", 1.0)),
+            quote_retries=int(slave.config.get("quote_retries", 2)),
+            bracket_tif=slave.config.get("bracket_tif", "GTC"),
+            entry_tif=slave.config.get("entry_tif", "DAY"),
+            fill_timeout=float(slave.config.get("fill_timeout", 10.0)),
+            exit_chase_steps=int(slave.config.get("exit_chase_steps", 4)),
+            exit_chase_pct=float(slave.config.get("exit_chase_pct", 0.002)),
+            entry_timeout=float(slave.config.get("entry_timeout", 900.0)),
+            account=slave.config.get("account"),
         )
 
     raise ValueError(f"no adapter registered for broker_type={slave.broker_type!r}")
