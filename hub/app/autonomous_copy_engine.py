@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
 import time
@@ -28,6 +29,11 @@ from app.routing import (
 )
 
 logger = logging.getLogger(__name__)
+
+# How long stop() waits for its tasks before abandoning them. Generous
+# enough that a task mid-await finishes unwinding, short enough that a
+# shutdown with several engines behind it still completes promptly.
+STOP_GRACE_SECONDS = 5.0
 
 
 @dataclass
@@ -163,6 +169,11 @@ class AutonomousCopyEngine(SessionGateMixin):
         self._consume_task: Optional[asyncio.Task] = None
         self._monitor_task: Optional[asyncio.Task] = None
         self._deferred_task: Optional[asyncio.Task] = None
+        # Declared here and not only in start(), because stop() reads it.
+        # An engine built but never started -- one whose restore() raised,
+        # or any caller that changes its mind -- made stop() die with
+        # AttributeError instead of shutting down.
+        self._deferred_close_task: Optional[asyncio.Task] = None
 
     async def restore(self) -> None:
         """Reload positions that were open when the hub last stopped.
@@ -206,20 +217,57 @@ class AutonomousCopyEngine(SessionGateMixin):
             self._preflight_routes(), name=f"autonomous-preflight-{self.slave_id}")
 
     async def stop(self) -> None:
-        for task in (self._consume_task, self._monitor_task, self._deferred_task,
-                     self._deferred_close_task, self._preflight_task):
-            if task is not None:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-        for task in list(self._fill_tasks):
+        """Stop every background task. Bounded, because shutting down must
+        not be able to hang.
+
+        `stop_engine` is called from the app's lifespan AND from
+        `PATCH /slaves/{id}` and `DELETE /slaves/{id}`, so an unbounded
+        wait here is not only a slow shutdown -- it is an API request that
+        never answers, and a hub that cannot be restarted cleanly on a VPS
+        where IB Gateway forces a restart daily.
+
+        A task that will not stop within the grace period is reported and
+        abandoned. That is the right trade: whatever it is doing, it is not
+        worth holding every other engine's shutdown behind it.
+
+        This does NOT claim to fix the intermittent CI hang in the suite --
+        `asyncio.run()` cancels and awaits leftover tasks itself, so a task
+        that ignores cancellation hangs the teardown whether or not this
+        waited for it. It removes one way for the hub to hang, not that one.
+        """
+        tasks = [
+            task for task in (
+                self._consume_task, self._monitor_task, self._deferred_task,
+                self._deferred_close_task, self._preflight_task,
+            ) if task is not None
+        ]
+        # The background fill collectors too. They are cancelled alongside
+        # the loops rather than after them: nothing in a fill collector
+        # depends on a loop still running, and waiting for the two groups
+        # in sequence doubles the worst case for no gain.
+        tasks += list(self._fill_tasks)
+        if not tasks:
+            return
+
+        for task in tasks:
             task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        _done, pending = await asyncio.wait(tasks, timeout=STOP_GRACE_SECONDS)
+
+        for task in _done:
+            # Retrieved so a task that died of something other than the
+            # cancellation does not surface later as "exception was never
+            # retrieved", which arrives with no stack worth reading.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                task.result()
+
+        if pending:
+            logger.error(
+                "slave=%s %d background task(s) did not stop within %.0fs and "
+                "have been abandoned: %s. The hub is shutting this engine "
+                "down anyway rather than holding everything behind it.",
+                self.slave_id, len(pending), STOP_GRACE_SECONDS,
+                ", ".join(sorted(t.get_name() for t in pending)),
+            )
 
     async def _emit(self, event_type: str, signal: Optional[Signal] = None, **fields) -> None:
         """Put an event on the bus, stamped with the trade it belongs to.

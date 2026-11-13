@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import time
 from typing import Any, Dict, Optional
@@ -12,6 +13,9 @@ from app.risk_controls import is_within_trading_hours
 from app.session_gate import SessionGateMixin
 
 logger = logging.getLogger(__name__)
+
+# Matches the autonomous engine's. See AutonomousCopyEngine.stop().
+STOP_GRACE_SECONDS = 5.0
 
 
 def _elapsed_ms(signal: Signal, at: float) -> int:
@@ -225,12 +229,25 @@ class CopyEngine(SessionGateMixin):
         self._task = asyncio.create_task(self._run(), name=f"copy-engine-{self.slave_id}")
 
     async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        """Stop the consume loop. Bounded, for the same reason the
+        autonomous engine's is: `stop_engine` is called from the app's
+        lifespan AND from PATCH/DELETE /slaves, so an unbounded wait is an
+        API request that never answers as well as a shutdown that hangs.
+        """
+        if self._task is None:
+            return
+        self._task.cancel()
+        _done, pending = await asyncio.wait([self._task],
+                                            timeout=STOP_GRACE_SECONDS)
+        for task in _done:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                task.result()
+        if pending:
+            logger.error(
+                "slave=%s the consume loop did not stop within %.0fs and has "
+                "been abandoned; shutting this engine down anyway",
+                self.slave_id, STOP_GRACE_SECONDS,
+            )
 
     async def _emit(self, event_type: str, signal: Optional[Signal] = None, **fields) -> None:
         """Put an event on the bus, stamped with the trade it belongs to.
