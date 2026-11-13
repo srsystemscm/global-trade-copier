@@ -35,14 +35,29 @@
 //| It does not read the forming bar, so repeated runs on one bar give |
 //| the same size and stop.                                            |
 //|                                                                    |
+//| ONE DELIBERATE DIVERGENCE FROM THE EA, added in 1.01:              |
+//|                                                                    |
+//| ACCT_RISK_MODE defaults to 1 -- percent of BALANCE -- at RISK_A    |
+//| 1.0, where the EA's own default is mode 0, a flat $2000. This is a |
+//| test setting and not the EA's: a fixed cash risk sizes differently |
+//| on every account it is dropped on, so the same script on ten       |
+//| charts would risk ten different fractions. Set ACCT_RISK_MODE back |
+//| to 0 to get the EA's real default.                                 |
+//|                                                                    |
+//| It is 1% PER CHART. The script knows nothing of the other charts   |
+//| it is running on, so N charts started together risk N% between     |
+//| them, and the slaves re-size independently of all of it.           |
+//|                                                                    |
 //| Versions:                                                          |
 //|   1.00 2026-11-11 initial build                                    |
+//|   1.01 2026-11-13 risk 1% of balance by default, and say in the    |
+//|                   log what that came to in cash                    |
 //+------------------------------------------------------------------+
 #property strict
 #property script_show_inputs
-#property version "1.00"
+#property version "1.01"
 
-#define SCRIPT_VERSION "1.00"
+#define SCRIPT_VERSION "1.01"
 
 //--- which leg of the EA to imitate
 input bool   GoLong              = true;    // false = the short leg (blocks 769 / 4319)
@@ -54,9 +69,9 @@ input int    ATR_SHIFT           = 1;       // ACTIVE_BAR_ENTRY_ID_* -> last clo
 input double ATR_SL_MULT         = 1.5;     // ATR_SL_LONG / ATR_SL_SHORT
 input double ATR_TP_MULT         = 1.0;     // ATR_TP_LONG / ATR_TP_SHORT
 input double TP_ADJUST           = 0.0;     // TP_1_LONG_ADJUST -- 0.0 means NO take-profit
-input int    ACCT_RISK_MODE      = 0;       // 0 fixed cash, 1 % of balance, 2 % of equity
+input int    ACCT_RISK_MODE      = 1;       // 0 fixed cash, 1 % of balance, 2 % of equity
 input int    FIXED_RISK_A        = 2000;    // used when ACCT_RISK_MODE = 0
-input double RISK_A              = 2.0;     // used when ACCT_RISK_MODE = 1 or 2
+input double RISK_A              = 1.0;     // PERCENT, when ACCT_RISK_MODE = 1 or 2
 input double SPREAD_SLIPPAGE     = 5.0;
 input int    MagicStart          = 1001;
 input string Group               = "";      // magic = MagicStart + (int)Group
@@ -75,7 +90,7 @@ input int    MAE_DELAY_MS        = 1500;
 //--- Hold the position this long after the MAE modify, then close it, so a
 //--- single run produces the whole OPEN -> MODIFY -> CLOSE sequence the
 //--- copier has to carry. 0 leaves the trade open.
-input int    CloseAfterMs        = 5000;
+input int    CloseAfterMs        = 3000;
 
 //--- fxDreema's POINT_FORMAT_RULES, which decide what a "pip" is
 input string POINT_FORMAT_RULES  = "0.001=0.01,0.00001=0.0001,0.000001=0.0001";
@@ -140,7 +155,12 @@ void OnStart()
          DoubleToStr(atr, digits));
    Print("  stop distance = ", DoubleToStr(ATR_SL_MULT, 2), " x ATR = ",
          DoubleToStr(atrStpLs, digits), " (", DoubleToStr(slPips, 1), " pips)");
-   Print("  risk mode ", ACCT_RISK_MODE, " -> ", DoubleToStr(lots, 2), " lots");
+   //--- Say what the risk came to in money, not just which mode produced
+   //--- it. A percentage is the one setting whose consequence you cannot
+   //--- read off the input, and the lot size alone will not tell you that
+   //--- a stop got widened to the broker minimum underneath it.
+   Print("  risk mode ", ACCT_RISK_MODE, " (", RiskDescription(), ") -> ",
+         DoubleToStr(lots, 2), " lots");
    if(tp <= 0.0)
       Print("  take-profit: none (TP_ADJUST = ", DoubleToStr(TP_ADJUST, 2), ")");
 
@@ -266,6 +286,25 @@ void CloseTicket(int ticket, string symbol, int digits)
       Print("CLOSE ticket=", ticket, " done");
   }
 
+
+//+------------------------------------------------------------------+
+//| What the risk setting actually amounts to on THIS account, in the |
+//| deposit currency, so the log answers "1% of what?" by itself.     |
+//+------------------------------------------------------------------+
+string RiskDescription()
+  {
+   if(ACCT_RISK_MODE == 1)
+      return DoubleToStr(RISK_A, 2) + "% of balance " +
+             DoubleToStr(AccountBalance(), 2) + " = " +
+             DoubleToStr((RISK_A / 100.0) * AccountBalance(), 2) + " " +
+             AccountCurrency();
+   if(ACCT_RISK_MODE == 2)
+      return DoubleToStr(RISK_A, 2) + "% of equity " +
+             DoubleToStr(AccountEquity(), 2) + " = " +
+             DoubleToStr((RISK_A / 100.0) * AccountEquity(), 2) + " " +
+             AccountCurrency();
+   return "fixed " + DoubleToStr((double)FIXED_RISK_A, 2) + " " + AccountCurrency();
+  }
 
 //+------------------------------------------------------------------+
 //| Sizing -- fxDreema DynamicLots(), the three *Risk branches only.  |

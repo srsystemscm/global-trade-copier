@@ -64,10 +64,61 @@ class _Trade:
                 self.fills = ["fill"]
                 self.orderStatus = _Status(self._price, self._size, "Filled")
 
+    def on_cancel(self):
+        """What the broker does with a cancel REQUEST.
+
+        An order that has already filled refuses it -- that is IBKR error
+        10148, "OrderId N that needs to be cancelled cannot be cancelled,
+        state: Filled" -- and stays Filled. Anything else goes Cancelled.
+
+        The fake did not model this at all before, which is exactly why the
+        stray-position bug had passing tests over it: cancelOrder recorded
+        the request and nothing ever answered, so every test agreed with
+        the code's assumption that asking is the same as it happening.
+        """
+        if self.fills:
+            return
+        self.orderStatus = _Status(0.0, 0.0, "Cancelled")
+
 
 class _NeverFills(_Trade):
     def __init__(self):
         super().__init__(fills_after=10**9)
+
+
+class _FillsOnCancel(_Trade):
+    """The 10148 case: the fill lands INSIDE the cancel round trip.
+
+    Live, this produced 1889 UGL and 641 TQQQ held against registry rows
+    that read CANCELLED.
+    """
+
+    def __init__(self, price=39.10, size=1889.0, order_id=1):
+        super().__init__(price=price, size=size, fills_after=10**9,
+                         order_id=order_id)
+        self._fill_price, self._fill_size = price, size
+
+    def on_cancel(self):
+        self.fills = ["fill"]
+        self.orderStatus = _Status(self._fill_price, self._fill_size, "Filled")
+
+
+class _PartialThenCancelled(_Trade):
+    """Some of it filled, and then the cancel really did take.
+
+    Those units are as real as a full fill. This is where the stray M2K
+    and MBT contracts came from.
+    """
+
+    def __init__(self, price=2784.3, part=10.0, total=21.0, order_id=1):
+        super().__init__(price=price, size=total, fills_after=10**9,
+                         order_id=order_id)
+        self._fill_price, self._part, self._total = price, part, total
+
+    def on_cancel(self):
+        self.fills = ["fill"]
+        self.orderStatus = _Status(self._fill_price, self._part, "Cancelled",
+                                   remaining=self._total - self._part)
 
 
 def _adapter(**cfg):
@@ -186,6 +237,10 @@ class _FakeIB:
 
     def cancelOrder(self, order):
         self.cancelled.append(order.orderId)
+        trade = next((t for t in self._all
+                      if t.order.orderId == order.orderId), None)
+        if trade is not None:
+            trade.on_cancel()
 
     def trades(self):
         return list(self._all)
@@ -577,3 +632,74 @@ def test_closing_a_partially_filled_entry_sells_only_what_filled():
     asyncio.run(a.close(res.slave_ticket))
     assert a.ib.placed[1].totalQuantity == 12.0
     assert res.slave_ticket in a.ib.cancelled, "left 35 able to fill later"
+
+
+# ---------------- a cancel is a request, not an outcome -----------------
+#
+# Seen live on 2026-11-13. Entry limits timed out, the hub cancelled them,
+# and IBKR answered 10148 -- "cannot be cancelled, state: Filled". The hub
+# wrote CANCELLED rows and walked away from 1889 UGL and 641 TQQQ. Nothing
+# downstream can ever find that volume: reconciliation works from open
+# rows, and a cancelled row is not one.
+
+def test_an_entry_that_fills_inside_the_cancel_round_trip_is_kept():
+    entry = _FillsOnCancel(price=39.10, size=1889.0)
+    a = _prepared(_adapter(fill_timeout=0.1, entry_timeout=0.1), entry)
+    req = OrderRequest(symbol="MGC", direction="BUY", size=1889.0, sl=None,
+                       tp=None, master_ticket=1)
+    res = asyncio.run(a.open(req))
+
+    price, size = asyncio.run(a.abandon_unfilled_entry(res.slave_ticket))
+
+    assert (price, size) == (39.10, 1889.0), (
+        "the broker refused the cancel because it had filled; recording a "
+        "cancel here is what strands the position")
+    assert res.slave_ticket in a._positions, "the position was dropped"
+
+
+def test_the_protective_legs_survive_a_fill_inside_the_cancel():
+    """Order of operations. Tearing the legs down and THEN finding out the
+    entry filled leaves a live position with no stop -- worse than either
+    outcome the method is choosing between."""
+    entry = _FillsOnCancel(price=3988.4, size=1.0)
+    a = _prepared(_adapter(fill_timeout=0.1, entry_timeout=0.1),
+                  entry, _NeverFills(), _NeverFills())
+    req = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=3876.5,
+                       tp=4100.0, master_ticket=1)
+    res = asyncio.run(a.open(req))
+
+    price, _ = asyncio.run(a.abandon_unfilled_entry(res.slave_ticket))
+
+    assert price == 3988.4
+    assert res.sl_order_id not in a.ib.cancelled, "stop cancelled under a live position"
+    assert res.tp_order_id not in a.ib.cancelled, "target cancelled under a live position"
+
+
+def test_a_partial_fill_before_a_real_cancel_is_still_a_position():
+    entry = _PartialThenCancelled(price=2784.3, part=10.0, total=21.0)
+    a = _prepared(_adapter(fill_timeout=0.1, entry_timeout=0.1), entry)
+    req = OrderRequest(symbol="MGC", direction="BUY", size=21.0, sl=None,
+                       tp=None, master_ticket=1)
+    res = asyncio.run(a.open(req))
+
+    price, size = asyncio.run(a.abandon_unfilled_entry(res.slave_ticket))
+
+    assert (price, size) == (2784.3, 10.0), (
+        "10 contracts really did fill; calling that a cancel leaves them "
+        "untracked at the broker")
+
+
+def test_a_cancel_that_really_took_is_still_a_cancel():
+    """The fix must not turn every abandon into a kept position."""
+    a = _prepared(_adapter(fill_timeout=0.1, entry_timeout=0.1),
+                  _NeverFills(), _NeverFills(), _NeverFills())
+    req = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=3876.5,
+                       tp=4100.0, master_ticket=1)
+    res = asyncio.run(a.open(req))
+
+    price, size = asyncio.run(a.abandon_unfilled_entry(res.slave_ticket))
+
+    assert (price, size) == (None, None)
+    assert set(a.ib.cancelled) == {res.slave_ticket, res.sl_order_id,
+                                   res.tp_order_id}
+    assert res.slave_ticket not in a._positions
