@@ -159,12 +159,31 @@ class OrderFill:
     # was right and the odd thing was the pairing.
     filled: float = 0.0             # sum of |quantity|
     net: float = 0.0                # signed
+    # The copier's own reference, as the broker handed it back. Empty for
+    # an order this hub did not place.
+    order_ref: Optional[str] = None
+    # Whether these executions OPENED the position. The registry row holds
+    # the entry's price and size, so only an opening fill can be checked
+    # against it -- an exit legitimately fills somewhere else entirely, and
+    # comparing a stop against the price it was protecting would report a
+    # mismatch on every protected position that ever closed.
+    #
+    # None where the statement does not say, in which case nothing is
+    # claimed either way.
+    opening: Optional[bool] = None
     executions: int = 0
     commission: float = 0.0
     _notional: float = 0.0
 
     def add(self, trade: FlexTrade) -> None:
         self.executions += 1
+        if trade.order_ref and not self.order_ref:
+            self.order_ref = trade.order_ref
+        if trade.open_close in ("O", "C"):
+            opening = trade.open_close == "O"
+            # A single order that both opens and closes is not something to
+            # check against an entry price either way.
+            self.opening = opening if self.opening in (None, opening) else None
         self.filled += abs(trade.quantity)
         self.net += trade.quantity
         self._notional += abs(trade.quantity) * trade.price
@@ -242,7 +261,7 @@ def _registry_by_order_id() -> Tuple[Dict[str, RegistryRow], int]:
         rows = cur.execute(
             """
             SELECT st.slave_id, st.slave_symbol, st.broker_order_id,
-                   st.slave_price, st.slave_lots
+                   st.broker_order_ref, st.slave_price, st.slave_lots
             FROM slave_trades st
             JOIN slaves s ON s.id = st.slave_id
             WHERE s.broker_type = 'ibkr'
@@ -252,13 +271,22 @@ def _registry_by_order_id() -> Tuple[Dict[str, RegistryRow], int]:
     joinable: Dict[str, RegistryRow] = {}
     without = 0
     for r in rows:
-        if not r["broker_order_id"]:
-            without += 1
-            continue
-        joinable[str(r["broker_order_id"])] = RegistryRow(
+        row = RegistryRow(
             slave_id=r["slave_id"], slave_symbol=r["slave_symbol"],
             price=r["slave_price"], size=r["slave_lots"],
         )
+        keys = [r["broker_order_ref"], r["broker_order_id"]]
+        keys = [str(k) for k in keys if k]
+        if not keys:
+            without += 1
+            continue
+        # Keyed under BOTH, because they answer different executions. The
+        # reference is on every leg of the position, including protective
+        # stops and targets this hub never placed a closing order for; the
+        # broker's order id is on the entry alone. An execution matching
+        # either is ours.
+        for key in keys:
+            joinable[key] = row
     return joinable, without
 
 
@@ -270,13 +298,12 @@ def _protective_order_ids() -> Dict[str, str]:
     `slave_trades`. Counted as untracked, every protected position would
     look like something the copier had lost track of.
 
-    CAVEAT, and the reason `untracked` is not alerted on yet: these ids are
-    `trade.order.orderId` -- TWS's client-side number -- exactly like the
-    entry ids were before `broker_order_id` was added. So they cannot match
-    a statement's `ibOrderID` either, and a stop fill still cannot be
-    recognised. Until these are captured as permIds too, an untracked list
-    would include every protective fill, so it is reported and not alarmed
-    on. See Summary.untracked_reliable.
+    These ids are `trade.order.orderId` -- TWS's client-side number -- so
+    they cannot match a statement's `ibOrderID` any more than the entry
+    ids could. They are kept as a second line of defence for positions
+    opened before the copier stamped its own reference on orders; since
+    then the legs carry the entry's reference and resolve through that
+    instead, which is what made `untracked` believable at all.
     """
     known: Dict[str, str] = {}
     with db_cursor() as cur:
@@ -292,8 +319,32 @@ def _protective_order_ids() -> Dict[str, str]:
 
 
 def _mismatch(fill: OrderFill, row: RegistryRow) -> Optional[Dict[str, Any]]:
-    """Where the broker's record and the hub's disagree about one order."""
+    """Where the broker's record and the hub's disagree about one order.
+
+    Only an OPENING fill is checked. The registry row records what the
+    entry executed at, and a protective stop or target fills wherever the
+    market took it -- so comparing an exit against the price it was
+    protecting would report a mismatch on every position that ever closed,
+    which is the opposite of useful. Exits are recognised as ours through
+    the reference and counted; what they filled at is the variance
+    capture's business, not this one's.
+    """
     differences = {}
+
+    if fill.two_sided:
+        # Reported whatever the fill opened or closed: an order carrying
+        # both sides is odd on its own terms, and the hub's figure is not
+        # the suspect one.
+        differences["two_sided"] = {"filled": fill.filled, "net": fill.net}
+
+    if fill.opening is not True:
+        return {
+            "ib_order_id": fill.ib_order_id,
+            "slave_id": row.slave_id,
+            "slave_symbol": row.slave_symbol,
+            "executions": fill.executions,
+            **differences,
+        } if differences else None
 
     broker_price = fill.avg_price
     if row.price is not None and broker_price is not None:
@@ -303,11 +354,6 @@ def _mismatch(fill: OrderFill, row: RegistryRow) -> Optional[Dict[str, Any]]:
 
     if row.size is not None and abs(fill.filled - abs(row.size)) > SIZE_TOLERANCE:
         differences["size"] = {"hub": abs(row.size), "broker": fill.filled}
-
-    if fill.two_sided:
-        # Reported as its own thing rather than as a size disagreement,
-        # because the hub's number is not the suspect one here.
-        differences["two_sided"] = {"filled": fill.filled, "net": fill.net}
 
     if not differences:
         return None
@@ -397,6 +443,12 @@ def compare(statement: FlexStatement, stored: int = 0, already_had: int = 0) -> 
         account=statement.account,
         join_available=bool(registry),
         unjoinable_rows=unjoinable_rows,
+        # Believable once the copier stamps its own reference on orders,
+        # because the reference reaches the protective legs too. Judged per
+        # statement rather than assumed: an execution carrying no reference
+        # at all is either older than the stamping or genuinely not ours,
+        # and only the first is a reason to stay quiet.
+        untracked_reliable=any(t.order_ref for t in statement.trades),
     )
 
     if not registry:
@@ -413,7 +465,9 @@ def compare(statement: FlexStatement, stored: int = 0, already_had: int = 0) -> 
         return summary
 
     for order_id, fill in sorted(orders.items()):
-        row = registry.get(order_id)
+        # The reference first: it is on every leg, so a protective fill
+        # resolves here where the order id would miss it.
+        row = registry.get(fill.order_ref or "") or registry.get(order_id)
         if row is not None:
             summary.matched += 1
             difference = _mismatch(fill, row)

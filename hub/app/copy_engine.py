@@ -5,6 +5,7 @@ import time
 from typing import Any, Dict, Optional
 
 from app import mirror, trade_registry
+from app.trade_registry import order_ref
 from app.adapters.base import AdapterError, BrokerAdapter, OrderRequest
 from app.events import EventBus
 from app.models import Signal
@@ -426,6 +427,7 @@ class CopyEngine(SessionGateMixin):
                 symbol=target.symbol,
                 direction=signal.direction,
                 size=lots,
+                order_ref=order_ref(signal.account, signal.ticket, target.symbol),
                 # plan.sl/tp, not signal.sl/tp. Where the slave trades a
                 # different instrument these are the master's levels
                 # translated onto the target's own price scale; where it
@@ -454,6 +456,7 @@ class CopyEngine(SessionGateMixin):
                 requested_at=requested_at,
                 filled_at=filled_at,
                 broker_order_id=result.broker_order_id,
+                broker_order_ref=result.broker_order_ref,
             )
             logger.info(
                 "slave=%s opened master_ticket=%s as slave_ticket=%s",

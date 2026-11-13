@@ -86,6 +86,12 @@ CREATE TABLE IF NOT EXISTS slave_trades (
     -- So the broker's id is recorded separately, and that is what
     -- reconciliation against the statement joins on.
     broker_order_id     TEXT,
+    -- The copier's own reference, stamped on the broker order. Unlike
+    -- broker_order_id this is a value we CHOOSE, so a statement carrying
+    -- it back proves the join rather than assuming it -- and the
+    -- protective stop/target orders carry the entry's, which is what makes
+    -- a stop fill recognisable instead of looking like drift.
+    broker_order_ref    TEXT,
     UNIQUE (slave_id, master_account, master_ticket, slave_symbol)
 );
 
@@ -307,6 +313,7 @@ def _migrate_to_account_keys(conn: sqlite3.Connection) -> None:
 _ADDED_COLUMNS = {
     "slave_trades": [
         ("broker_order_id", "TEXT"),
+        ("broker_order_ref", "TEXT"),
         ("master_price", "REAL"),
         ("slave_price", "REAL"),
         ("slave_lots", "REAL"),
