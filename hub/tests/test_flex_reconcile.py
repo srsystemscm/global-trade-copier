@@ -99,14 +99,22 @@ def ibkr_slave(slave_id="ibkr-paper-1"):
     return slave_id
 
 
-def registry_row(slave_id, slave_ticket, symbol="GCZ6", price=None, lots=None,
-                 master_ticket=1):
+def registry_row(slave_id, broker_order_id, symbol="GCZ6", price=None,
+                 lots=None, master_ticket=1, slave_ticket=1):
+    """A copy this hub made, keyed the way the statement keys it.
+
+    `broker_order_id` is the join, NOT `slave_ticket`: the latter is TWS's
+    client-side order number and never appears in a Flex statement. The
+    first version of these tests seeded `slave_ticket` and passed, which is
+    how a join that matched 0 of 109 real orders got shipped.
+    """
     with db_cursor() as cur:
         cur.execute(
             "INSERT INTO slave_trades (slave_id, master_account, master_ticket, "
-            "slave_symbol, slave_ticket, status, slave_price, slave_lots) "
-            "VALUES (?, '11558127', ?, ?, ?, 'OPEN', ?, ?)",
-            (slave_id, master_ticket, symbol, slave_ticket, price, lots),
+            "slave_symbol, slave_ticket, broker_order_id, status, slave_price, "
+            "slave_lots) VALUES (?, '11558127', ?, ?, ?, ?, 'OPEN', ?, ?)",
+            (slave_id, master_ticket, symbol, slave_ticket,
+             str(broker_order_id), price, lots),
         )
 
 
@@ -237,15 +245,63 @@ def test_a_price_the_hub_never_captured_is_not_a_mismatch():
 
 
 def test_an_order_the_broker_filled_that_the_hub_has_no_record_of():
-    ibkr_slave()
+    """Reported, but not alarmed on -- yet.
+
+    One of the two orders is in the registry, so the join is available and
+    the other can be named. It is still not raised, because protective
+    stop and target orders are recorded by their client-side ids and so
+    cannot be recognised either: an alerting untracked list would include
+    every protective fill. See Summary.untracked_reliable.
+    """
+    slave = ibkr_slave()
+    registry_row(slave, 900001, price=4040.7, lots=1.0)
+
     summary = compare(parse_statement(TWO_ORDERS))
     assert summary.orders == 2
-    assert summary.matched == 0
-    assert [u["ib_order_id"] for u in summary.untracked] == ["900001", "900002"]
+    assert summary.join_available is True
+    assert summary.matched == 1
+    assert [u["ib_order_id"] for u in summary.untracked] == ["900002"]
     assert summary.untracked[0]["slave_symbol"] == "GCZ6"
     assert summary.untracked[0]["size"] == 1.0
-    assert summary.untracked[0]["avg_price"] == 4040.7
-    assert summary.clean is False
+    assert summary.untracked_reliable is False
+    assert summary.clean is True, "reported, not raised"
+
+
+def test_a_pass_with_nothing_to_join_on_claims_nothing():
+    """The failure this guard exists for.
+
+    The join was first written against `slave_ticket`, which is TWS's
+    client-side order number and never appears in a statement. Run against
+    a real 30-day statement it matched 0 of 109 orders and called every one
+    untracked -- an alarm that would have fired daily and been wrong daily.
+
+    With no row carrying a broker order id there is nothing to compare, so
+    the pass says so and asserts nothing about the statement.
+    """
+    ibkr_slave()                      # a slave, but no copies recorded
+    summary = compare(parse_statement(TWO_ORDERS))
+
+    assert summary.join_available is False
+    assert summary.matched == 0
+    assert summary.untracked == [], "no key, no claim"
+    assert summary.mismatched == []
+    assert summary.clean is True, "and nothing to alert about"
+    assert summary.checked == 2, "the executions were still counted"
+
+
+def test_rows_predating_the_key_are_counted_not_guessed_at():
+    """They are invisible to the join and nothing can recover their id."""
+    slave = ibkr_slave()
+    registry_row(slave, 900001, price=4040.7, lots=1.0)
+    with db_cursor() as cur:
+        cur.execute(
+            "INSERT INTO slave_trades (slave_id, master_account, master_ticket, "
+            "slave_symbol, slave_ticket, status) "
+            "VALUES (?, '11558127', 77, 'MGC', 404, 'OPEN')", (slave,))
+
+    summary = compare(parse_statement(TWO_ORDERS))
+    assert summary.join_available is True
+    assert summary.unjoinable_rows == 1
 
 
 def test_both_sides_under_one_order_id_is_reported_as_itself():
@@ -296,16 +352,22 @@ def test_executions_with_no_order_id_are_counted_not_hidden():
 
 
 def test_only_ibkr_slaves_are_joined():
-    """`slave_ticket` is an IB order id for an IBKR slave and an MT4 ticket
-    number for an MT4 one. Both being small integers, joining across all of
-    them matches by coincidence of value.
+    """An MT4 slave's ids live in a different numbering space entirely, so
+    joining across both would match by coincidence of value.
     """
     insert_slave("mt5-icm-1", "MT5 ICM", "mt4", {"mode": "mirror"}, True)
     registry_row("mt5-icm-1", 900001, price=4038.95, lots=2.0)
 
+    # An IBKR row too, on an id the statement does NOT carry, so the join
+    # is available and the question is only whether the MT4 row is used.
+    slave = ibkr_slave()
+    registry_row(slave, 555555, symbol="MGC", price=1.0, lots=1.0,
+                 master_ticket=99)
+
     summary = compare(parse_statement(ONE_ORDER))
-    assert summary.matched == 0, "an MT4 ticket is not an IB order id"
-    assert len(summary.untracked) == 1
+    assert summary.join_available is True
+    assert summary.matched == 0, "the MT4 row was not joined against"
+    assert [u["ib_order_id"] for u in summary.untracked] == ["900001"]
 
 
 def test_absence_is_never_claimed_to_have_been_checked():

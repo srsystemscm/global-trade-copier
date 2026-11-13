@@ -23,6 +23,7 @@ def record_open(
     slave_lots: Optional[float] = None,
     requested_at: Optional[float] = None,
     filled_at: Optional[float] = None,
+    broker_order_id: Optional[str] = None,
 ) -> None:
     """Record the copy, and what it executed at.
 
@@ -36,8 +37,9 @@ def record_open(
             """
             INSERT INTO slave_trades
                 (slave_id, master_account, master_ticket, slave_symbol, slave_ticket, status,
-                 opened_at, master_price, slave_price, slave_lots, requested_at, filled_at)
-            VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?)
+                 opened_at, master_price, slave_price, slave_lots, requested_at, filled_at,
+                 broker_order_id)
+            VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (slave_id, master_account, master_ticket, slave_symbol) DO UPDATE SET
                 slave_ticket = excluded.slave_ticket,
                 status       = 'OPEN',
@@ -47,10 +49,15 @@ def record_open(
                 slave_price  = excluded.slave_price,
                 slave_lots   = excluded.slave_lots,
                 requested_at = excluded.requested_at,
-                filled_at    = excluded.filled_at
+                filled_at    = excluded.filled_at,
+                -- COALESCE, not excluded: a re-record that does not know
+                -- the broker's id must not erase one already captured.
+                broker_order_id = COALESCE(excluded.broker_order_id,
+                                           slave_trades.broker_order_id)
             """,
             (slave_id, master_account, master_ticket, slave_symbol, slave_ticket, time.time(),
-             master_price, slave_price, slave_lots, requested_at, filled_at),
+             master_price, slave_price, slave_lots, requested_at, filled_at,
+             broker_order_id),
         )
 
 

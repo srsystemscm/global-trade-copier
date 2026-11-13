@@ -486,6 +486,15 @@ class IBKRAdapter(BrokerAdapter):
         entry.tif = self.entry_tif
         trade = self._place(contract, entry)
         slave_ticket = trade.order.orderId
+        # permId is IBKR's own permanent id for the order, and the only one
+        # that appears in an Activity Flex statement. orderId above is TWS's
+        # client-side sequence number and is not in the statement at all, so
+        # without this there is nothing to reconcile the two on.
+        #
+        # It is assigned when the order is acknowledged, which can be a
+        # moment after placing it -- so 0/None here is normal and means "not
+        # yet known", not "no id".
+        broker_order_id = getattr(trade.order, "permId", None) or None
 
         sl_order_id = tp_order_id = None
         if not order.broker_brackets and (sl_price is not None or tp_price is not None):
@@ -561,7 +570,9 @@ class IBKRAdapter(BrokerAdapter):
         # evening book may not fill for minutes. The caller collects it via
         # await_entry_fill() and records it then.
         return OrderResult(
-            slave_ticket=slave_ticket, sl_order_id=sl_order_id, tp_order_id=tp_order_id
+            slave_ticket=slave_ticket, sl_order_id=sl_order_id,
+            tp_order_id=tp_order_id,
+            broker_order_id=None if broker_order_id is None else str(broker_order_id),
         )
 
     def _cancel_tracked_order(self, order_id: Optional[int]) -> None:

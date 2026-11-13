@@ -83,6 +83,11 @@ class OrderResult:
     # without them a restored position can't have its stop moved or cancelled.
     sl_order_id: Optional[int] = None
     tp_order_id: Optional[int] = None
+    # The broker's OWN id for this order, where it differs from the handle
+    # above. IBKR's `slave_ticket` is TWS's client-side order number, while
+    # its Flex statements report a nine-digit broker id -- different
+    # numbering spaces, so reconciling the two needs this recorded.
+    broker_order_id: Optional[str] = None
 
 
 @dataclass

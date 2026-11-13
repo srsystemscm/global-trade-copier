@@ -72,6 +72,20 @@ CREATE TABLE IF NOT EXISTS slave_trades (
     filled_at           REAL,   -- adapter came back with a ticket
     master_close_price  REAL,
     slave_close_price   REAL,
+    -- The BROKER's own id for the order, where it has one distinct from
+    -- the handle this hub trades by.
+    --
+    -- `slave_ticket` for an IBKR slave is `trade.order.orderId`, which is
+    -- TWS's client-side sequence number: small, and restarting with the
+    -- session. An IBKR Activity Flex statement reports `ibOrderID`, which
+    -- is the broker's own nine-digit id. They are different numbering
+    -- spaces and never match -- measured, after reconciliation was built
+    -- on the assumption that they did and matched 0 of 109 orders against
+    -- a real statement.
+    --
+    -- So the broker's id is recorded separately, and that is what
+    -- reconciliation against the statement joins on.
+    broker_order_id     TEXT,
     UNIQUE (slave_id, master_account, master_ticket, slave_symbol)
 );
 
@@ -249,6 +263,7 @@ def _migrate_to_account_keys(conn: sqlite3.Connection) -> None:
 # separate from the account-key migration, which does.
 _ADDED_COLUMNS = {
     "slave_trades": [
+        ("broker_order_id", "TEXT"),
         ("master_price", "REAL"),
         ("slave_price", "REAL"),
         ("slave_lots", "REAL"),

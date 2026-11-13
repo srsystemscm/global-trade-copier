@@ -4,10 +4,29 @@
 stores it and compares it to the Trade Registry, on a daily schedule,
 without anybody running anything by hand.
 
-The comparison is possible because of one coincidence worth stating
-plainly: `IBKRAdapter.open()` records `slave_ticket = trade.order.orderId`,
-and Flex reports `ibOrderID`. So the broker's statement and this hub's
-registry are already keyed the same way, and the join is an equality.
+The join key, and the mistake that was made about it
+----------------------------------------------------
+
+This was first written believing the two sides were already keyed the
+same way: `IBKRAdapter.open()` recorded `slave_ticket =
+trade.order.orderId`, Flex reports `ibOrderID`, so the join looked like a
+plain equality.
+
+They are different identifiers. `orderId` is TWS's CLIENT-side sequence
+number -- small, and restarting with the session (497, 295, 404 in this
+hub's registry). `ibOrderID` is IBKR's own, nine digits (244184125). Run
+against a real 30-day statement the join matched **0 of 109 orders** and
+called every one of them untracked, which would have alerted every day
+and been wrong every day.
+
+So the adapter now records `trade.order.permId` -- IBKR's permanent,
+broker-side id, and the one that actually appears in a statement -- into
+`slave_trades.broker_order_id`, and that is what the join uses.
+
+Rows written before that change have no `broker_order_id`, and nothing can
+recover it for them. A pass that cannot join says so and claims nothing:
+see `Summary.join_available`. Claiming drift on the strength of a key that
+is not there is how a reconciliation becomes an alarm nobody reads.
 
 What is compared, and what deliberately is not
 ----------------------------------------------
@@ -206,31 +225,41 @@ class RegistryRow:
     size: Optional[float]
 
 
-def _registry_by_order_id() -> Dict[str, RegistryRow]:
-    """Every copy this hub made, keyed by the broker order id it became.
+def _registry_by_order_id() -> Tuple[Dict[str, RegistryRow], int]:
+    """Copies keyed by the BROKER's order id, and how many lack one.
 
-    Only IBKR slaves: `slave_ticket` is an IB order id for those and
-    something else entirely for an MT4 slave, so joining across all of them
-    would match an MT4 ticket number against an IBKR order id purely by
-    coincidence of value -- which, both being small integers, happens.
+    Only IBKR slaves. `broker_order_id` is only ever written for them, and
+    an MT4 slave's `slave_ticket` lives in a different numbering space
+    entirely -- joining across both would match by coincidence of value,
+    which for small integers happens.
+
+    The second return value is the number of IBKR rows with no broker id.
+    Those are rows written before the id was captured, and nothing can
+    recover it for them: they are invisible to this join, and a count is
+    the only honest thing to say about them.
     """
     with db_cursor() as cur:
         rows = cur.execute(
             """
-            SELECT st.slave_id, st.slave_symbol, st.slave_ticket,
+            SELECT st.slave_id, st.slave_symbol, st.broker_order_id,
                    st.slave_price, st.slave_lots
             FROM slave_trades st
             JOIN slaves s ON s.id = st.slave_id
-            WHERE s.broker_type = 'ibkr' AND st.slave_ticket IS NOT NULL
+            WHERE s.broker_type = 'ibkr'
             """
         ).fetchall()
-    return {
-        str(r["slave_ticket"]): RegistryRow(
+
+    joinable: Dict[str, RegistryRow] = {}
+    without = 0
+    for r in rows:
+        if not r["broker_order_id"]:
+            without += 1
+            continue
+        joinable[str(r["broker_order_id"])] = RegistryRow(
             slave_id=r["slave_id"], slave_symbol=r["slave_symbol"],
             price=r["slave_price"], size=r["slave_lots"],
         )
-        for r in rows
-    }
+    return joinable, without
 
 
 def _protective_order_ids() -> Dict[str, str]:
@@ -240,6 +269,14 @@ def _protective_order_ids() -> Dict[str, str]:
     so they appear in the statement under order ids that are nowhere in
     `slave_trades`. Counted as untracked, every protected position would
     look like something the copier had lost track of.
+
+    CAVEAT, and the reason `untracked` is not alerted on yet: these ids are
+    `trade.order.orderId` -- TWS's client-side number -- exactly like the
+    entry ids were before `broker_order_id` was added. So they cannot match
+    a statement's `ibOrderID` either, and a stop fill still cannot be
+    recognised. Until these are captured as permIds too, an untracked list
+    would include every protective fill, so it is reported and not alarmed
+    on. See Summary.untracked_reliable.
     """
     known: Dict[str, str] = {}
     with db_cursor() as cur:
@@ -298,10 +335,31 @@ class Summary:
     untracked: List[Dict[str, Any]] = field(default_factory=list)
     period: Optional[str] = None
     account: str = ""
+    # Whether any registry row carries a broker order id to join on. False
+    # means this pass compared nothing and is making no claim.
+    join_available: bool = False
+    # Whether `untracked` can be believed. False while the protective
+    # stop/target orders are still recorded by their client-side ids, which
+    # a statement never reports -- so every protective fill would appear in
+    # the list. The orders are still reported, for the record; they just do
+    # not raise anything.
+    untracked_reliable: bool = False
+    # IBKR rows with no broker order id -- written before it was captured,
+    # unrecoverable, and invisible to the join.
+    unjoinable_rows: int = 0
 
     @property
     def clean(self) -> bool:
-        return not self.mismatched and not self.untracked
+        """Nothing worth raising. Read by the alerting, so it is
+        deliberately conservative about what counts.
+
+        A pass that could not join is not "clean" in the sense of "all
+        well" -- it is silent -- but it must not alert. And `untracked` is
+        only counted while it can be believed: see untracked_reliable.
+        """
+        if self.mismatched:
+            return False
+        return not (self.untracked and self.untracked_reliable)
 
     def as_detail(self) -> Dict[str, Any]:
         return {
@@ -316,6 +374,9 @@ class Summary:
             "already_had": self.already_had,
             "mismatched": self.mismatched,
             "untracked": self.untracked,
+            "join_available": self.join_available,
+            "unjoinable_rows": self.unjoinable_rows,
+            "untracked_reliable": self.untracked_reliable,
             # Said in the payload, not only in this module's docstring: a
             # reader must not take a clean pass as "the broker executed
             # everything the registry expected".
@@ -326,7 +387,7 @@ class Summary:
 def compare(statement: FlexStatement, stored: int = 0, already_had: int = 0) -> Summary:
     """Compare a statement against the registry. Touches nothing."""
     orders, unjoinable = _by_order(statement.trades)
-    registry = _registry_by_order_id()
+    registry, unjoinable_rows = _registry_by_order_id()
     protective = _protective_order_ids()
 
     summary = Summary(
@@ -334,7 +395,22 @@ def compare(statement: FlexStatement, stored: int = 0, already_had: int = 0) -> 
         stored=stored, already_had=already_had,
         period=f"{statement.from_date} -> {statement.to_date}",
         account=statement.account,
+        join_available=bool(registry),
+        unjoinable_rows=unjoinable_rows,
     )
+
+    if not registry:
+        # Nothing to join against, so nothing can be said. Reporting every
+        # order as untracked here would be an alarm that fires daily and is
+        # wrong daily -- which is exactly what happened before the key was
+        # fixed, measured at 109 of 109.
+        logger.warning(
+            "Flex reconciliation: no registry row carries a broker order id, "
+            "so this statement cannot be joined and nothing is being claimed "
+            "about it. %d IBKR row(s) predate the id being captured. New "
+            "copies will carry it.", unjoinable_rows,
+        )
+        return summary
 
     for order_id, fill in sorted(orders.items()):
         row = registry.get(order_id)
@@ -374,7 +450,13 @@ async def run_once(
     stored, already_had = store(statement)
     summary = compare(statement, stored, already_had)
 
-    if summary.clean:
+    if not summary.join_available:
+        logger.info(
+            "Flex reconciliation (%s): %d execution(s) stored, %d new. No "
+            "comparison was made -- see the warning above.",
+            summary.period, summary.checked, summary.stored,
+        )
+    elif summary.clean:
         logger.info(
             "Flex reconciliation (%s): %d execution(s) over %d order(s), "
             "%d matched, %d protective, %d new -- nothing disagrees",
@@ -398,6 +480,15 @@ async def run_once(
                            item["ib_order_id"], item["direction"],
                            item["slave_symbol"], item["size"])
 
+    if summary.untracked and not summary.untracked_reliable:
+        logger.info(
+            "Flex reconciliation: %d order(s) could not be tied to a registry "
+            "row, which is expected for now -- protective stop and target "
+            "orders are still recorded by their client-side ids, which a "
+            "statement never reports. Not raising anything on it.",
+            len(summary.untracked),
+        )
+
     if summary.unjoinable:
         logger.warning(
             "Flex reconciliation: %d execution(s) carry no ibOrderID and "
@@ -415,12 +506,14 @@ async def run_once(
         })
 
     if notifier is not None and not summary.clean:
+        untracked = (len(summary.untracked) if summary.untracked_reliable
+                     else 0)
         await notifier.notify(
             "flex_reconciliation",
             f"IBKR's own statement disagrees with the copier's record: "
-            f"{len(summary.mismatched)} mismatch(es) and "
-            f"{len(summary.untracked)} order(s) the broker filled that this "
-            f"hub has no record of, over {summary.period}",
+            f"{len(summary.mismatched)} mismatch(es) and {untracked} order(s) "
+            f"the broker filled that this hub has no record of, over "
+            f"{summary.period}",
         )
 
     return summary
