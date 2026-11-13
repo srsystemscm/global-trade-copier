@@ -6,6 +6,7 @@ These cover the recovery path and the guard that keeps signals off a dead
 adapter in the meantime.
 """
 import asyncio
+import time
 
 from app.adapters.base import BrokerAdapter
 from app.copy_engine import CopyEngine
@@ -44,15 +45,50 @@ def _watchdog(adapter, recover=None, on_session_state=None, max_attempts=3, paus
     )
 
 
-def _drive(watchdog, seconds=0.25):
+def _drive(watchdog, until=None, seconds=0.25, timeout=5.0):
+    """Run the watchdog, then stop it and return what it emitted.
+
+    `until` waits for a CONDITION with a deadline; `seconds` sleeps for a
+    fixed span. Which one is right depends on what is being asserted, and
+    the difference matters:
+
+    - a test asserting something HAPPENED must wait for it. The recovery
+      loop is driven by a real clock, and how many passes fit into a fixed
+      span depends on the machine -- Windows' loop granularity is ~15ms,
+      and a shared CI runner is slower than a desktop. These tests were
+      written with fixed sleeps and one of them duly failed on CI under a
+      newer dependency set, having escalated correctly and simply run out
+      of wall clock before recovery completed. That is the test being
+      wrong, not the watchdog.
+    - a test asserting something did NOT happen cannot wait for it, so it
+      keeps a fixed window.
+
+    `until` is called with the events emitted so far, and may close over
+    whatever else the test is watching.
+    """
     async def go():
         emitted = []
         watchdog.events.emit = lambda e: _collect(emitted, e)  # type: ignore[assignment]
         watchdog.start()
-        await asyncio.sleep(seconds)
+        if until is None:
+            await asyncio.sleep(seconds)
+        else:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and not until(emitted):
+                await asyncio.sleep(0.005)
         await watchdog.stop()
         return emitted
     return asyncio.run(go())
+
+
+def _saw(event_type):
+    """A condition for `until`: this event type has been emitted."""
+    return lambda emitted: any(e.get("type") == event_type for e in emitted)
+
+
+def _counted(event_type, n):
+    return lambda emitted: sum(
+        1 for e in emitted if e.get("type") == event_type) >= n
 
 
 def _collect(sink, event):
@@ -79,7 +115,7 @@ def test_disconnect_triggers_recovery():
 
     w = _watchdog(adapter, recover=recover)
     w.connected = True  # was up, so the next poll is a disconnect transition
-    types = _types(_drive(w))
+    types = _types(_drive(w, until=_saw("slave_session_recovered")))
 
     assert attempts, "recovery was never attempted"
     assert "slave_disconnected" in types
@@ -101,7 +137,7 @@ def test_recovery_retries_until_it_works():
 
     w = _watchdog(adapter, recover=recover, max_attempts=10)
     w.connected = True
-    types = _types(_drive(w))
+    types = _types(_drive(w, until=_saw("slave_session_recovered")))
 
     assert calls["n"] == 3
     assert "slave_session_recovered" in types
@@ -121,7 +157,11 @@ def test_recovery_escalates_once_then_keeps_trying():
 
     w = _watchdog(adapter, recover=recover, max_attempts=2)
     w.connected = True
-    types = _types(_drive(w, seconds=0.3))
+    # Both halves of the claim: it has alerted, AND it has carried on past
+    # the cap. Waiting for only the alert would stop before the retries
+    # that are the actual point.
+    types = _types(_drive(w, until=lambda emitted: (
+        _counted("slave_recovery_failed", 1)(emitted) and calls["n"] > 2)))
 
     assert types.count("slave_recovery_failed") == 1, "alerted more than once"
     assert calls["n"] > 2, "gave up at the cap instead of continuing to retry"
@@ -141,7 +181,7 @@ def test_recovery_after_escalation_still_reports_success():
 
     w = _watchdog(adapter, recover=recover, max_attempts=2)
     w.connected = True
-    types = _types(_drive(w, seconds=0.3))
+    types = _types(_drive(w, until=_saw("slave_session_recovered")))
 
     assert types.count("slave_recovery_failed") == 1
     assert "slave_session_recovered" in types
@@ -154,7 +194,10 @@ def test_adapters_without_recovery_are_untouched():
     adapter = _Adapter(ok=False)
     w = _watchdog(adapter, recover=None)
     w.connected = True
-    types = _types(_drive(w, seconds=0.1))
+    # Waiting for the disconnect is enough to make the absences below
+    # meaningful: with no `recover` there is no recovery loop to emit them
+    # at all, so a longer window could not change the answer.
+    types = _types(_drive(w, until=_saw("slave_disconnected")))
 
     assert "slave_disconnected" in types
     assert "slave_session_recovered" not in types
@@ -174,7 +217,7 @@ def test_pause_during_recovery_stands_down():
 
     w = _watchdog(adapter, recover=recover, paused=lambda: flag["paused"], max_attempts=10)
     w.connected = True
-    _drive(w, seconds=0.15)
+    _drive(w, until=lambda _emitted: w.connected is None)
 
     assert w.connected is None
 
@@ -188,7 +231,7 @@ def test_engine_is_told_the_session_went_down_and_came_back():
 
     w = _watchdog(adapter, recover=recover, on_session_state=states.append)
     w.connected = True
-    _drive(w)
+    _drive(w, until=lambda _emitted: states and states[-1] is True)
 
     assert states[0] is False, "engine was not told the session dropped"
     assert states[-1] is True, "engine was never cleared to trade again"
