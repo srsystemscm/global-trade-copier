@@ -7,6 +7,12 @@ on:
   push:
     branches: [master]
   pull_request:
+  # For the upgrade canary below, which is the only job these reach. Monday
+  # morning, so a week's worth of releases has landed and there is a working
+  # week to deal with whatever it says.
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
 
 # A second push to the same branch makes the first run's answer worthless, so
 # cancel it rather than paying for it.
@@ -119,3 +125,52 @@ jobs:
         # change only -- which is most of what goes wrong in this dashboard,
         # and all of it currently found by opening the page by hand.
         run: npm run build
+
+  latest-deps:
+    name: upgrade canary
+    # Never on a pull request, so a library released this morning cannot
+    # block a merge. It answers "what breaks when we upgrade" BEFORE anyone
+    # upgrades -- which is the question the pinned runs left open: two tests
+    # failed under newer versions and the job was killed before pytest said
+    # which two.
+    #
+    # Red here is information, not an outage. Nothing is blocked by it.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install the newest of everything
+        working-directory: hub
+        # No constraints file and no pins: the names come out of the pinned
+        # files with the versions stripped off, so a dependency added to
+        # requirements.txt is canaried automatically rather than being
+        # forgotten in a second list kept here.
+        #
+        # This is the one job allowed to drift. Everything else installs the
+        # set the suite is known to pass on.
+        run: |
+          python -m pip install --upgrade pip
+          python scripts/unpin_requirements.py requirements.txt requirements-dev.txt > requirements-latest.txt
+          Get-Content requirements-latest.txt
+          python -m pip install --upgrade -r requirements-latest.txt
+
+      - name: What it resolved to
+        working-directory: hub
+        # Printed before the suite runs, so a failure below can be read
+        # against the versions that produced it. Without this the report is
+        # "it broke on the newest of something".
+        run: python -m pip list
+
+      - name: Run the test suite
+        working-directory: hub
+        run: >-
+          python -m pytest tests/ -q -rf
+          --timeout=180 --timeout-method=thread
+          --durations=10
