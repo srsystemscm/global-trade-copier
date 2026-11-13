@@ -90,7 +90,7 @@ input int    MAE_DELAY_MS        = 1500;
 //--- Hold the position this long after the MAE modify, then close it, so a
 //--- single run produces the whole OPEN -> MODIFY -> CLOSE sequence the
 //--- copier has to carry. 0 leaves the trade open.
-input int    CloseAfterMs        = 5000;
+input int    CloseAfterMs        = 3000;
 
 //--- fxDreema's POINT_FORMAT_RULES, which decide what a "pip" is
 input string POINT_FORMAT_RULES  = "0.001=0.01,0.00001=0.0001,0.000001=0.0001";
