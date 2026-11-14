@@ -100,7 +100,7 @@ class CopyEngine(SessionGateMixin):
         """
         if not self.slave_config.get("sizing"):
             target, reason = mirror.resolve_target(
-                self.slave_config, signal.symbol, signal.lots
+                self.slave_config, signal.symbol, signal.lots, signal.magic
             )
             if target is None:
                 return None, reason
@@ -142,6 +142,10 @@ class CopyEngine(SessionGateMixin):
             self.slave_config, symbol, signal.direction,
             master_price=signal.price, master_sl=signal.sl, master_tp=signal.tp,
             spec=spec, balance=account.balance, equity=account.equity,
+            # Which EA produced this. A strategy sized for a CFD account is
+            # a different amount of risk on a futures leg, and that is set
+            # per magic rather than per slave.
+            magic=signal.magic,
         )
 
     async def _fit_margin(self, plan, signal):

@@ -240,6 +240,10 @@ function RiskTab({ status, onChanged }) {
   // block now risks a share of its OWN balance per signal, so leaving
   // them out hid the setting that decides what gets traded.
   const slaves = status?.slaves ?? [];
+  // Every master the hub has heard from. Offered in the editor because
+  // with four to eight of them, a typed account number is a typo waiting
+  // to silently stop a slave trading.
+  const knownAccounts = Object.keys(status?.master?.last_heartbeat_by_account || {});
 
   async function load() {
     try {
@@ -331,16 +335,23 @@ function RiskTab({ status, onChanged }) {
         </p>
         {slaves.length === 0 && <p className="muted">No slaves configured.</p>}
         {slaves.map((s) => (
-          <SlaveRisk key={s.id} slave={s} onSaved={onChanged} />
+          <SlaveRisk
+            key={s.id}
+            slave={s}
+            knownAccounts={knownAccounts}
+            onSaved={onChanged}
+          />
         ))}
       </div>
     </>
   );
 }
 
-function SlaveRisk({ slave, onSaved }) {
+function SlaveRisk({ slave, knownAccounts, onSaved }) {
   const [editing, setEditing] = useState(false);
   const [editingMagic, setEditingMagic] = useState(false);
+  const [editingMasters, setEditingMasters] = useState(false);
+  const [editingScale, setEditingScale] = useState(false);
   const [editingRoll, setEditingRoll] = useState(false);
   const [showRoutes, setShowRoutes] = useState(false);
 
@@ -391,11 +402,30 @@ function SlaveRisk({ slave, onSaved }) {
 
       {editing && <SlaveRiskForm slave={slave} onDone={() => { setEditing(false); onSaved && onSaved(); }} />}
 
+      {/* Asked before the magic, because that is the order the bus
+          asks in: magic numbers are per-master and collide across them. */}
+      <div className="slave-risk-row">
+        <div>
+          <span className="muted small">Masters followed</span>
+          <div className="slave-risk-sizing">{slave.master_filter_summary}</div>
+        </div>
+        <button className="btn btn-small" onClick={() => setEditingMasters((v) => !v)}>
+          {editingMasters ? "Cancel" : "Edit"}
+        </button>
+      </div>
+      {editingMasters && (
+        <MasterFilterForm
+          slave={slave}
+          knownAccounts={knownAccounts}
+          onDone={() => { setEditingMasters(false); onSaved && onSaved(); }}
+        />
+      )}
+
       {/* Which signals reach this slave at all. A filter decides that
           before sizing ever runs, so it belongs above the routes. */}
       <div className="slave-risk-row">
         <div>
-          <span className="muted small">Signals accepted</span>
+          <span className="muted small">Strategies accepted</span>
           <div className="slave-risk-sizing">{slave.magic_filter_summary}</div>
         </div>
         <button className="btn btn-small" onClick={() => setEditingMagic((v) => !v)}>
@@ -406,6 +436,27 @@ function SlaveRisk({ slave, onSaved }) {
         <MagicFilterForm
           slave={slave}
           onDone={() => { setEditingMagic(false); onSaved && onSaved(); }}
+        />
+      )}
+
+      {/* Per-EA risk. The strategies are sized for a CFD account; the
+          futures and ETF legs have far less leverage, so the same signal
+          is a different amount of risk once it lands there. */}
+      <div className="slave-risk-row">
+        <div>
+          <span className="muted small">Risk per strategy</span>
+          <div className="slave-risk-sizing">
+            {describeScale(slave)}
+          </div>
+        </div>
+        <button className="btn btn-small" onClick={() => setEditingScale((v) => !v)}>
+          {editingScale ? "Cancel" : "Edit"}
+        </button>
+      </div>
+      {editingScale && (
+        <RiskScaleForm
+          slave={slave}
+          onDone={() => { setEditingScale(false); onSaved && onSaved(); }}
         />
       )}
 
@@ -510,10 +561,332 @@ function RouteTable({ routes }) {
   );
 }
 
+function describeScale(slave) {
+  const byMagic = slave.risk_scale_by_magic || {};
+  const entries = Object.entries(byMagic);
+  const base = slave.risk_scale ?? 1;
+  const baseText =
+    base === 1 ? "every strategy at full target risk" : `all strategies x${base}`;
+  if (entries.length === 0) return baseText;
+  const listed = entries
+    .map(([magic, scale]) => `${magic} x${scale}`)
+    .join(", ");
+  return `${baseText}; ${listed}`;
+}
+
+function RiskScaleForm({ slave, onDone }) {
+  const [full, setFull] = useState(null);
+  const [base, setBase] = useState(1);
+  const [rows, setRows] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const got = await api.getSlave(slave.id);
+        setFull(got);
+        setBase(got.config.risk_scale ?? 1);
+        const table = got.config.risk_scale_by_magic || {};
+        setRows(
+          Object.entries(table).map(([magic, scale]) => ({
+            magic: String(magic),
+            scale: String(scale),
+          })),
+        );
+      } catch (e) {
+        setErr(e.message);
+      }
+    })();
+  }, [slave.id]);
+
+  function setRow(i, patch) {
+    setRows(rows.map((r, j) => (i === j ? { ...r, ...patch } : r)));
+  }
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const table = {};
+      for (const r of rows) {
+        const magic = r.magic.trim();
+        if (!magic) continue;
+        if (!/^\d+$/.test(magic)) throw new Error(`"${magic}" is not a magic number`);
+        const scale = Number(r.scale);
+        // 0 is a real instruction -- do not trade this strategy here --
+        // so it is allowed. Blank and negative are not.
+        if (r.scale === "" || Number.isNaN(scale) || scale < 0) {
+          throw new Error(`scale for magic ${magic} must be 0 or more`);
+        }
+        if (magic in table) throw new Error(`magic ${magic} is listed twice`);
+        table[magic] = scale;
+      }
+
+      const config = { ...full.config };
+      if (Number(base) === 1) delete config.risk_scale;
+      else config.risk_scale = Number(base);
+      if (Object.keys(table).length === 0) delete config.risk_scale_by_magic;
+      else config.risk_scale_by_magic = table;
+
+      await api.patchSlave(slave.id, { config });
+      onDone();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (err && !full) return <div className="banner banner-error">{err}</div>;
+  if (!full) return <p className="muted small">Loading...</p>;
+
+  return (
+    <div className="slave-risk-form">
+      {err && <div className="banner banner-error">{err}</div>}
+
+      <label>
+        All strategies on this slave
+        <input
+          type="number"
+          step="0.05"
+          min="0"
+          value={base}
+          onChange={(e) => setBase(e.target.value)}
+        />
+      </label>
+
+      <div className="scale-rows">
+        <div className="scale-head">
+          <span>Magic</span>
+          <span>Scale</span>
+          <span />
+        </div>
+        {rows.map((r, i) => (
+          <div className="scale-row" key={i}>
+            <input
+              value={r.magic}
+              placeholder="1001"
+              onChange={(e) => setRow(i, { magic: e.target.value })}
+            />
+            <input
+              type="number"
+              step="0.05"
+              min="0"
+              value={r.scale}
+              placeholder="1.0"
+              onChange={(e) => setRow(i, { scale: e.target.value })}
+            />
+            <button
+              className="btn btn-small btn-danger"
+              onClick={() => setRows(rows.filter((_, j) => j !== i))}
+            >
+              Remove
+            </button>
+          </div>
+        ))}
+        <button
+          className="btn btn-small"
+          onClick={() => setRows([...rows, { magic: "", scale: "1" }])}
+        >
+          + Add strategy
+        </button>
+      </div>
+
+      <p className="muted small">
+        1.0 is the strategy&apos;s own target risk, unchanged. The origin EAs each risk a
+        fixed share of the account they run on, so 1.0 on a futures or ETF slave means the
+        same share of THAT account -- which is usually too much, because there is far less
+        leverage there than on the CFD account the strategy was sized for. 0 means do not
+        trade this strategy on this slave at all.
+      </p>
+      <p className="muted small">
+        A route that sets its own scale wins over this table, and this table wins over the
+        slave-wide value above it.
+      </p>
+
+      <div className="slave-actions">
+        <button className="btn btn-small" onClick={save} disabled={busy}>
+          {busy ? "Saving..." : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function MasterFilterForm({ slave, knownAccounts, onDone }) {
+  const [full, setFull] = useState(null);
+  const [allowRows, setAllowRows] = useState([]);
+  const [denyRows, setDenyRows] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const got = await api.getSlave(slave.id);
+        const mf = got.config.master_filter;
+        setFull(got);
+        const asText = (list) =>
+          (list || []).map((e) => String(e && e.account != null ? e.account : e));
+        if (Array.isArray(mf)) setAllowRows(asText(mf));
+        else if (mf && typeof mf === "object") {
+          setAllowRows(asText(mf.allow));
+          setDenyRows(asText(mf.deny));
+        }
+      } catch (e) {
+        setErr(e.message);
+      }
+    })();
+  }, [slave.id]);
+
+  function clean(rows, where) {
+    const out = [];
+    for (const raw of rows) {
+      const t = String(raw).trim();
+      if (!t) continue;
+      if (out.includes(t)) throw new Error(`master ${t} is listed twice in ${where}`);
+      out.push(t);
+    }
+    return out;
+  }
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const allow = clean(allowRows, "the follow list");
+      const deny = clean(denyRows, "the never-follow list");
+      const clash = allow.filter((a) => deny.includes(a));
+      if (clash.length) {
+        throw new Error(
+          `master ${clash.join(", ")} is in both lists -- deny wins, so it would never trade`,
+        );
+      }
+
+      const config = { ...full.config };
+      if (allow.length === 0 && deny.length === 0) {
+        delete config.master_filter;
+      } else {
+        const next = {};
+        // An empty allow-list is not "no allow-list": it would stop every
+        // signal. Only send the key when it has members.
+        if (allow.length) next.allow = allow;
+        if (deny.length) next.deny = deny;
+        config.master_filter = next;
+      }
+      await api.patchSlave(slave.id, { config });
+      onDone();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (err && !full) return <div className="banner banner-error">{err}</div>;
+  if (!full) return <p className="muted small">Loading...</p>;
+
+  return (
+    <div className="slave-risk-form">
+      {err && <div className="banner banner-error">{err}</div>}
+      <datalist id="known-masters">
+        {(knownAccounts || []).map((a) => (
+          <option key={a} value={a} />
+        ))}
+      </datalist>
+      <AccountList
+        label="Follow only these masters"
+        hint="none listed = follow every master"
+        values={allowRows}
+        onChange={setAllowRows}
+      />
+      <AccountList
+        label="Never follow these"
+        hint="applied after the list above"
+        values={denyRows}
+        onChange={setDenyRows}
+      />
+      <p className="muted small">
+        Magic numbers are per master and WILL collide: every fxDreema project numbers its
+        strategies from 1001, so two masters each running their first EA both stamp 1001. A
+        slave that follows both cannot tell them apart -- an accepted magic takes both, and a
+        per-strategy risk scale resizes both. Naming the masters is what makes the strategy
+        list mean something.
+      </p>
+      <div className="slave-actions">
+        <button className="btn btn-small" onClick={save} disabled={busy}>
+          {busy ? "Saving..." : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AccountList({ label, hint, values, onChange }) {
+  return (
+    <div className="magic-list">
+      <span className="muted small">
+        {label} <span className="muted small">-- {hint}</span>
+      </span>
+      {values.map((v, i) => (
+        <div className="magic-row" key={i}>
+          <input
+            value={v}
+            list="known-masters"
+            placeholder="44964870"
+            onChange={(e) => onChange(values.map((x, j) => (i === j ? e.target.value : x)))}
+          />
+          <button
+            className="btn btn-small btn-danger"
+            onClick={() => onChange(values.filter((_, j) => j !== i))}
+          >
+            Remove
+          </button>
+        </div>
+      ))}
+      <button className="btn btn-small" onClick={() => onChange([...values, ""])}>
+        + Add master
+      </button>
+    </div>
+  );
+}
+
+function MagicList({ label, hint, values, onChange }) {
+  return (
+    <div className="magic-list">
+      <span className="muted small">
+        {label} <span className="muted small">-- {hint}</span>
+      </span>
+      {values.map((v, i) => (
+        <div className="magic-row" key={i}>
+          <input
+            value={v}
+            placeholder="1001"
+            onChange={(e) => onChange(values.map((x, j) => (i === j ? e.target.value : x)))}
+          />
+          <button
+            className="btn btn-small btn-danger"
+            onClick={() => onChange(values.filter((_, j) => j !== i))}
+          >
+            Remove
+          </button>
+        </div>
+      ))}
+      <button className="btn btn-small" onClick={() => onChange([...values, ""])}>
+        + Add magic
+      </button>
+    </div>
+  );
+}
+
 function MagicFilterForm({ slave, onDone }) {
   const [full, setFull] = useState(null);
-  const [allow, setAllow] = useState("");
-  const [deny, setDeny] = useState("");
+  // One magic number per field. A comma-separated box reads fine until a
+  // stray character turns the whole list into one unparseable string, and
+  // an allow-list that fails to parse is a slave that stops trading.
+  const [allowRows, setAllowRows] = useState([]);
+  const [denyRows, setDenyRows] = useState([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
 
@@ -523,10 +896,10 @@ function MagicFilterForm({ slave, onDone }) {
         const got = await api.getSlave(slave.id);
         const mf = got.config.magic_filter;
         setFull(got);
-        if (Array.isArray(mf)) setAllow(mf.join(", "));
+        if (Array.isArray(mf)) setAllowRows(mf.map(String));
         else if (mf && typeof mf === "object") {
-          setAllow((mf.allow || []).join(", "));
-          setDeny((mf.deny || []).join(", "));
+          setAllowRows((mf.allow || []).map(String));
+          setDenyRows((mf.deny || []).map(String));
         }
       } catch (e) {
         setErr(e.message);
@@ -534,22 +907,30 @@ function MagicFilterForm({ slave, onDone }) {
     })();
   }, [slave.id]);
 
-  function parseList(text) {
-    return text
-      .split(/[,\s]+/)
-      .map((t) => t.trim())
-      .filter(Boolean)
-      .map(Number);
+  function parseRows(rows, where) {
+    const out = [];
+    for (const raw of rows) {
+      const t = String(raw).trim();
+      if (!t) continue;
+      if (!/^\d+$/.test(t)) throw new Error(`"${t}" in ${where} is not a magic number`);
+      const n = Number(t);
+      if (out.includes(n)) throw new Error(`magic ${n} is listed twice in ${where}`);
+      out.push(n);
+    }
+    return out;
   }
 
   async function save() {
     setBusy(true);
     setErr(null);
     try {
-      const allowList = parseList(allow);
-      const denyList = parseList(deny);
-      if ([...allowList, ...denyList].some((n) => !Number.isInteger(n))) {
-        throw new Error("magic numbers must be whole numbers");
+      const allowList = parseRows(allowRows, "the accept list");
+      const denyList = parseRows(denyRows, "the never-accept list");
+      const clash = allowList.filter((n) => denyList.includes(n));
+      if (clash.length) {
+        throw new Error(
+          `magic ${clash.join(", ")} is in both lists -- deny wins, so it would never trade`,
+        );
       }
       const config = { ...full.config };
       if (allowList.length === 0 && denyList.length === 0) {
@@ -577,14 +958,18 @@ function MagicFilterForm({ slave, onDone }) {
   return (
     <div className="slave-risk-form">
       {err && <div className="banner banner-error">{err}</div>}
-      <label>
-        Accept only these magic numbers <span className="muted small">blank = accept all</span>
-        <input value={allow} onChange={(e) => setAllow(e.target.value)} placeholder="1001, 1002, 2389" />
-      </label>
-      <label>
-        Never accept these <span className="muted small">applied after the list above</span>
-        <input value={deny} onChange={(e) => setDeny(e.target.value)} placeholder="1007" />
-      </label>
+      <MagicList
+        label="Accept only these"
+        hint="none listed = accept every strategy"
+        values={allowRows}
+        onChange={setAllowRows}
+      />
+      <MagicList
+        label="Never accept these"
+        hint="applied after the list above"
+        values={denyRows}
+        onChange={setDenyRows}
+      />
       <p className="muted small">
         One master terminal can run many EAs, each stamping its own magic number. This decides
         which of them this slave copies. Leaving both blank accepts every signal -- which is what

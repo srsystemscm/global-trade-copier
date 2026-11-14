@@ -10,6 +10,7 @@ from app.config import settings
 from app.db import db_cursor
 from app.events import EventBus
 from app.magic_filter import ALL as EVERY_MAGIC
+from app.master_filter import EVERY_MASTER, MasterFilter
 from app.magic_filter import MagicFilter
 from app.models import Signal
 from app.risk_controls import is_kill_switch_active
@@ -29,6 +30,7 @@ class SignalBus:
         # app/magic_filter.py for why the selection lives on the slave and
         # is applied here rather than in the engines.
         self._magic: Dict[str, MagicFilter] = {}
+        self._masters: Dict[str, MasterFilter] = {}
         self.events = events
 
     def register_slave(
@@ -40,6 +42,21 @@ class SignalBus:
         logger.info("registered slave queue: %s (takes %s)",
                     slave_id, self._magic[slave_id].describe())
         return queue
+
+    def set_master_filter(
+        self, slave_id: str, master_filter: Optional[MasterFilter] = None
+    ) -> None:
+        """Change which masters a running slave takes, without a restart.
+
+        Same reasoning as set_magic_filter: a selection that needed a hub
+        restart would be the one piece of a slave's config you could not
+        adjust while the market was open.
+        """
+        if slave_id not in self._slave_queues:
+            return
+        selection = master_filter or EVERY_MASTER
+        self._masters[slave_id] = selection
+        logger.info("slave=%s now takes %s", slave_id, selection.describe())
 
     def set_magic_filter(
         self, slave_id: str, magic_filter: Optional[MagicFilter] = None
@@ -59,6 +76,7 @@ class SignalBus:
     def unregister_slave(self, slave_id: str) -> None:
         self._slave_queues.pop(slave_id, None)
         self._magic.pop(slave_id, None)
+        self._masters.pop(slave_id, None)
         logger.info("unregistered slave queue: %s", slave_id)
 
     def _recipients(self, signal: Signal) -> List[str]:
@@ -71,7 +89,13 @@ class SignalBus:
         """
         taking = []
         for slave_id in self._slave_queues:
-            accepts, why = self._magic.get(slave_id, EVERY_MAGIC).accepts(signal)
+            # The MASTER is asked first. Magic numbers are per-master and
+            # collide across them -- every fxDreema project numbers from
+            # 1001 -- so "is this one of my masters" has to be settled
+            # before "is this one of my strategies" means anything.
+            accepts, why = self._masters.get(slave_id, EVERY_MASTER).accepts(signal)
+            if accepts:
+                accepts, why = self._magic.get(slave_id, EVERY_MAGIC).accepts(signal)
             if accepts:
                 taking.append(slave_id)
             else:
