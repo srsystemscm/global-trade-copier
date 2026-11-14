@@ -41,7 +41,7 @@ export default function Settings() {
       {tab === "General" && <GeneralTab config={config} onChanged={refresh} />}
       {tab === "Master" && <MasterTab status={status} />}
       {tab === "Slaves" && <SlavesTab status={status} onChanged={refresh} />}
-      {tab === "Risk" && <RiskTab status={status} />}
+      {tab === "Risk" && <RiskTab status={status} onChanged={refresh} />}
       {tab === "Notifications" && <NotificationsTab config={config} onChanged={refresh} />}
       {tab === "Logs" && <LogsTab />}
       {tab === "Export" && <ExportTab />}
@@ -231,11 +231,15 @@ function SlavesTab({ status, onChanged }) {
   );
 }
 
-function RiskTab({ status }) {
+function RiskTab({ status, onChanged }) {
   const [risk, setRisk] = useState(null);
   const [error, setError] = useState(null);
   const [saving, setSaving] = useState(false);
-  const autonomousSlaves = status?.slaves.filter((s) => s.mode === "autonomous") ?? [];
+  // Every slave, not only the autonomous ones. Mirror slaves had no
+  // sizing of their own when this view was written; one with a sizing
+  // block now risks a share of its OWN balance per signal, so leaving
+  // them out hid the setting that decides what gets traded.
+  const slaves = status?.slaves ?? [];
 
   async function load() {
     try {
@@ -319,19 +323,504 @@ function RiskTab({ status }) {
       </div>
 
       <div className="panel">
-        <h2 style={{ marginTop: 0 }}>Per-slave sizing &amp; risk management</h2>
+        <h2 style={{ marginTop: 0 }}>Per-slave sizing &amp; risk</h2>
         <p className="muted small">
-          Autonomous mode only. Edit from the Slaves tab or the Add Slave wizard; this view is read-only.
+          How much each slave stakes per signal, and what would stop it trading at all.
+          Every slave is listed -- mirror slaves size from their own balance too when they
+          carry a sizing block.
         </p>
-        {autonomousSlaves.length === 0 && <p className="muted">No autonomous-mode slaves configured.</p>}
-        {autonomousSlaves.map((s) => (
-          <div key={s.id} style={{ marginBottom: 16 }}>
-            <strong>{s.name}</strong>
-            <pre className="review-json">{JSON.stringify({ sizing: s.sizing, risk_management: s.risk_management }, null, 2)}</pre>
-          </div>
+        {slaves.length === 0 && <p className="muted">No slaves configured.</p>}
+        {slaves.map((s) => (
+          <SlaveRisk key={s.id} slave={s} onSaved={onChanged} />
         ))}
       </div>
     </>
+  );
+}
+
+function SlaveRisk({ slave, onSaved }) {
+  const [editing, setEditing] = useState(false);
+  const [editingMagic, setEditingMagic] = useState(false);
+  const [editingRoll, setEditingRoll] = useState(false);
+  const [showRoutes, setShowRoutes] = useState(false);
+
+  return (
+    <div className="slave-risk">
+      <div className="slave-risk-head">
+        <div>
+          <strong>{slave.name}</strong>{" "}
+          <span className="muted small">
+            {slave.broker_type} &middot; {slave.mode}
+          </span>
+          <div className="slave-risk-sizing">{slave.sizing_summary}</div>
+        </div>
+        {!slave.sizing_per_route && (
+          <button className="btn btn-small" onClick={() => setEditing((v) => !v)}>
+            {editing ? "Cancel" : "Edit"}
+          </button>
+        )}
+      </div>
+
+      <div className="slave-risk-flags">
+        {slave.netting?.allow_opposing && (
+          <span className="badge badge-warn" title="A signal opposing what this account already holds is copied rather than refused">
+            opposing legs allowed
+          </span>
+        )}
+        {slave.netting?.max_legs != null && (
+          <span className="badge">max {slave.netting.max_legs} legs/symbol</span>
+        )}
+        {slave.netting?.max_aggregate_risk_pct != null && (
+          <span className="badge">
+            {(slave.netting.max_aggregate_risk_pct * 100).toFixed(1)}% aggregate/symbol
+          </span>
+        )}
+        {slave.margin?.max_pct_of_free != null && (
+          <span className="badge">
+            margin ceiling {(slave.margin.max_pct_of_free * 100).toFixed(0)}% of free
+          </span>
+        )}
+      </div>
+
+      {slave.sizing_per_route && (
+        <p className="muted small">
+          Sizing is set on each of those individually, not on the slave as a whole, so there is
+          nothing to edit here -- a slave-level value would save cleanly and never be read.
+        </p>
+      )}
+
+      {editing && <SlaveRiskForm slave={slave} onDone={() => { setEditing(false); onSaved && onSaved(); }} />}
+
+      {/* Which signals reach this slave at all. A filter decides that
+          before sizing ever runs, so it belongs above the routes. */}
+      <div className="slave-risk-row">
+        <div>
+          <span className="muted small">Signals accepted</span>
+          <div className="slave-risk-sizing">{slave.magic_filter_summary}</div>
+        </div>
+        <button className="btn btn-small" onClick={() => setEditingMagic((v) => !v)}>
+          {editingMagic ? "Cancel" : "Edit"}
+        </button>
+      </div>
+      {editingMagic && (
+        <MagicFilterForm
+          slave={slave}
+          onDone={() => { setEditingMagic(false); onSaved && onSaved(); }}
+        />
+      )}
+
+      {/* Rolling is two market orders per position when it fires, and it
+          fires on its own schedule. Running invisibly is the problem. */}
+      {(slave.contract_roll || slave.mode === "autonomous") && (
+        <div className="slave-risk-row">
+          <div>
+            <span className="muted small">Contract roll</span>
+            <div className="slave-risk-sizing">
+              {slave.contract_roll?.enabled
+                ? `on -- rolls when the next month out-trades the front by ${
+                    slave.contract_roll.min_volume_ratio ?? 1
+                  }x, checked every ${
+                    (slave.contract_roll.check_interval_seconds ?? 3600) / 60
+                  } min`
+                : "off -- positions are never rolled to the next contract"}
+            </div>
+          </div>
+          <button className="btn btn-small" onClick={() => setEditingRoll((v) => !v)}>
+            {editingRoll ? "Cancel" : "Edit"}
+          </button>
+        </div>
+      )}
+      {editingRoll && (
+        <ContractRollForm
+          slave={slave}
+          onDone={() => { setEditingRoll(false); onSaved && onSaved(); }}
+        />
+      )}
+
+      {slave.routes?.length > 0 && (
+        <div className="slave-risk-row">
+          <button className="btn btn-small" onClick={() => setShowRoutes((v) => !v)}>
+            {showRoutes ? "Hide" : "Show"} {slave.routes.length} route
+            {slave.routes.length === 1 ? "" : "s"}
+          </button>
+        </div>
+      )}
+      {showRoutes && <RouteTable routes={slave.routes} />}
+    </div>
+  );
+}
+
+function RouteTable({ routes }) {
+  return (
+    <div className="table-wrap">
+      <table className="positions-table route-table">
+        <thead>
+          <tr>
+            <th>Master</th>
+            <th>Magic</th>
+            <th>Target</th>
+            <th>Dir</th>
+            <th>Order</th>
+            <th>Month</th>
+            <th>Stop held by</th>
+            <th>Sizing</th>
+          </tr>
+        </thead>
+        <tbody>
+          {routes.map((r, i) => (
+            <tr key={`${r.symbol}-${r.target.join("/")}-${i}`}>
+              <td>{r.symbol}</td>
+              <td>{r.magic ?? <span className="muted">any</span>}</td>
+              <td>
+                {r.target.join(" / ")}
+                {r.target.length > 1 && (
+                  <span className="muted small"> (first that resolves)</span>
+                )}
+              </td>
+              <td>
+                {r.direction ?? <span className="muted">both</span>}
+                {r.target_direction && r.target_direction !== r.direction && (
+                  <span className="muted small"> &rarr;{r.target_direction}</span>
+                )}
+              </td>
+              <td>
+                {r.order_type}
+                {r.outside_rth && <span className="badge badge-warn">outside RTH</span>}
+              </td>
+              <td>{r.month_slot ?? <span className="muted">--</span>}</td>
+              <td>
+                {r.broker_brackets === false ? (
+                  <span className="badge badge-warn" title="No resting stop at the broker -- the copier closes this leg itself, so it is unprotected while the hub is down">
+                    the copier
+                  </span>
+                ) : (
+                  "broker"
+                )}
+              </td>
+              <td>{r.sizing}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="muted small">
+        Read-only for now. These decide what a signal becomes -- which contract month, who holds
+        the stop, whether it may work outside regular hours.
+      </p>
+    </div>
+  );
+}
+
+function MagicFilterForm({ slave, onDone }) {
+  const [full, setFull] = useState(null);
+  const [allow, setAllow] = useState("");
+  const [deny, setDeny] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const got = await api.getSlave(slave.id);
+        const mf = got.config.magic_filter;
+        setFull(got);
+        if (Array.isArray(mf)) setAllow(mf.join(", "));
+        else if (mf && typeof mf === "object") {
+          setAllow((mf.allow || []).join(", "));
+          setDeny((mf.deny || []).join(", "));
+        }
+      } catch (e) {
+        setErr(e.message);
+      }
+    })();
+  }, [slave.id]);
+
+  function parseList(text) {
+    return text
+      .split(/[,\s]+/)
+      .map((t) => t.trim())
+      .filter(Boolean)
+      .map(Number);
+  }
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const allowList = parseList(allow);
+      const denyList = parseList(deny);
+      if ([...allowList, ...denyList].some((n) => !Number.isInteger(n))) {
+        throw new Error("magic numbers must be whole numbers");
+      }
+      const config = { ...full.config };
+      if (allowList.length === 0 && denyList.length === 0) {
+        delete config.magic_filter;
+      } else {
+        const next = {};
+        // An EMPTY allow-list is not the same as no allow-list: it would
+        // stop every signal. Only send the key when it has members.
+        if (allowList.length) next.allow = allowList;
+        if (denyList.length) next.deny = denyList;
+        config.magic_filter = next;
+      }
+      await api.patchSlave(slave.id, { config });
+      onDone();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (err && !full) return <div className="banner banner-error">{err}</div>;
+  if (!full) return <p className="muted small">Loading...</p>;
+
+  return (
+    <div className="slave-risk-form">
+      {err && <div className="banner banner-error">{err}</div>}
+      <label>
+        Accept only these magic numbers <span className="muted small">blank = accept all</span>
+        <input value={allow} onChange={(e) => setAllow(e.target.value)} placeholder="1001, 1002, 2389" />
+      </label>
+      <label>
+        Never accept these <span className="muted small">applied after the list above</span>
+        <input value={deny} onChange={(e) => setDeny(e.target.value)} placeholder="1007" />
+      </label>
+      <p className="muted small">
+        One master terminal can run many EAs, each stamping its own magic number. This decides
+        which of them this slave copies. Leaving both blank accepts every signal -- which is what
+        every slave does today.
+      </p>
+      <div className="slave-actions">
+        <button className="btn btn-small" onClick={save} disabled={busy}>
+          {busy ? "Saving..." : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ContractRollForm({ slave, onDone }) {
+  const [full, setFull] = useState(null);
+  const [form, setForm] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const got = await api.getSlave(slave.id);
+        const roll = got.config.contract_roll || {};
+        setFull(got);
+        setForm({
+          enabled: !!roll.enabled,
+          min_volume_ratio: roll.min_volume_ratio ?? 1,
+          check_interval_minutes: (roll.check_interval_seconds ?? 3600) / 60,
+        });
+      } catch (e) {
+        setErr(e.message);
+      }
+    })();
+  }, [slave.id]);
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const config = { ...full.config };
+      config.contract_roll = {
+        ...(config.contract_roll || {}),
+        enabled: !!form.enabled,
+        min_volume_ratio: Number(form.min_volume_ratio),
+        check_interval_seconds: Math.round(Number(form.check_interval_minutes) * 60),
+      };
+      await api.patchSlave(slave.id, { config });
+      onDone();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (err && !form) return <div className="banner banner-error">{err}</div>;
+  if (!form) return <p className="muted small">Loading...</p>;
+
+  return (
+    <div className="slave-risk-form">
+      {err && <div className="banner banner-error">{err}</div>}
+      <label className="checkbox-row">
+        <input
+          type="checkbox"
+          checked={form.enabled}
+          onChange={(e) => setForm({ ...form, enabled: e.target.checked })}
+        />
+        Roll positions to the next contract before expiry
+      </label>
+      <label>
+        Roll once the next month out-trades the front by
+        <input
+          type="number"
+          step="0.1"
+          min="0"
+          value={form.min_volume_ratio}
+          onChange={(e) => setForm({ ...form, min_volume_ratio: e.target.value })}
+        />
+      </label>
+      <label>
+        Check every (minutes)
+        <input
+          type="number"
+          step="5"
+          min="1"
+          value={form.check_interval_minutes}
+          onChange={(e) => setForm({ ...form, check_interval_minutes: e.target.value })}
+        />
+      </label>
+      <p className="muted small">
+        Volume, not the calendar: the next month out-trading the front is the market saying the
+        front is dying. A roll is two market orders per position, and a sweep runs outermost expiry
+        first so a rolled position never lands on a month another strategy still holds.
+      </p>
+      <div className="slave-actions">
+        <button className="btn btn-small" onClick={save} disabled={busy}>
+          {busy ? "Saving..." : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SlaveRiskForm({ slave, onDone }) {
+  const [full, setFull] = useState(null);
+  const [form, setForm] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const got = await api.getSlave(slave.id);
+        const sz = got.config.sizing || {};
+        setFull(got);
+        setForm({
+          mode: sz.mode === "pct_risk" ? "pct_risk" : "mirror_lots",
+          risk_pct: sz.risk_pct != null ? +(sz.risk_pct * 100).toFixed(4) : 1,
+          capital_base: sz.capital_base || "balance",
+          max_risk_pct: sz.max_risk_pct != null ? +(sz.max_risk_pct * 100).toFixed(4) : "",
+          allow_opposing: !!(got.config.netting || {}).allow_opposing,
+        });
+      } catch (e) {
+        setErr(e.message);
+      }
+    })();
+  }, [slave.id]);
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      // Read-modify-write, deliberately. PATCH replaces config_json whole,
+      // so routes, mirror_map, host and ports have to travel back
+      // untouched or they are deleted by omission.
+      const config = { ...full.config };
+
+      if (form.mode === "mirror_lots") {
+        delete config.sizing;
+      } else {
+        const sizing = { ...(config.sizing || {}), mode: "pct_risk" };
+        sizing.risk_pct = Number(form.risk_pct) / 100;
+        sizing.capital_base = form.capital_base;
+        if (form.max_risk_pct === "" || form.max_risk_pct === null) delete sizing.max_risk_pct;
+        else sizing.max_risk_pct = Number(form.max_risk_pct) / 100;
+        config.sizing = sizing;
+      }
+
+      config.netting = { ...(config.netting || {}), allow_opposing: !!form.allow_opposing };
+
+      await api.patchSlave(slave.id, { config });
+      onDone();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (err && !form) return <div className="banner banner-error">{err}</div>;
+  if (!form) return <p className="muted small">Loading this slave&apos;s configuration...</p>;
+
+  return (
+    <div className="slave-risk-form">
+      {err && <div className="banner banner-error">{err}</div>}
+
+      <label>
+        Sizing
+        <select value={form.mode} onChange={(e) => setForm({ ...form, mode: e.target.value })}>
+          <option value="mirror_lots">Mirror the master&apos;s lots</option>
+          <option value="pct_risk">Risk a percentage of this account</option>
+        </select>
+      </label>
+
+      {form.mode === "pct_risk" && (
+        <>
+          <label>
+            Risk per signal (%)
+            <input
+              type="number"
+              step="0.05"
+              min="0"
+              value={form.risk_pct}
+              onChange={(e) => setForm({ ...form, risk_pct: e.target.value })}
+            />
+          </label>
+          <label>
+            Measured against
+            <select
+              value={form.capital_base}
+              onChange={(e) => setForm({ ...form, capital_base: e.target.value })}
+            >
+              <option value="balance">Balance</option>
+              <option value="equity">Equity</option>
+            </select>
+          </label>
+          <label>
+            Refuse above (%) <span className="muted small">blank for no ceiling</span>
+            <input
+              type="number"
+              step="0.05"
+              min="0"
+              value={form.max_risk_pct}
+              onChange={(e) => setForm({ ...form, max_risk_pct: e.target.value })}
+            />
+          </label>
+          <p className="muted small">
+            The smallest tradeable size can already risk more than the target -- one gold future on a
+            wide stop does. When it exceeds the ceiling the leg is refused rather than sized up, so a
+            ceiling too close to the target means that instrument simply will not trade.
+          </p>
+        </>
+      )}
+
+      <label className="checkbox-row">
+        <input
+          type="checkbox"
+          checked={form.allow_opposing}
+          onChange={(e) => setForm({ ...form, allow_opposing: e.target.checked })}
+        />
+        Copy a signal that opposes what this account already holds
+      </label>
+      <p className="muted small">
+        Off, a BUY is refused while the account is short that symbol. On a hedging account both legs
+        sit side by side, which is intended if you trade both ways yourself -- and wrong if these
+        positions are not yours to add to.
+      </p>
+
+      <div className="slave-actions">
+        <button className="btn btn-small" onClick={save} disabled={busy}>
+          {busy ? "Saving..." : "Save"}
+        </button>
+      </div>
+    </div>
   );
 }
 

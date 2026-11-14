@@ -84,6 +84,167 @@ def _find_engine(request: Request, slave_id: str):
 POSITIONS_TIMEOUT_S = 5.0
 
 
+def _describe_sizing(sizing: Optional[Dict[str, Any]]) -> str:
+    """One readable phrase for one sizing block.
+
+    An absent block is not "none": a mirror slave without one converts the
+    master's lots by point value, which is a real sizing decision and the
+    one a reader most needs told, because nothing on screen would
+    otherwise distinguish it from a slave sizing itself.
+    """
+    sizing = sizing or {}
+    mode = sizing.get("mode")
+    if not mode:
+        return "mirrors the master's lots"
+    if mode == "pct_risk":
+        pct = sizing.get("risk_pct")
+        base = sizing.get("capital_base", "balance")
+        ceiling = sizing.get("max_risk_pct")
+        text = f"{pct:.2%} of {base}" if isinstance(pct, (int, float)) else f"pct_risk of {base}"
+        if isinstance(ceiling, (int, float)):
+            text += f", capped {ceiling:.2%}"
+        return text
+    if mode == "dollar_notional":
+        return f"${sizing.get('notional')} notional"
+    if mode == "fixed_contracts":
+        return f"{sizing.get('contracts')} contract(s) fixed"
+    if mode == "lot_multiplier":
+        return f"master lots x{sizing.get('multiplier')}"
+    return str(mode)
+
+
+def _tally(blocks, label: str) -> str:
+    """Several sizing blocks described as one line."""
+    blocks = list(blocks)
+    counts: Dict[str, int] = {}
+    for block in blocks:
+        described = _describe_sizing(block)
+        counts[described] = counts.get(described, 0) + 1
+    if len(counts) == 1:
+        return f"{len(blocks)} {label}, all {next(iter(counts))}"
+    parts = ", ".join(f"{n}x {d}" for d, n in sorted(counts.items(), key=lambda kv: -kv[1]))
+    return f"{len(blocks)} {label}: {parts}"
+
+
+def _per_target_sizing(config: Dict[str, Any]) -> Dict[str, Any]:
+    """The {"MGC": {...}, "GLD": {...}} form, if that is what this is.
+
+    resolve_sizing_config accepts sizing either as one shared block or as
+    a block per target symbol, told apart by whether the values are
+    dicts. Read as a single block, the per-target form has no `mode` at
+    all -- so it described itself as "mirrors the master's lots", which on
+    an autonomous slave is both wrong and reassuring, the worst pair.
+    """
+    sizing = config.get("sizing") or {}
+    return {k: v for k, v in sizing.items() if isinstance(v, dict)}
+
+
+def _sizing_summary(config: Dict[str, Any]) -> str:
+    """How this slave sizes, in one line, in all three shapes it takes.
+
+    `ibkr-etf-1` carries sizing on each of its twenty routes and none at
+    the slave level, so reporting the slave-level block alone showed
+    `null` -- which reads as unconfigured when it is configured twenty
+    times over. That is worse than saying nothing.
+    """
+    per_target = _per_target_sizing(config)
+    if per_target:
+        return _tally(per_target.values(), "targets")
+
+    if config.get("sizing"):
+        return _describe_sizing(config["sizing"])
+
+    routes = config.get("routes") or []
+    if not routes:
+        return _describe_sizing(None)
+    return _tally((r.get("sizing") for r in routes), "routes")
+
+
+def _describe_route_sizing(block: Optional[Dict[str, Any]]) -> str:
+    """A route's sizing, which may be whole, absent, or a partial override.
+
+    merge_sizing lets a route carry only the keys it changes, so
+    `{"max_risk_pct": 0.035}` means "the slave's sizing, with a higher
+    ceiling". Read as a block in its own right it has no `mode` and so
+    described itself as the no-sizing case -- the master's lots -- on a
+    slave that risks a percentage of its own balance. One such route
+    exists today, on ETHUSD, and nothing on screen would have shown that
+    its ceiling is more than double the others'.
+    """
+    if not block:
+        return "slave default"
+    if block.get("mode"):
+        return _describe_sizing(block)
+
+    bits = []
+    if isinstance(block.get("risk_pct"), (int, float)):
+        bits.append(f"{block['risk_pct']:.2%}")
+    if block.get("capital_base"):
+        bits.append(f"of {block['capital_base']}")
+    if isinstance(block.get("max_risk_pct"), (int, float)):
+        bits.append(f"capped {block['max_risk_pct']:.2%}")
+    for key in ("contracts", "notional", "multiplier", "rounding"):
+        if block.get(key) is not None:
+            bits.append(f"{key} {block[key]}")
+    return "slave default, " + ", ".join(bits) if bits else "slave default"
+
+
+def _route_rows(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Each route, flattened to what a reader needs to judge it.
+
+    The slave-level summary says "20 routes, all 1.00% of balance", which
+    answers how much and not what. On futures that is the half that
+    matters: which contract month, whether the broker holds the stop, and
+    whether the order may work outside regular hours are all per route,
+    and all of them decide what a copy actually becomes.
+    """
+    rows: List[Dict[str, Any]] = []
+    for route in config.get("routes") or []:
+        target = route.get("target")
+        rows.append({
+            "symbol": route.get("symbol"),
+            "magic": route.get("magic"),
+            # A route may name several targets and take the first that
+            # resolves, so this is a list as often as a string.
+            "target": target if isinstance(target, list) else [target],
+            "direction": route.get("direction"),
+            "target_direction": route.get("target_direction"),
+            "order_type": route.get("order_type") or "market",
+            "outside_rth": bool(route.get("outside_rth")),
+            # False means the copier holds the stop itself and the broker
+            # has no resting order -- worth seeing, because it decides
+            # whether the position is protected while the hub is down.
+            "broker_brackets": route.get("broker_brackets"),
+            "month_slot": route.get("month_slot"),
+            "sizing": _describe_route_sizing(route.get("sizing")),
+            "atr_period": route.get("atr_period"),
+            "risk_management": route.get("risk_management") or None,
+        })
+    return rows
+
+
+def _slave_summary_extras(slave) -> Dict[str, Any]:
+    """Settings that decide whether, and into what, a signal is copied."""
+    try:
+        selection = magic_filter.parse(slave.config)
+        magic_summary = selection.describe()
+        magic_dict = selection.as_dict()
+    except ValueError as exc:
+        # A filter that will not parse is refused at PATCH time, so this is
+        # a config written before that check or edited by hand. Saying so
+        # beats showing "every magic" over a selection that is not running.
+        magic_summary = f"unreadable: {exc}"
+        magic_dict = None
+
+    roll = slave.config.get("contract_roll") or None
+    return {
+        "magic_filter": magic_dict,
+        "magic_filter_summary": magic_summary,
+        "contract_roll": roll,
+        "routes": _route_rows(slave.config),
+    }
+
+
 async def _fetch_positions(engine, account_types) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for account_type in account_types:
@@ -161,6 +322,17 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         # refused, and margin.max_pct_of_free is why a size gets reduced.
         "netting": slave.config.get("netting") or None,
         "margin": slave.config.get("margin") or None,
+        # A line a reader can act on without opening the JSON, and the only
+        # place the per-route case is represented at all.
+        "sizing_summary": _sizing_summary(slave.config),
+        # Whether editing slave-level sizing would do anything. Routes carry
+        # their own and win over the shared block, so offering a slave-level
+        # control on a route-based slave is a setting that saves cleanly and
+        # changes nothing -- the worst kind.
+        "sizing_per_route": bool(
+            _per_target_sizing(slave.config)
+            or (not slave.config.get("sizing") and slave.config.get("routes"))),
+        **_slave_summary_extras(slave),
     }
 
     if engine is not None:
@@ -223,6 +395,29 @@ async def create_slave(payload: SlaveCreate, request: Request):
         request.app.state.engines.append(engine)
 
     return await _slave_summary(request, slave)
+
+
+@router.get("/slaves/{slave_id}")
+async def get_one_slave(slave_id: str):
+    """One slave's STORED CONFIG, whole.
+
+    PATCH replaces config_json rather than merging into it, so anything
+    editing a slave has to send the entire object back. Without a way to
+    read it first, an editor would have to reconstruct it from the
+    summary -- which omits routes, mirror_map, host and ports -- and
+    saving would quietly delete every one of them.
+    """
+    slave = get_slave(slave_id)
+    if slave is None:
+        raise HTTPException(404, f"no slave with id={slave_id!r}")
+    return {
+        "id": slave.id,
+        "name": slave.name,
+        "broker_type": slave.broker_type,
+        "enabled": slave.enabled,
+        "paused": slave.paused,
+        "config": slave.config,
+    }
 
 
 @router.patch("/slaves/{slave_id}")

@@ -155,3 +155,65 @@ def test_absent_blocks_report_as_null_rather_than_empty():
 
     assert summary["netting"] is None
     assert summary["margin"] is None
+
+
+# ---------------------------------------------------- the one-line summary
+#
+# A reader should not have to open JSON to learn what a slave stakes. The
+# summary has to handle all three shapes resolve_sizing_config accepts,
+# and the third one caught this out: read as a single block, per-target
+# sizing has no `mode`, so an autonomous Schwab slave described itself as
+# "mirrors the master's lots" -- wrong, and reassuring, which is worse.
+
+def test_a_slave_level_block_reads_as_a_percentage():
+    summary = api_routes._sizing_summary(
+        {"sizing": {"mode": "pct_risk", "risk_pct": 0.01,
+                    "capital_base": "balance", "max_risk_pct": 0.025}})
+    assert summary == "1.00% of balance, capped 2.50%"
+
+
+def test_no_sizing_says_what_actually_happens():
+    """Absent is not "none": the master's lots get converted instead."""
+    assert api_routes._sizing_summary({"mode": "mirror"}) == "mirrors the master's lots"
+
+
+def test_route_level_sizing_is_counted_not_hidden():
+    config = {"routes": [
+        {"sizing": {"mode": "pct_risk", "risk_pct": 0.01, "capital_base": "balance"}}
+    ] * 20}
+    assert api_routes._sizing_summary(config) == "20 routes, all 1.00% of balance"
+
+
+def test_per_target_sizing_is_not_mistaken_for_no_sizing():
+    config = {"sizing": {
+        "MGC": {"mode": "fixed_contracts", "contracts": 1},
+        "GLD": {"mode": "dollar_notional", "notional": 5000},
+    }}
+    summary = api_routes._sizing_summary(config)
+    assert "mirrors" not in summary, "an autonomous slave claimed to mirror lots"
+    assert summary.startswith("2 targets")
+
+
+def test_mixed_routes_are_spelled_out():
+    config = {"routes": [
+        {"sizing": {"mode": "pct_risk", "risk_pct": 0.01, "capital_base": "balance"}},
+        {"sizing": {"mode": "pct_risk", "risk_pct": 0.01, "capital_base": "balance"}},
+        {"sizing": {"mode": "dollar_notional", "notional": 5000}},
+    ]}
+    assert api_routes._sizing_summary(config) == (
+        "3 routes: 2x 1.00% of balance, 1x $5000 notional")
+
+
+def test_a_slave_whose_sizing_is_not_slave_level_says_so():
+    """The flag the UI uses to withhold an Edit button: a slave-level value
+    on these would save cleanly and never be read."""
+    routed = _slave("etf", {"mode": "autonomous", "routes": [
+        {"sizing": {"mode": "pct_risk", "risk_pct": 0.01}}]})
+    per_target = _slave("schwab", {"mode": "autonomous", "sizing": {
+        "MGC": {"mode": "fixed_contracts", "contracts": 1}}})
+    plain = _slave("icm", {"mode": "mirror", "sizing": {
+        "mode": "pct_risk", "risk_pct": 0.01}})
+
+    assert asyncio.run(api_routes._slave_summary(_request(), routed))["sizing_per_route"]
+    assert asyncio.run(api_routes._slave_summary(_request(), per_target))["sizing_per_route"]
+    assert not asyncio.run(api_routes._slave_summary(_request(), plain))["sizing_per_route"]
