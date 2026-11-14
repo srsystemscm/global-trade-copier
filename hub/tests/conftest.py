@@ -1,4 +1,7 @@
+import atexit
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -7,6 +10,21 @@ import pytest  # noqa: E402  (must follow the sys.path insert)
 
 from app import db  # noqa: E402
 from app.config import settings  # noqa: E402
+
+# ---------------------------------------------------------------- logging
+#
+# Point the log directory at a throwaway one BEFORE anything imports
+# app.main, which calls setup_logging() at module level. That happens
+# during collection, long before a fixture could run -- which is why the
+# database fixture below isolates correctly and logging did not.
+#
+# Without this the suite wrote into the live log. TC_LOG_DIR in .env made
+# that C:\GTC\logs\hub.log, so stub-hub runs appeared as copier_id=gtc-test
+# interleaved with the real copier's lines: a log that cannot be trusted
+# at the moment someone is reading it to diagnose something real.
+_TEST_LOG_DIR = Path(tempfile.mkdtemp(prefix="gtc-test-logs-"))
+settings.log_dir = _TEST_LOG_DIR
+atexit.register(lambda: shutil.rmtree(_TEST_LOG_DIR, ignore_errors=True))
 
 
 @pytest.fixture(autouse=True)
