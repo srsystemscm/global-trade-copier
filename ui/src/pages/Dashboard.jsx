@@ -4,12 +4,22 @@ import ActivityFeed from "../components/ActivityFeed.jsx";
 import ConnectionWizard from "../components/ConnectionWizard.jsx";
 import MasterPanel from "../components/MasterPanel.jsx";
 import SlaveCard from "../components/SlaveCard.jsx";
+import SlaveRow from "../components/SlaveRow.jsx";
 import { useEvents } from "../useEvents.js";
 
 export default function Dashboard() {
   const [status, setStatus] = useState(null);
   const [trades, setTrades] = useState([]);
   const [wizardOpen, setWizardOpen] = useState(false);
+  // Remembered per browser. Which view suits depends on how many slaves
+  // someone runs, which is a property of the person, not of the data.
+  const [view, setView] = useState(() => {
+    try {
+      return localStorage.getItem("gtc.slaveView") || "tiles";
+    } catch {
+      return "tiles";
+    }
+  });
   const [error, setError] = useState(null);
   const { events, connected } = useEvents();
 
@@ -37,6 +47,16 @@ export default function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [events.length]);
 
+  function chooseView(next) {
+    setView(next);
+    try {
+      localStorage.setItem("gtc.slaveView", next);
+    } catch {
+      // A browser that refuses storage still gets the toggle, it just
+      // forgets it on reload. Not a reason to fail.
+    }
+  }
+
   async function togglePause(slave) {
     await api.patchSlave(slave.id, { paused: !slave.paused });
     refresh();
@@ -59,21 +79,71 @@ export default function Dashboard() {
 
       {error && <div className="banner banner-error">{error}</div>}
 
-      <MasterPanel status={status} wsConnected={connected} />
+      <MasterPanel status={status} trades={trades} wsConnected={connected} />
 
       <section>
-        <h2>Slaves</h2>
-        <div className="slave-grid">
-          {status?.slaves.map((slave) => (
-            <SlaveCard
-              key={slave.id}
-              slave={slave}
-              onTogglePause={() => togglePause(slave)}
-              onRemove={() => removeSlave(slave)}
-            />
-          ))}
-          {status && status.slaves.length === 0 && <p className="muted">No slaves configured yet.</p>}
+        <div className="section-head">
+          <h2>Slaves</h2>
+          <div className="view-toggle">
+            <button
+              className={`btn btn-small ${view === "tiles" ? "active" : ""}`}
+              onClick={() => chooseView("tiles")}
+            >
+              Tiles
+            </button>
+            <button
+              className={`btn btn-small ${view === "list" ? "active" : ""}`}
+              onClick={() => chooseView("list")}
+            >
+              List
+            </button>
+          </div>
         </div>
+
+        {status && status.slaves.length === 0 && <p className="muted">No slaves configured yet.</p>}
+
+        {view === "tiles" ? (
+          <div className="slave-grid">
+            {status?.slaves.map((slave) => (
+              <SlaveCard
+                key={slave.id}
+                slave={slave}
+                onTogglePause={() => togglePause(slave)}
+                onRemove={() => removeSlave(slave)}
+              />
+            ))}
+          </div>
+        ) : (
+          status?.slaves.length > 0 && (
+            <div className="table-wrap">
+              <table className="positions-table slave-table">
+                <thead>
+                  <tr>
+                    <th>Slave</th>
+                    <th>State</th>
+                    <th>Link</th>
+                    <th>Masters</th>
+                    <th>Sizing</th>
+                    <th>Risk scale</th>
+                    <th>Signals</th>
+                    <th>Positions</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {status.slaves.map((slave) => (
+                    <SlaveRow
+                      key={slave.id}
+                      slave={slave}
+                      onTogglePause={() => togglePause(slave)}
+                      onRemove={() => removeSlave(slave)}
+                    />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        )}
       </section>
 
       <section>

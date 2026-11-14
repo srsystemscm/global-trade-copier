@@ -545,10 +545,12 @@ code {
 }
 
 .slave-risk {
-  border-top: 1px solid var(--border);
-  padding: 14px 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  background: var(--surface2, rgba(255, 255, 255, 0.02));
 }
-.slave-risk:first-of-type { border-top: 0; }
 
 .slave-risk-head {
   display: flex;
@@ -557,16 +559,13 @@ code {
   gap: 12px;
 }
 
-.slave-risk-sizing {
-  margin-top: 4px;
-  font-size: 13px;
-}
+.slave-risk-sizing { font-size: 13px; }
 
 .slave-risk-flags {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin-top: 8px;
+  margin-top: 6px;
 }
 
 .slave-risk-form {
@@ -599,11 +598,14 @@ code {
 
 .slave-risk-row {
   display: flex;
-  align-items: flex-start;
+  align-items: baseline;
   justify-content: space-between;
   gap: 12px;
-  margin-top: 10px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
 }
+.slave-risk-row > div { display: flex; align-items: baseline; gap: 8px; }
 
 .route-table th,
 .route-table td {
@@ -613,3 +615,100 @@ code {
 .route-table .badge {
   margin-left: 6px;
 }
+
+/* --- per-strategy risk scale ------------------------------------- */
+
+.scale-rows { display: flex; flex-direction: column; gap: 6px; }
+
+.scale-head,
+.scale-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.scale-head {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.magic-list { display: flex; flex-direction: column; gap: 6px; }
+.magic-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+/* --- masters first, then slaves ---------------------------------- */
+
+.hub-strip { margin-bottom: 14px; }
+
+.master-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.master-card { padding: 12px 14px; }
+
+.master-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.master-account {
+  font-weight: 600;
+  font-size: 15px;
+  letter-spacing: 0.02em;
+}
+
+.master-card-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+}
+.master-card-row .label { color: var(--muted); font-size: 12px; }
+
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.view-toggle { display: flex; gap: 4px; }
+.view-toggle .btn.active {
+  border-color: var(--accent, #8b9cff);
+  color: var(--accent, #8b9cff);
+}
+
+/* smaller tiles, now that masters sit above them */
+.slave-grid {
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)) !important;
+}
+
+.slave-table th,
+.slave-table td {
+  font-size: 12px;
+  vertical-align: top;
+}
+.slave-row-sizing { white-space: normal; max-width: 240px; }
+.slave-row-actions { white-space: nowrap; }
+.slave-row-detail > td { padding-left: 24px; background: rgba(255, 255, 255, 0.02); }
+
+.slave-masters {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.slave-row-masters { white-space: normal; max-width: 200px; }

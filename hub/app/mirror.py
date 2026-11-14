@@ -42,7 +42,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 from app.contract_specs import ContractSpec
-from app.sizing import capital_base_amount, compute_size, resolve_balance_adjustment
+from app.sizing import (capital_base_amount, compute_size,
+                        resolve_balance_adjustment, resolve_risk_scale)
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +153,8 @@ def resolve_symbol(
 
 
 def resolve_target(
-    slave_config: Dict[str, Any], master_symbol: str, master_lots: float
+    slave_config: Dict[str, Any], master_symbol: str, master_lots: float,
+    magic: Optional[int] = None,
 ) -> Tuple[Optional[MirrorTarget], Optional[str]]:
     """Which instrument this signal becomes, and how many lots of it.
 
@@ -163,7 +165,7 @@ def resolve_target(
     Returns (target, None) to proceed, or (None, reason) to refuse. The reason
     is written for whoever reads the log at the time, so it names the figures.
     """
-    scale = float(slave_config.get("risk_scale", 1.0) or 0.0)
+    scale = float(resolve_risk_scale(slave_config, None, magic) or 0.0)
     if scale <= 0:
         return None, (
             f"risk_scale is {scale}, which is not a tradeable fraction; refusing "
@@ -235,6 +237,7 @@ def plan_by_risk(
     spec: Any,
     balance: float,
     equity: float,
+    magic: Optional[int] = None,
 ) -> Tuple[Optional[MirrorPlan], Optional[str]]:
     """Size this signal as a percentage of the SLAVE's own capital.
 
@@ -325,7 +328,7 @@ def plan_by_risk(
         account_balance=balance + adjustment,
         account_equity=equity + adjustment,
         contract_spec=contract_spec,
-        risk_scale=float(slave_config.get("risk_scale", 1.0) or 0.0),
+        risk_scale=float(resolve_risk_scale(slave_config, None, magic) or 0.0),
     )
     if result.skipped or result.size <= 0:
         return None, (

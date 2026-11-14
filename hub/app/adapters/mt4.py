@@ -71,6 +71,9 @@ class MT4Adapter(BrokerAdapter):
         self.ctx = zmq.asyncio.Context.instance()
         self.sock: Optional[zmq.asyncio.Socket] = None
         self._lock = asyncio.Lock()
+        # Filled from the EA's ACCOUNT reply. None until it answers:
+        # the hub reads null as 'not known yet'.
+        self.account: Optional[str] = None
 
     def _open_socket(self) -> None:
         if self.sock is not None:
@@ -82,6 +85,28 @@ class MT4Adapter(BrokerAdapter):
     async def connect(self) -> None:
         self._open_socket()
         logger.info("MT4Adapter[%s] connected to tcp://%s:%s", self.slave_id, self.host, self.port)
+        await self._learn_account()
+
+    async def _learn_account(self) -> None:
+        """Ask the terminal which account it is logged into.
+
+        One round trip at connect, so the login is known before anything
+        else needs it. Without this it arrives only when a signal happens
+        to size by risk, which on a quiet weekend is never -- and a slave
+        that cannot name its account cannot be tied to its own ledger.
+
+        Failure here is not fatal: the account stays None, which reads as
+        "not known yet", and the next ACCOUNT reply fills it. An EA that
+        cannot answer must not stop the slave from starting.
+        """
+        try:
+            await self.get_account_summary("")
+        except Exception as exc:  # noqa: BLE001 -- any adapter or socket fault
+            logger.info(
+                "MT4Adapter[%s] could not read the account at connect (%s); "
+                "it will be filled on the first ACCOUNT reply",
+                self.slave_id, exc,
+            )
 
     async def disconnect(self) -> None:
         if self.sock is not None:
@@ -187,6 +212,17 @@ class MT4Adapter(BrokerAdapter):
         had risk_scale.
         """
         reply = await self._ask_tolerating_old_ea({"cmd": "ACCOUNT"}, "ACCOUNT")
+        # The terminal's login, kept because it is the number every other
+        # system identifies this account by -- the hub's ledger, the Desk
+        # Manager feed, the broker's own statements. The bridge has always
+        # sent it; nothing here kept it, so a mirror slave reported no
+        # account at all and could not be tied to its own records.
+        #
+        # Only set when the EA actually said: null means "not known yet",
+        # and "" or 0 would read as a real answer.
+        login = reply.get("login")
+        if login not in (None, "", 0):
+            self.account = str(login)
         return AccountSummary(
             balance=float(reply["balance"]), equity=float(reply["equity"])
         )

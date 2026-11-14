@@ -31,6 +31,14 @@ export default function SlaveCard({ slave, onTogglePause, onRemove }) {
           {slave.sizing_summary}
         </div>
       )}
+      {/* Which masters this slave follows. With one master it reads
+          "every master" and is noise; with four to eight it is the first
+          thing worth knowing about a slave. */}
+      {slave.master_filter_summary && (
+        <div className="slave-masters" title="Masters this slave follows">
+          {slave.master_filter_summary}
+        </div>
+      )}
       {slave.netting?.allow_opposing && (
         <div style={{ marginBottom: 6 }}>
           <span className="badge badge-warn" title="A signal opposing what this account holds is copied, not refused">

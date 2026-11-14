@@ -98,16 +98,42 @@ def resolve_balance_adjustment(slave_config: Dict[str, Any]) -> float:
     return float(slave_config.get("balance_adjustment", 0.0) or 0.0)
 
 
-def resolve_risk_scale(slave_config: Dict[str, Any], route_scale: Optional[float]) -> float:
+def resolve_risk_scale(
+    slave_config: Dict[str, Any],
+    route_scale: Optional[float] = None,
+    magic: Optional[int] = None,
+) -> float:
     """How much of the configured risk this leg carries.
 
-    The route (strategy) wins over the slave, so a slave can run at half
-    size overall while one strategy on it runs at a quarter. 1.0 means
-    unchanged, which is the default everywhere -- an absent setting must
-    never quietly resize anything.
+    Three places can say, most specific first:
+
+    1. the ROUTE, which already names a (symbol, magic) pair
+    2. `risk_scale_by_magic`, keyed by the EA's magic number
+    3. `risk_scale` on the slave
+
+    1.0 is the default everywhere -- an absent setting must never quietly
+    resize anything.
+
+    The per-magic table exists because leverage is not the same on every
+    venue. One EA sized for a CFD account is a different amount of risk
+    once its signal lands on a futures or ETF leg, and the knob that fixes
+    that belongs to the strategy rather than to the whole slave. Mirror
+    slaves have no routes at all, so without this they could only be
+    scaled wholesale.
+
+    JSON object keys are strings, so an integer magic is looked up both
+    ways rather than silently missing a table written by hand.
     """
     if route_scale is not None:
         return float(route_scale)
+
+    if magic is not None:
+        by_magic = slave_config.get("risk_scale_by_magic") or {}
+        if isinstance(by_magic, dict):
+            for key in (str(magic), magic):
+                if key in by_magic:
+                    return float(by_magic[key])
+
     return float(slave_config.get("risk_scale", 1.0))
 
 

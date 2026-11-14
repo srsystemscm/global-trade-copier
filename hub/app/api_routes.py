@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from app import magic_filter, trade_registry
+from app import magic_filter, master_filter, trade_registry
 from app.adapters.base import AdapterError
 from app.config import settings
 from app.db import db_cursor, get_config_value, list_logs, set_config_value
@@ -65,6 +65,21 @@ def _validated_magic_filter(config: Optional[Dict[str, Any]]):
         return None
     try:
         return magic_filter.parse(config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _validated_master_filter(config: Optional[Dict[str, Any]]):
+    """Parse a config's master selection, or answer 400 saying what is wrong.
+
+    Same reasoning as the magic selection: a list that cannot be read must
+    not reach the database, or the slave fails to start on some later
+    restart rather than on the request that broke it.
+    """
+    if config is None:
+        return None
+    try:
+        return master_filter.parse(config)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -236,12 +251,29 @@ def _slave_summary_extras(slave) -> Dict[str, Any]:
         magic_summary = f"unreadable: {exc}"
         magic_dict = None
 
+    try:
+        masters = master_filter.parse(slave.config)
+        master_summary = masters.describe()
+        master_dict = masters.as_dict()
+    except ValueError as exc:
+        master_summary = f"unreadable: {exc}"
+        master_dict = None
+
     roll = slave.config.get("contract_roll") or None
     return {
+        "master_filter": master_dict,
+        "master_filter_summary": master_summary,
         "magic_filter": magic_dict,
         "magic_filter_summary": magic_summary,
         "contract_roll": roll,
         "routes": _route_rows(slave.config),
+        # How much of the configured risk a leg carries. 1.0 everywhere by
+        # default, which means "the EA's own target risk, unchanged".
+        "risk_scale": slave.config.get("risk_scale"),
+        # Per EA. The futures and ETF legs have far less leverage than the
+        # CFD account the strategies were sized on, so this is set per
+        # magic rather than per slave.
+        "risk_scale_by_magic": slave.config.get("risk_scale_by_magic") or None,
     }
 
 
@@ -305,6 +337,10 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         "paused": engine.paused if engine is not None else slave.paused,
         "running": engine is not None,
         "connected": watchdog.connected if watchdog is not None else None,
+        # The account this slave actually trades, as the broker reports it.
+        # None until the terminal has said; the UI and the hub both read
+        # that as "not known yet" rather than as an answer.
+        "account": getattr(getattr(engine, "adapter", None), "account", None) or None,
         "positions": None,
         "positions_error": None,
         "atr_period": slave.config.get("atr_period") if mode == "autonomous" else None,
@@ -381,6 +417,7 @@ async def create_slave(payload: SlaveCreate, request: Request):
     if get_slave(payload.id) is not None:
         raise HTTPException(409, f"slave id {payload.id!r} already exists")
     _validated_magic_filter(payload.config)
+    _validated_master_filter(payload.config)
 
     slave = insert_slave(payload.id, payload.name, payload.broker_type, payload.config, payload.enabled)
 
@@ -427,6 +464,7 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
         raise HTTPException(404, f"no slave with id={slave_id!r}")
 
     takes = _validated_magic_filter(payload.config)
+    from_masters = _validated_master_filter(payload.config)
 
     if payload.name is not None or payload.config is not None:
         slave = update_slave(slave_id, name=payload.name, config=payload.config)
@@ -445,6 +483,7 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
             # reaches this slave's queue in the first place. Updated even
             # when no engine is running, which is a no-op the bus ignores.
             request.app.state.bus.set_magic_filter(slave_id, takes)
+            request.app.state.bus.set_master_filter(slave_id, from_masters)
 
     if payload.paused is not None:
         set_paused(slave_id, payload.paused)

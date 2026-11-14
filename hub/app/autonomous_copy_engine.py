@@ -708,7 +708,7 @@ class AutonomousCopyEngine(SessionGateMixin):
 
         sizing_config = merge_sizing(
             resolve_sizing_config(self.slave_config, target_symbol), route.sizing)
-        risk_scale = resolve_risk_scale(self.slave_config, route.risk_scale)
+        risk_scale = resolve_risk_scale(self.slave_config, route.risk_scale, signal.magic)
         sizing_result = compute_size(
             sizing_config=sizing_config,
             master_lots=signal.lots or 0.0,
