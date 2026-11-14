@@ -352,6 +352,7 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
   const [editingMagic, setEditingMagic] = useState(false);
   const [editingMasters, setEditingMasters] = useState(false);
   const [editingScale, setEditingScale] = useState(false);
+  const [editingBasis, setEditingBasis] = useState(false);
   const [editingRoll, setEditingRoll] = useState(false);
   const [showRoutes, setShowRoutes] = useState(false);
 
@@ -436,6 +437,25 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
         <MagicFilterForm
           slave={slave}
           onDone={() => { setEditingMagic(false); onSaved && onSaved(); }}
+        />
+      )}
+
+      {/* What that percentage is a percentage OF. Directly under the
+          sizing line because the two are read together: "1% of balance"
+          means nothing without knowing which balance. */}
+      <div className="slave-risk-row">
+        <div>
+          <span className="muted small">Risk measured against</span>
+          <div className="slave-risk-sizing">{describeBasis(slave)}</div>
+        </div>
+        <button className="btn btn-small" onClick={() => setEditingBasis((v) => !v)}>
+          {editingBasis ? "Cancel" : "Edit"}
+        </button>
+      </div>
+      {editingBasis && (
+        <RiskBasisForm
+          slave={slave}
+          onDone={() => { setEditingBasis(false); onSaved && onSaved(); }}
         />
       )}
 
@@ -557,6 +577,132 @@ function RouteTable({ routes }) {
         Read-only for now. These decide what a signal becomes -- which contract month, who holds
         the stop, whether it may work outside regular hours.
       </p>
+    </div>
+  );
+}
+
+function describeBasis(slave) {
+  const adj = slave.balance_adjustment;
+  const floor = slave.min_risk_capital;
+  if (!adj && !floor) return "the broker's own balance";
+  const parts = [];
+  if (adj) parts.push(`${adj > 0 ? "+" : ""}${money(adj)} adjustment`);
+  if (floor) parts.push(`never below ${money(floor)}`);
+  return parts.join(", ");
+}
+
+function money(n) {
+  const v = Number(n);
+  if (!isFinite(v)) return String(n);
+  return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+}
+
+function RiskBasisForm({ slave, onDone }) {
+  const [full, setFull] = useState(null);
+  const [adjustment, setAdjustment] = useState("");
+  const [floor, setFloor] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const got = await api.getSlave(slave.id);
+        setFull(got);
+        setAdjustment(got.config.balance_adjustment != null ? String(got.config.balance_adjustment) : "");
+        setFloor(got.config.min_risk_capital != null ? String(got.config.min_risk_capital) : "");
+      } catch (e) {
+        setErr(e.message);
+      }
+    })();
+  }, [slave.id]);
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const config = { ...full.config };
+
+      const adj = adjustment.trim();
+      if (adj === "" || Number(adj) === 0) delete config.balance_adjustment;
+      else {
+        if (Number.isNaN(Number(adj))) throw new Error("the adjustment must be a number");
+        config.balance_adjustment = Number(adj);
+      }
+
+      const flr = floor.trim();
+      if (flr === "" || Number(flr) === 0) delete config.min_risk_capital;
+      else {
+        const n = Number(flr);
+        if (Number.isNaN(n) || n < 0) throw new Error("the floor must be 0 or more");
+        config.min_risk_capital = n;
+      }
+
+      await api.patchSlave(slave.id, { config });
+      onDone();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (err && !full) return <div className="banner banner-error">{err}</div>;
+  if (!full) return <p className="muted small">Loading...</p>;
+
+  return (
+    <div className="slave-risk-form">
+      {err && <div className="banner banner-error">{err}</div>}
+
+      <label>
+        Balance adjustment <span className="muted small">account currency, + or -</span>
+        <input
+          type="number"
+          step="1000"
+          value={adjustment}
+          placeholder="0"
+          onChange={(e) => setAdjustment(e.target.value)}
+        />
+      </label>
+      <p className="muted small">
+        Corrects a figure that is wrong. A 250k account pays 50k in tax and the broker now
+        reports 200k; an adjustment of +50,000 keeps the strategies risking as if it were
+        still 250k, because a withdrawal is not a drawdown. Applied whichever capital base
+        is in force.
+      </p>
+
+      <label>
+        Never size below <span className="muted small">account currency, blank or 0 for no floor</span>
+        <input
+          type="number"
+          step="1000"
+          min="0"
+          value={floor}
+          placeholder="0"
+          onChange={(e) => setFloor(e.target.value)}
+        />
+      </label>
+      <p className="muted small">
+        Overrides a figure that is right. If that account then draws down to 175k, sizing
+        carries on at the floor instead.
+      </p>
+      <p className="muted small">
+        <strong>This is not free.</strong> Below the floor you are risking a percentage of
+        money that is not there: 1% of a 250,000 floor is 2,500, which on an account
+        actually holding 175,000 is 1.43% of it -- and the gap widens as the drawdown does.
+        That is the point of the setting, and it is also how a drawdown accelerates.
+      </p>
+      <p className="muted small">
+        Margin is never measured against either of these. The broker holds margin against
+        real equity, and a cap measured against an inflated figure would believe it had room
+        it does not have.
+      </p>
+
+      <div className="slave-actions">
+        <button className="btn btn-small" onClick={save} disabled={busy}>
+          {busy ? "Saving..." : "Save"}
+        </button>
+      </div>
     </div>
   );
 }

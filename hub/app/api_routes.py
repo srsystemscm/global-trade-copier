@@ -274,6 +274,12 @@ def _slave_summary_extras(slave) -> Dict[str, Any]:
         # CFD account the strategies were sized on, so this is set per
         # magic rather than per slave.
         "risk_scale_by_magic": slave.config.get("risk_scale_by_magic") or None,
+        # What risk is measured against when it is not the broker's own
+        # figure. Two settings, separate on purpose: the adjustment
+        # corrects a figure that is wrong, the floor overrides one that is
+        # right. Both are in account currency.
+        "balance_adjustment": slave.config.get("balance_adjustment") or None,
+        "min_risk_capital": slave.config.get("min_risk_capital") or None,
     }
 
 
