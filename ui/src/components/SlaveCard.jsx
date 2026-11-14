@@ -23,6 +23,22 @@ export default function SlaveCard({ slave, onTogglePause, onRemove }) {
         </div>
       )}
 
+      {/* What this slave stakes per signal. It decides every size on the
+          card below, and used to appear on no screen at all for a mirror
+          slave -- which is most of them. */}
+      {slave.sizing_summary && (
+        <div className="slave-sizing" title="Risk per signal">
+          {slave.sizing_summary}
+        </div>
+      )}
+      {slave.netting?.allow_opposing && (
+        <div style={{ marginBottom: 6 }}>
+          <span className="badge badge-warn" title="A signal opposing what this account holds is copied, not refused">
+            opposing legs allowed
+          </span>
+        </div>
+      )}
+
       <div className="slave-positions">
         {slave.positions_error && <div className="muted small">P&amp;L: {slave.positions_error}</div>}
         {slave.positions && slave.positions.length === 0 && (
