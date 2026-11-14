@@ -119,6 +119,13 @@ TYPES: Dict[str, Reported] = {
     }),
     "slave_open": Reported(None, INFO, COPIED, {
         "slave_symbol": "slave_symbol", "slave_ticket": "slave_ticket",
+        # slave_ticket is the CLIENT-side handle and is the wrong thing to
+        # join a broker's records on -- on IBKR it appears in no statement
+        # at all. These two are the broker's own, and a consumer that
+        # reconciles against a statement should use them and say "not
+        # linked" when they are null rather than report drift.
+        "broker_order_id": "broker_order_id",
+        "broker_order_ref": "broker_order_ref",
         "size": "size", "size_unit": _size_unit, "sizing": "sizing",
         "requested_price": "requested_price", "fill_price": "fill_price",
         "sl": "sl", "tp": "tp", "legs": "legs",

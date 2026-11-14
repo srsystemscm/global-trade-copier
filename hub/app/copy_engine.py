@@ -467,6 +467,11 @@ class CopyEngine(SessionGateMixin):
                 signal=signal,
                 slave_symbol=target.symbol,
                 slave_ticket=result.slave_ticket,
+                # The BROKER's own ids, not the client-side handle. See the
+                # note in the autonomous engine: joining a statement on the
+                # client-side number matched 0 of 109 rows.
+                broker_order_id=result.broker_order_id,
+                broker_order_ref=result.broker_order_ref,
                 # What actually went on, where the broker says so. The
                 # requested size is what was asked for, not what is held.
                 size=result.lots if result.lots is not None else lots,

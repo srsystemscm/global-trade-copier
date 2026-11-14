@@ -1115,6 +1115,13 @@ class AutonomousCopyEngine(SessionGateMixin):
             # One broker order per leg. A size that had to be split across
             # several would be reported as the number it became.
             legs=1,
+            # The BROKER's own ids, not the client-side handle. IBKR's
+            # slave_ticket is TWS's order number and appears in no
+            # statement: joining on it matched 0 of 109 rows on
+            # 2026-11-13. Anything downstream reconciling a leg against a
+            # broker's own records needs these two instead.
+            broker_order_id=result.broker_order_id,
+            broker_order_ref=result.broker_order_ref,
             latency_ms=round((filled_at - requested_at) * 1000),
             signal_to_fill_ms=self._elapsed_ms(signal, filled_at),
         )

@@ -1,9 +1,70 @@
-# Copier → Operations hub reporter, schema 1.0
+# Copier → Operations hub reporter, schema 1.1
 
 The contract between this copier and the Operations hub's Copier tab. The
 copier's side is built here; the hub's storage, ingest route, API and page are
 built in the hub thread against this document. Keep them in step: a field added
 on one side only is a field nobody can rely on.
+
+> **1.1 reconciles this document with the hub thread's proposal of
+> 2026-11-14.** Both sides had written a contract for the same endpoint and
+> they did not match. The transport agreed exactly -- route, bearer auth,
+> `schema_version`, append-only events acked by `event_id`, `null` is not
+> `0.0`, UTC ISO-8601. The payload did not. What changed, and why, is in
+> **Reconciliation** below. Read that first if you have the old version in
+> your head.
+
+## Reconciliation with the hub's proposal (2026-11-14)
+
+| point | was | now | why |
+|---|---|---|---|
+| envelope | `{schema_version, snapshot, events}` | `{schema_version, copier, sent_at, status, orders, legs, events}` | the hub's shape. `snapshot` split into `copier` + `status`; nothing is lost. |
+| order / leg rows | none; events only | `orders[]` and `legs[]`, upserted | the tab shows a row per master order with its legs. Folding an append-only event stream into that is possible and is the hub re-deriving state the copier already holds. |
+| tickets | JSON numbers | **strings** | MT5 tickets are `ulong`. `2081752763` survives a JSON number today; the rule should not depend on staying under 2^53. |
+| broker id | `slave_ticket` only | `broker_order_id` + `broker_order_ref` | see **The join key**. |
+| refusal codes | event `type` | unchanged | the catalogue already is the fixed list the hub asked for. |
+
+### The join key
+
+The hub proposed `ib_order_id` and `ib_perm_id`. This document names them
+`broker_order_id` and `broker_order_ref` instead, for two reasons.
+
+**One pair, not one pair per broker.** A leg is a leg; MT5 slaves have broker
+ids too. Broker-specific field names mean a consumer has to know which
+platform produced a row before it can read it, which is the kind of branch
+that goes wrong quietly.
+
+**`broker_order_ref` is the better key, and it is ours.** `broker_order_id`
+is the broker's own id -- on IBKR the permId -- and it is on the **entry
+order alone**. `broker_order_ref` is a reference the copier stamps on every
+order it places, in the form `gtc:<master_account>:<master_ticket>:<symbol>`,
+so it is also on the protective stop and target. A stop that fires months
+later carries it; nothing else ties that fill back to the copy it protected.
+
+Both may be `null`: on a slave that does not support a reference, and on
+anything opened before 2026-11-13. **A consumer that cannot join must say
+"not linked" rather than report drift.** The copier learned this the
+expensive way -- it first joined statements on `slave_ticket`, TWS's
+client-side order number, which appears in no statement at all: 0 of 109
+rows matched, and the unit tests passed throughout because they seeded the
+key the code looked for.
+
+### Answers to the hub thread's four questions
+
+1. **One `copier.id`.** `copier_id` is configured (default `"gtc"`), one per
+   copier process, with a `session_id` that changes on restart. Nothing stops
+   a second installation reporting under its own id; the hub grouping by
+   copier is right.
+2. **Master accounts.** The copier cannot answer this -- it knows only that
+   signals arrive from the account the master EA stamps on them. Chris's
+   call.
+3. **Refusal codes.** Already a fixed list: the event `type` column in the
+   catalogue below. `reason` is free text *within* a coded type, never
+   instead of one. Build the tab and the alerts on `type`.
+4. **Backfill.** None today. The first report carries current state and
+   events from the moment the reporter starts; the copier's own database is
+   not replayed. If the hub wants history from before that, say so -- it is
+   new work on this side, and cheaper to decide before the first run than to
+   reconcile afterwards.
 
 The closest existing model is `ops_hub/docs/payload-v1.md`, the Desk Manager
 wire format. The identity / ack / queue semantics here are deliberately the
@@ -50,15 +111,113 @@ logged.
 | `session_id` | new on every copier start. Lets the hub see a restart. |
 | `seq` | increments per report within a session. A gap means a report was lost. |
 
-## Snapshot vs events
+## The envelope
 
-**Snapshot** is what is true now. It is sent on every report, is never queued,
-and is never acked — a stale snapshot is worthless, so a lost one is simply
-replaced by the next.
+```jsonc
+{
+  "schema_version": "1.1",
+  "copier":  {"id": "gtc-vps2", "version": "5.1.0",
+              "session_id": "a1b2c3", "seq": 417,
+              "started_at": "2026-11-14T06:00:00Z"},
+  "sent_at": "2026-11-14T13:46:05Z",
+  "status":  { },      // what is true now -- never queued, never acked
+  "orders":  [ ],      // upserts, keyed (master_account, master_ticket)
+  "legs":    [ ],      // upserts, keyed (master_account, master_ticket, slave_id)
+  "events":  [ ]       // append-only, acked by event_id
+}
+```
 
-**Events** are what happened. They are queued to disk, sent until the hub acks
-them, and only then dropped. Nothing is lost across a copier restart or a hub
-outage, and nothing is double-counted.
+Three kinds of thing, with three different durability rules. Mixing them up
+is how a feed either loses what happened or double-counts it.
+
+**`status`** is what is true now. Sent on every report, never queued, never
+acked — a stale snapshot is worthless, so a lost one is simply replaced by
+the next.
+
+**`orders` and `legs`** are upserts. Sent when they change, and in full on
+start-up or after the hub was unreachable. Resending is harmless by
+construction: the hub writes them by key. They are state, not history, so
+they are not acked either — the next full send repairs any gap.
+
+**`events`** are what happened. Queued to disk, sent until the hub acks them
+by `event_id`, and only then dropped. Nothing is lost across a copier restart
+or a hub outage, and nothing is double-counted.
+
+Why both rows and events, when the rows could be folded out of the event
+stream: because the copier already holds that state in its registry, and
+re-deriving it in the hub means two implementations of one truth that drift
+the first time an event type is added. The events remain the record — see
+**Counters are a convenience, not the record** — and the rows are the copier
+saying what it currently believes.
+
+## Orders
+
+One row per master order, keyed `(master_account, master_ticket)`. Never
+`master_ticket` alone: ticket numbers are only unique within an account, and
+two masters will collide.
+
+```jsonc
+{
+  "master_account": "44964870",
+  "master_ticket": "382615392",        // STRING -- MT5 tickets are ulong
+  "magic": 1001,
+  "symbol": "USTEC",
+  "direction": "BUY",
+  "lots": 1.0,
+  "opened_at": "2026-11-13T21:53:02Z",
+  "open_price": 27852.3,
+  "sl": 26518.13,
+  "tp": 28742.75,                      // null where the EA sets none
+  "modifies": 1,                       // how many MODIFY signals have landed
+  "closed_at": "2026-11-13T21:53:09Z",
+  "close_price": 27851.0,
+  "updated_at": "2026-11-13T21:53:09Z"
+}
+```
+
+**Send the order's state, not each publish.** A master EA can publish the
+same CLOSE twice a second apart — observed on 2026-11-11, ticket 382156066 —
+and an upsert keyed as above absorbs that. If both are also worth reporting
+as events, they share one `event_id`.
+
+## Legs
+
+One row per slave leg, keyed `(master_account, master_ticket, slave_id)` —
+the same key the copier's own Trade Registry uses.
+
+```jsonc
+{
+  "master_account": "44964870",
+  "master_ticket": "382615392",
+  "slave_id": "ibkr-paper-1",
+  "slave_account": "DUR314653",
+  "slave_ticket": "697",               // STRING; the CLIENT-side handle
+  "broker_order_id": "999031902",      // the broker's own id, entry only
+  "broker_order_ref": "gtc:44964870:382615392:MNQ",   // on every leg
+  "autonomous": true,
+  "slave_symbol": "MNQ",
+  "slave_direction": "BUY",            // the TRADED side: an inverse ETF flips it
+  "size": 4.0,
+  "size_unit": "contracts",            // never converted; see Units and times
+  "master_price": 27852.3,
+  "requested_price": 27831.125,
+  "fill_price": 27831.125,
+  "master_close_price": 27851.0,
+  "slave_close_price": 27815.75,
+  "state": "closed",                   // requested | open | closed | cancelled | failed
+  "requested_at": "2026-11-13T21:53:02.810Z",
+  "filled_at": "2026-11-13T21:53:03.169Z",
+  "updated_at": "2026-11-13T21:53:09Z"
+}
+```
+
+`slave_account` is here as well as in `status.slaves[]` so a row can be
+joined to the hub's ledger without a second lookup.
+
+**Do not compute slippage for an autonomous leg.** `master_price` and
+`fill_price` are different instruments on different price scales — a gold CFD
+against a GC future — so their difference is a contract basis, not slippage.
+`autonomous` is on the row so a consumer cannot get this wrong by accident.
 
 ### event_id
 
@@ -612,6 +771,33 @@ Note also that the autonomous engine's own name for a netting refusal is
 `netting_refused`; the reporter maps it onto the spec's `netting_blocked`, so
 the hub sees one type for both engines.
 
+## What is agreed but NOT yet sent
+
+**Read this before building the hub side.** Schema 1.1 is the agreed
+contract; the copier does not implement all of it yet, and the gap is listed
+here rather than discovered against a live feed.
+
+| part | state |
+|---|---|
+| transport, auth, `schema_version`, ack semantics | **sent** |
+| `status` (as `snapshot` today) | **sent**, under the old key |
+| `events`, the whole catalogue | **sent** |
+| `broker_order_id`, `broker_order_ref` on `slave_open` | **sent** (added 2026-11-14) |
+| envelope split into `copier` + `status` | not yet |
+| `orders[]` | **not yet** |
+| `legs[]` | **not yet** |
+| tickets as strings | not yet -- numbers today |
+
+So a hub built strictly to this document would today receive an envelope
+with `snapshot` where it expects `copier` and `status`, and no `orders` or
+`legs` at all. The event stream is complete and carries enough to fold the
+rows out of, but that is the duplication this revision exists to avoid.
+
+**Neither side should build the rows twice.** Either the copier sends
+`orders`/`legs` first, or the hub folds the events and the arrays are
+dropped from the contract. The copier's view is that sending them is the
+smaller job, because the registry already holds exactly those rows.
+
 ## What is NOT deployed
 
 `enabled` is `false` in `hub/config/hub_reporter.json`, there is no key, and
@@ -623,3 +809,26 @@ Switching it on, once the hub has a route and has issued a key: put the key in
 `ODH_COPIER_KEY` or in `hub/config/hub_key.txt` (gitignored), set `enabled` to
 true, and restart the copier. With no key the reporter subscribes to nothing,
 starts no task and writes no row.
+
+## What changed underneath this document on 2026-11-13
+
+The contract was written before a day of live testing that changed what the
+feed will carry. None of it alters a field; all of it alters what the
+numbers mean.
+
+- **Every slave now sizes autonomously**, at 1% of its own balance. Master
+  lots no longer propagate anywhere, including to the two mirror slaves. A
+  leg's `size` bears no relation to the order's `lots`, which is why
+  slippage is meaningless on an autonomous leg and why `size_unit` is on
+  the row.
+- **`mt5-dwx-futures-1` is a LIVE-money account** (Darwinex-Live), enabled,
+  with `netting.allow_opposing` on so it trades alongside positions the
+  copier did not open. Legs from it are real.
+- **Untracked volume exists today.** Five positions on the IBKR paper
+  account are held at the broker against registry rows that say
+  `CANCELLED` or `CLOSED`. They will appear in `reconciliation` events as
+  `untracked[]` rows. They are real drift, they predate the fix, and the
+  tab should not present them as new.
+- **The cancel-is-not-an-outcome fix** stops new ones: an entry that fills
+  inside its cancel round trip is now kept as a position rather than
+  recorded as a cancel.
