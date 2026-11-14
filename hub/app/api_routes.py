@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -75,6 +76,61 @@ def _find_engine(request: Request, slave_id: str):
     return None
 
 
+# How long one slave's position fetch may hold up a page that lists all of
+# them. The adapters have their own timeouts -- the MT4 one is 45 seconds --
+# which are right for a copy that must not be abandoned halfway, and far too
+# long for a dashboard poll. This is the dashboard's own patience, not the
+# broker's.
+POSITIONS_TIMEOUT_S = 5.0
+
+
+async def _fetch_positions(engine, account_types) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for account_type in account_types:
+        for pos in await engine.adapter.get_open_positions(account_type):
+            out.append({
+                "symbol": pos.symbol,
+                "quantity": pos.quantity,
+                "average_price": pos.average_price,
+                "market_value": pos.market_value,
+                "unrealized_pnl": pos.unrealized_pnl,
+            })
+    return out
+
+
+async def _positions_within(engine, account_types):
+    """This slave's positions, or None if it did not answer in time.
+
+    NEVER CANCELS THE FETCH. A ZMQ REQ socket is strictly lock-step --
+    send, receive, send, receive -- and cancelling between the two leaves
+    it expecting a reply that nobody will read. Every later call on that
+    socket then dies with "Operation cannot be accomplished in current
+    state", so a page timeout would take the slave down rather than just
+    skip it. That was observed: wrapping the fetch in wait_for turned a
+    slow slave into a permanently broken one.
+
+    So the request runs to the adapter's own timeout, which is sized for a
+    copy that must not be abandoned halfway. This only bounds how long the
+    PAGE waits for it.
+
+    One fetch in flight per slave, shared by every caller. Without that, a
+    dashboard polling every few seconds queues request after request behind
+    the adapter's lock, and they arrive long after anyone wanted them.
+    """
+    task = getattr(engine, "_positions_task", None)
+    if task is None or task.done():
+        task = asyncio.ensure_future(_fetch_positions(engine, account_types))
+        # Someone must retrieve the exception even when no page is waiting
+        # by the time it fails, or asyncio logs it as never retrieved.
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        engine._positions_task = task
+
+    done, _ = await asyncio.wait({task}, timeout=POSITIONS_TIMEOUT_S)
+    if not done:
+        return None
+    return task.result()
+
+
 async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
     engine = _find_engine(request, slave.id)
     mode = slave.config.get("mode", "mirror")
@@ -91,26 +147,36 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         "positions": None,
         "positions_error": None,
         "atr_period": slave.config.get("atr_period") if mode == "autonomous" else None,
-        "sizing": slave.config.get("sizing") if mode == "autonomous" else None,
+        # Reported for BOTH modes. It used to be autonomous-only, from when a
+        # mirror slave had no sizing of its own and simply carried the
+        # master's lots across. A mirror slave with a `sizing` block now
+        # sizes from its own capital through the same compute_size the
+        # autonomous engines use -- so hiding it here meant a setting that
+        # decides what gets traded was live in the engine and absent from
+        # every screen that shows the slave.
+        "sizing": slave.config.get("sizing"),
         "risk_management": slave.config.get("risk_management") if mode == "autonomous" else None,
+        # Both decide whether a signal becomes a trade at all, and both were
+        # invisible: netting.allow_opposing is why a hedged leg copies or is
+        # refused, and margin.max_pct_of_free is why a size gets reduced.
+        "netting": slave.config.get("netting") or None,
+        "margin": slave.config.get("margin") or None,
     }
 
     if engine is not None:
         account_types = ["futures", "brokerage"] if slave.broker_type == "schwab" else [None]
-        positions: List[Dict[str, Any]] = []
         try:
-            for account_type in account_types:
-                for pos in await engine.adapter.get_open_positions(account_type):
-                    positions.append(
-                        {
-                            "symbol": pos.symbol,
-                            "quantity": pos.quantity,
-                            "average_price": pos.average_price,
-                            "market_value": pos.market_value,
-                            "unrealized_pnl": pos.unrealized_pnl,
-                        }
-                    )
-            summary["positions"] = positions
+            fetched = await _positions_within(engine, account_types)
+            if fetched is None:
+                # A terminal that is shut, or a bridge that stopped
+                # answering. Reported as this slave's problem rather than
+                # allowed to become the whole page's: a closed Darwinex
+                # terminal took /status past two minutes and the dashboard
+                # never rendered at all.
+                summary["positions_error"] = (
+                    f"no answer within {POSITIONS_TIMEOUT_S:g}s -- is the terminal open?")
+            else:
+                summary["positions"] = fetched
         except NotImplementedError:
             summary["positions_error"] = "not supported for this broker"
         except AdapterError as exc:
@@ -119,9 +185,21 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
     return summary
 
 
+async def _all_slave_summaries(request: Request) -> List[Dict[str, Any]]:
+    """Every slave's summary, gathered at once rather than one after another.
+
+    Sequentially, a page listing six slaves waited for six broker round
+    trips end to end, so the slowest one set the page's speed and several
+    slow ones added up. They have nothing to do with each other.
+    """
+    slaves = list_all_slaves()
+    return list(await asyncio.gather(
+        *(_slave_summary(request, slave) for slave in slaves)))
+
+
 @router.get("/slaves")
 async def get_slaves(request: Request):
-    return {"slaves": [await _slave_summary(request, slave) for slave in list_all_slaves()]}
+    return {"slaves": await _all_slave_summaries(request)}
 
 
 @router.post("/slaves")
@@ -258,7 +336,7 @@ async def patch_risk(payload: RiskUpdate):
 @router.get("/status")
 async def get_status(request: Request):
     receiver = request.app.state.receiver
-    slaves = [await _slave_summary(request, slave) for slave in list_all_slaves()]
+    slaves = await _all_slave_summaries(request)
     return {
         "uptime_seconds": round(time.time() - request.app.state.start_time, 1),
         "master": {
