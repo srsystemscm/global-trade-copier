@@ -28,6 +28,7 @@ from app.hub_reporter.config import SCHEMA_VERSION, HubReporterConfig
 from app.hub_reporter.config import load as load_config
 from app.hub_reporter.outbox import Outbox
 from app.hub_reporter.snapshot import Counters, SlaveFacts
+from app.hub_reporter import rows
 from app.hub_reporter.snapshot import build as build_snapshot
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,11 @@ class HubReporter:
         self.session_id = outbox_mod.new_session_id()
         self.outbox = Outbox(self.cfg.copier_id, self.session_id, self.cfg.queue_max)
         self.facts = SlaveFacts()
+        # How far the order/leg rows have been reported. Advanced only when
+        # a report is ACCEPTED: advancing on build would skip everything in
+        # a report the hub never received.
+        self._rows_watermark = None
+        self._pending_watermark = None
         self.counters = Counters()
         self.seq = 0
 
@@ -105,6 +111,11 @@ class HubReporter:
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=self.cfg.timeout_s)
         self._queue = self.events.subscribe()
+        # Python creates the default executor on first use, so the first
+        # to_thread of the row build would pay thread-pool startup -- and
+        # that first one can land while a signal is being copied. Paid here
+        # instead, at start, where nothing is waiting on it.
+        await asyncio.to_thread(lambda: None)
         self._tasks = [
             asyncio.create_task(self._ingest(), name="hub-reporter-ingest"),
             asyncio.create_task(self._send_loop(), name="hub-reporter-send"),
@@ -241,7 +252,7 @@ class HubReporter:
             await asyncio.sleep(self.cfg.debounce_s)
         self._nudge.clear()
 
-    def build_report(self) -> Dict[str, Any]:
+    def build_report(self, rows_data=None) -> Dict[str, Any]:
         """One report: identity, the snapshot, and the oldest events.
 
         `seq` increments per report within the session, so a gap tells the
@@ -250,15 +261,34 @@ class HubReporter:
         """
         self.seq += 1
         events = self.outbox.oldest(self.cfg.max_events_per_report)
+        # Built first: it refreshes what the facts know about each slave
+        # (mode, size unit, account), which the leg rows then read.
+        snapshot = build_snapshot(
+            self.state, self.facts, self.counters, self.outbox.stats()
+        )
+        if rows_data is None:
+            rows_data = rows.build(self._rows_watermark, self.facts)
+        orders, legs, watermark = rows_data
+        self._pending_watermark = watermark
+
         return {
             "schema_version": SCHEMA_VERSION,
-            "copier_id": self.cfg.copier_id,
-            "session_id": self.session_id,
-            "seq": self.seq,
+            # Identity, which 1.0 carried at the top level.
+            "copier": {
+                "id": self.cfg.copier_id,
+                "session_id": self.session_id,
+                "seq": self.seq,
+                **snapshot.pop("copier", {}),
+            },
             "sent_at": catalogue.iso(time.time()),
-            "snapshot": build_snapshot(
-                self.state, self.facts, self.counters, self.outbox.stats()
-            ),
+            # What is true now: never queued, never acked. A stale one is
+            # worthless, so a lost one is replaced by the next.
+            "status": snapshot,
+            # Upserts, keyed (master_account, master_ticket[, slave_id]).
+            # Resending is harmless; the hub writes them by key.
+            "orders": orders,
+            "legs": legs,
+            # Append-only, acked by event_id. These remain the record.
             "events": events,
         }
 
@@ -270,7 +300,19 @@ class HubReporter:
         queue keeps growing -- and the next cycle is a retry already, with
         the backlog and a fresh snapshot.
         """
-        report = self.build_report()
+        # Off the loop. Measured at 3ms when nothing changed and 29ms over
+        # a day's backlog, which is nothing -- but it scales with how much
+        # traded, and the cap allows 200 orders in one report. Blocking the
+        # loop for that long would cost a copy, and the one rule this
+        # reporter has is that it never does.
+        #
+        # Safe in a thread: db_cursor opens its own connection per call.
+        # `facts` is read here and written on the loop; the worst case is a
+        # leg row carrying a size unit one report out of date.
+        rows_data = await asyncio.to_thread(
+            rows.build, self._rows_watermark, self.facts)
+
+        report = self.build_report(rows_data)
         sent_ids = [e.get("event_id") for e in report["events"]]
         assert self._client is not None
 
@@ -311,6 +353,12 @@ class HubReporter:
         # Exactly the ids the hub returned. Not "everything we sent", which
         # would lose the events a partly-successful store did not keep.
         removed = self.outbox.ack(acked)
+        # The rows in this report reached the hub, so the next one starts
+        # after them. Only here: a report that failed, or one answered with
+        # an unreadable body, has to be sent again in full.
+        if self._pending_watermark is not None:
+            self._rows_watermark = self._pending_watermark
+            self._pending_watermark = None
         self.reports_sent += 1
         self.consecutive_failures = 0
         self.last_ok_at = time.time()
@@ -322,11 +370,11 @@ class HubReporter:
             logger.info(
                 "hub reporter: seq=%s sent %d event(s), the hub acked %d -- the "
                 "rest stay queued",
-                report["seq"], len(sent_ids), removed,
+                report["copier"]["seq"], len(sent_ids), removed,
             )
         else:
             logger.debug("hub reporter: seq=%s ok, %d event(s) acked",
-                         report["seq"], removed)
+                         report["copier"]["seq"], removed)
         # Still more behind this report than one carries: go again rather
         # than wait out the interval, or a backlog drains at 200 events per
         # 15 seconds.

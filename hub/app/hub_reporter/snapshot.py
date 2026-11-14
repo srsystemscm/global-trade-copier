@@ -79,6 +79,10 @@ class SlaveFacts:
         self._modes: Dict[str, str] = {}
         self._units: Dict[str, str] = {}
         self._last_error: Dict[str, Dict[str, Any]] = {}
+        # Learned from the live adapter each snapshot, because an IBKR
+        # login can hold several accounts and an MT terminal reports its
+        # own login -- both are resolved at connect, not configured.
+        self._accounts: Dict[str, Optional[str]] = {}
 
     def mode(self, slave_id: Optional[str]) -> str:
         """mirror or autonomous, reading the slaves table if need be.
@@ -101,6 +105,29 @@ class SlaveFacts:
             configured = slave.config.get("size_unit")
             if configured:
                 self._units[slave.id] = str(configured)
+
+    def note_account(self, slave_id: str, account: Optional[str]) -> None:
+        """Remember what the adapter resolved, so a leg row can carry it.
+
+        Only overwritten by a real answer: an adapter that has not yet
+        connected reports None, and forgetting a number already learned
+        would make a leg unjoinable for as long as the terminal is shut.
+        """
+        if account:
+            self._accounts[slave_id] = str(account)
+
+    def slave_account(self, slave_id: Optional[str]) -> Optional[str]:
+        """The account this slave trades, or None for "not known yet"."""
+        return self._accounts.get(slave_id or "")
+
+    def is_autonomous(self, slave_id: Optional[str]) -> bool:
+        """Whether a leg's fill is comparable to the master's price.
+
+        It is not, in autonomous mode: a gold CFD against a GC future is a
+        contract basis, not slippage. On the row so a consumer cannot get
+        that wrong by accident.
+        """
+        return self.mode(slave_id) == "autonomous"
 
     def record_error(self, slave_id: Optional[str], message: Optional[str], at: float) -> None:
         if not slave_id:
@@ -234,6 +261,11 @@ def _slaves(engines: List[Any], facts: SlaveFacts) -> List[Dict[str, Any]]:
         connected = getattr(watchdog, "connected", None) if watchdog is not None else None
         error = facts.last_error(slave.id)
         preflight = getattr(engine, "preflight", None) if engine is not None else None
+        # Resolved from the live adapter, and remembered: a leg row carries
+        # the same number, and the terminal may be shut by the time one is
+        # built.
+        account = _slave_account(slave, engine)
+        facts.note_account(slave.id, account)
         out.append({
             "id": slave.id,
             "name": slave.name,
@@ -246,7 +278,7 @@ def _slaves(engines: List[Any], facts: SlaveFacts) -> List[Dict[str, Any]]:
             "running": engine is not None,
             "connected": connected,
             "open_legs": legs.get(slave.id, 0),
-            "account": _slave_account(slave, engine),
+            "account": account,
             "session_state": _session_state(engine, connected),
             "blocked_targets": dict(getattr(engine, "blocked_targets", {}) or {}),
             # null means "every strategy", which is not the same as an

@@ -771,32 +771,63 @@ Note also that the autonomous engine's own name for a netting refusal is
 `netting_refused`; the reporter maps it onto the spec's `netting_blocked`, so
 the hub sees one type for both engines.
 
-## What is agreed but NOT yet sent
+## What is sent, as of 2026-11-14
 
-**Read this before building the hub side.** Schema 1.1 is the agreed
-contract; the copier does not implement all of it yet, and the gap is listed
-here rather than discovered against a live feed.
+All of schema 1.1. The copier sends the `copier` + `status` envelope,
+`orders[]`, `legs[]` and the event stream, with tickets and account numbers
+as strings.
 
 | part | state |
 |---|---|
-| transport, auth, `schema_version`, ack semantics | **sent** |
-| `status` (as `snapshot` today) | **sent**, under the old key |
-| `events`, the whole catalogue | **sent** |
-| `broker_order_id`, `broker_order_ref` on `slave_open` | **sent** (added 2026-11-14) |
-| envelope split into `copier` + `status` | not yet |
-| `orders[]` | **not yet** |
-| `legs[]` | **not yet** |
-| tickets as strings | not yet -- numbers today |
+| transport, auth, `schema_version`, ack semantics | sent |
+| envelope split into `copier` + `status` | **sent** |
+| `events`, the whole catalogue | sent |
+| `broker_order_id`, `broker_order_ref` on `slave_open` | sent |
+| `orders[]` | **sent** |
+| `legs[]` | **sent**, including `slave_account` |
+| tickets and accounts as strings | **sent** |
 
-So a hub built strictly to this document would today receive an envelope
-with `snapshot` where it expects `copier` and `status`, and no `orders` or
-`legs` at all. The event stream is complete and carries enough to fold the
-rows out of, but that is the duplication this revision exists to avoid.
+### Four fields are null on purpose
 
-**Neither side should build the rows twice.** Either the copier sends
-`orders`/`legs` first, or the hub folds the events and the arrays are
-dropped from the contract. The copier's view is that sending them is the
-smaller job, because the registry already holds exactly those rows.
+Null is not an oversight in any of these. Each is a value the copier does
+not hold, and sending a plausible one would be worse than sending none.
+
+**`legs[].slave_direction`** -- the TRADED side. It is the master's for most
+routes and the opposite for an inverse ETF, and which applies is a route
+property the registry does not record. The master's direction would be
+wrong exactly where this field earns its place. The `slave_open` event
+carries the traded side; use that until the registry keeps it.
+
+**`legs[].requested_price`** -- the level the order aimed at. Reported on
+the `slave_open` event, where the engines know it; the registry keeps the
+fill.
+
+**`legs[].broker_order_ref`** -- null on anything opened before
+2026-11-13, when the copier started stamping a reference.
+
+**`slaves[].account`** on an MT slave -- null until the terminal has
+answered. Never `""` and never `0`.
+
+### Upsert semantics the hub can rely on
+
+Rows are sent when they change, and the watermark **only advances on a
+report the hub accepted**. A failed POST, or a 200 whose body cannot be
+read, re-sends the same rows. Resending is harmless by construction: the
+hub writes by key.
+
+The watermark advances to *when the read began*, not to the newest row
+seen, so a row written during the read is sent again rather than skipped
+forever. Re-sending is free; missing is not.
+
+A cold start sends the last 24 hours, not the whole registry -- the resend
+exists to repair an outage, not to replay history. At most 200 orders per
+report, oldest first, so a backlog drains in order and the cap drops the
+newest, which the next report carries anyway.
+
+The rows are built in a worker thread. Measured at 2.8ms when nothing
+changed and 29ms over a day's backlog, which is nothing -- but the cap
+allows 200 orders, and blocking the event loop for the ~260ms that implies
+would cost a copy. The one rule this reporter has is that it never does.
 
 ## What is NOT deployed
 

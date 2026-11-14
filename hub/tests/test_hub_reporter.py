@@ -97,17 +97,22 @@ def test_a_report_carries_the_shape_the_hub_agreed_to():
 
     assert len(hub.reports) == 1
     report = hub.reports[0]
-    assert report["schema_version"] == "1.0"
-    assert report["copier_id"] == "gtc-test"
-    assert report["session_id"] == reporter.session_id
-    assert report["seq"] == 1
+    assert report["schema_version"] == "1.1"
+    # 1.1 moved identity into its own block. The hub reads both, but
+    # this is what the copier now sends.
+    assert report["copier"]["id"] == "gtc-test"
+    assert report["copier"]["session_id"] == reporter.session_id
+    assert report["copier"]["seq"] == 1
+    assert "orders" in report and "legs" in report
     assert report["sent_at"].endswith("Z")
     assert hub.auth[0] == "Bearer test-key"
 
-    snapshot = report["snapshot"]
-    assert set(snapshot) == {"copier", "masters", "slaves", "risk", "counters", "queue"}
-    assert snapshot["copier"]["http_port"]
-    assert snapshot["copier"]["started_at"].endswith("Z")
+    snapshot = report["status"]
+    # `copier` moved out of the snapshot and up to the envelope in 1.1:
+    # it is identity, not state, and the hub keys reports by it.
+    assert set(snapshot) == {"masters", "slaves", "risk", "counters", "queue"}
+    assert report["copier"]["http_port"]
+    assert report["copier"]["started_at"].endswith("Z")
     assert snapshot["counters"]["since_start"] == {
         "received": 1, "copied": 1, "refused": 0, "failed": 0
     }
@@ -136,7 +141,7 @@ def test_the_snapshot_is_never_queued():
         # Three cycles with nothing happening at all.
         assert _drive(reporter, cycles=3) == [True, True, True]
 
-    assert [r["seq"] for r in hub.reports] == [1, 2, 3]
+    assert [r["copier"]["seq"] for r in hub.reports] == [1, 2, 3]
     assert all(r["events"] == [] for r in hub.reports)
     assert pending_ids() == [], "a snapshot must never reach the outbox"
 
@@ -315,7 +320,7 @@ def test_the_snapshot_reports_slaves_masters_and_risk():
         )
         _drive(reporter)
 
-    snapshot = hub.reports[0]["snapshot"]
+    snapshot = hub.reports[0]["status"]
     assert snapshot["masters"] == [{
         "account": "11558127",
         "last_signal_at": "2025-11-13T20:05:02Z",
@@ -359,7 +364,7 @@ def test_a_slaves_last_error_comes_from_the_events_that_passed():
                              "emitted_at": 1763064305.0})
         _drive(reporter)
 
-    slave = hub.reports[0]["snapshot"]["slaves"][0]
+    slave = hub.reports[0]["status"]["slaves"][0]
     assert slave["last_error"] == "no money"
     assert slave["last_error_at"] == "2025-11-13T20:05:05Z"
 
@@ -372,9 +377,9 @@ def test_an_unacked_backlog_shows_as_a_growing_depth():
             reporter.ingest_one(signal_event(ticket=t))
             _drive(reporter)
 
-    depths = [r["snapshot"]["queue"]["depth"] for r in hub.reports]
+    depths = [r["status"]["queue"]["depth"] for r in hub.reports]
     assert depths == [1, 2, 3]
-    assert hub.reports[0]["snapshot"]["queue"]["oldest_event_at"].endswith("Z")
+    assert hub.reports[0]["status"]["queue"]["oldest_event_at"].endswith("Z")
 
 
 # ----------------------------------------------------------- size_unit
