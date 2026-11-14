@@ -58,7 +58,17 @@ if ($listening) {
         $existing = Get-Process -Id $procId -ErrorAction SilentlyContinue
         if ($existing) {
             Write-Host ("stopping pid {0} ({1}) on port {2}" -f $procId, $existing.ProcessName, $Port)
-            Stop-Process -Id $procId -Force
+            try {
+                Stop-Process -Id $procId -Force -ErrorAction Stop
+            } catch {
+                # Almost always because the copier was started from an
+                # ELEVATED prompt and this one is not. Said plainly: the
+                # alternative is a confusing failure three steps later,
+                # when the new process cannot bind the port.
+                Write-Warning ("cannot stop pid {0}: {1}" -f $procId, $_.Exception.Message)
+                Write-Warning  'If it was started from an elevated prompt, run this script elevated too.'
+                exit 1
+            }
         }
     }
     # Give the socket time to close, or the new process races the old one
@@ -113,6 +123,37 @@ while ((Get-Date) -lt $deadline) {
 }
 
 if ($ok) {
+    # /health answering is not proof that OUR process is the one answering.
+    # If the stop silently failed, the old copier is still on the port and
+    # would satisfy the check perfectly while the new one died unable to
+    # bind -- a green light for a restart that never happened.
+    $holder = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    $holderPid = $null
+    if ($holder) { $holderPid = ($holder.OwningProcess | Select-Object -First 1) }
+
+    # A CHILD counts. The venv's python.exe on Windows is a redirector:
+    # it re-executes the base interpreter, and that child is what binds
+    # the ports. Demanding the holder BE the started pid reported a
+    # perfectly good restart as a failure.
+    $ours = $false
+    if ($holderPid -eq $proc.Id) {
+        $ours = $true
+    } elseif ($holderPid) {
+        $walk = $holderPid
+        for ($i = 0; $i -lt 5 -and -not $ours; $i++) {
+            $info = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $walk) -ErrorAction SilentlyContinue
+            if (-not $info) { break }
+            if ($info.ParentProcessId -eq $proc.Id) { $ours = $true; break }
+            $walk = $info.ParentProcessId
+        }
+    }
+
+    if (-not $ours) {
+        Write-Warning ("port {0} is held by pid {1}, which is not the process just started (pid {2}) nor a child of it." -f $Port, $holderPid, $proc.Id)
+        Write-Warning 'Something else is answering. Nothing was restarted.'
+        exit 1
+    }
+
     Write-Host ("copier is up: pid {0}, {1}" -f $proc.Id, $health) -ForegroundColor Green
     exit 0
 }

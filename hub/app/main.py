@@ -2,11 +2,13 @@ import logging
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api_routes import router as api_router
-from app.config import settings
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from app.config import HUB_ROOT, settings
 from app.db import init_db
 from app.engine_manager import start_engines, stop_engine
 from app.events import EventBus
@@ -108,3 +110,56 @@ async def health():
         "status": "ok",
         "uptime_seconds": round(time.time() - START_TIME, 1),
     }
+
+
+# --------------------------------------------------------------- the UI
+#
+# Served by the hub itself, from the build in ui/dist. It used to exist
+# only behind Vite's dev server, which meant the dashboard was reachable
+# only on a machine where somebody had run `npm run dev` -- so there was
+# no interface at all on a VPS, and none here the moment that process
+# stopped.
+#
+# Mounted LAST, because the catch-all below matches everything: FastAPI
+# tries routes in the order they were added, so every API route above
+# still wins.
+
+UI_DIST = HUB_ROOT.parent / "ui" / "dist"
+
+# Paths that belong to the API. A typo'd API call should answer 404, not a
+# page: HTML arriving where JSON was expected is a confusing way to learn
+# you misspelled a route.
+_API_PREFIXES = (
+    "slaves", "trades", "status", "config", "risk", "logs", "health",
+    "schwab", "ws", "docs", "openapi.json", "redoc",
+)
+
+if (UI_DIST / "index.html").is_file():
+    assets = UI_DIST / "assets"
+    if assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_ui(full_path: str):
+        """The dashboard, and client-side routes within it.
+
+        React Router owns /dashboard, /copier and /settings, which exist
+        only in the browser -- the server has no file for them, so each
+        has to answer with index.html and let the app route it.
+        """
+        head = full_path.split("/", 1)[0]
+        if head in _API_PREFIXES:
+            raise HTTPException(status_code=404, detail=f"no such route: /{full_path}")
+
+        candidate = (UI_DIST / full_path).resolve()
+        # Stay inside the build directory: a path like ../../.env would
+        # otherwise read whatever the process can see.
+        if full_path and UI_DIST.resolve() in candidate.parents and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(UI_DIST / "index.html")
+
+else:
+    logger.warning(
+        "no UI build at %s -- the dashboard will not be served. Run "
+        "`npm run build` in ui/ to create it.", UI_DIST,
+    )
