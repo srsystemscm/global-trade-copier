@@ -28,7 +28,7 @@ KEY_ENV = "ODH_COPIER_KEY"
 
 INGEST_PATH = "/api/v1/ingest/copier"
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 
 @dataclass(frozen=True)

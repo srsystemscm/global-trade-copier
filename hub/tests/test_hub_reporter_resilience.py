@@ -299,9 +299,12 @@ def test_a_hub_coming_back_gets_the_whole_backlog_and_a_current_snapshot():
 
     assert pending_ids() == []
     # Four attempts while it was down or recovering, each carrying a
-    # snapshot: a hub that comes back is current immediately.
-    assert all("snapshot" in r for r in hub.reports)
-    assert [r["seq"] for r in hub.reports] == [1, 2, 3, 4]
+    # status: a hub that comes back is current immediately.
+    assert all("status" in r for r in hub.reports)
+    # And the rows that failed to land are sent again rather than skipped:
+    # the watermark only advances on a report the hub accepted.
+    assert all("orders" in r and "legs" in r for r in hub.reports)
+    assert [r["copier"]["seq"] for r in hub.reports] == [1, 2, 3, 4]
 
 
 # ================================================= the loop, end to end
@@ -354,7 +357,7 @@ def test_a_quiet_copier_still_sends_a_snapshot():
         assert asyncio.run(go())
 
     assert all(r["events"] == [] for r in hub.reports)
-    assert hub.reports[0]["snapshot"]["copier"]["uptime_s"] >= 0
+    assert hub.reports[0]["copier"]["uptime_s"] >= 0
 
 
 def test_a_backlog_deeper_than_one_report_drains_without_waiting():
