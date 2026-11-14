@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from app.contract_specs import ContractSpec
 
@@ -96,6 +96,69 @@ def resolve_balance_adjustment(slave_config: Dict[str, Any]) -> float:
     AutonomousCopyEngine._risk_account.
     """
     return float(slave_config.get("balance_adjustment", 0.0) or 0.0)
+
+
+def resolve_min_risk_capital(slave_config: Dict[str, Any]) -> float:
+    """A floor under the figure RISK is measured against.
+
+    The case it exists for, in the user's words: a 250k account pays 50k
+    in tax and then draws down 25k. The withdrawal is not a loss and the
+    drawdown is meant to be traded through at the size the account was
+    built for, so sizing keeps using 250k rather than the 175k the broker
+    reports.
+
+    SAY WHAT THIS DOES, because it is not free. Below the floor, risk is
+    a percentage of money that is not there -- 1% of a 250k floor on a
+    175k account is 1.43% of what the account actually holds, and it grows
+    as the drawdown does. That is the point of the setting, and it is also
+    how a drawdown accelerates. It is deliberately separate from
+    balance_adjustment: one corrects a figure that is wrong, the other
+    overrides a figure that is right.
+
+    Margin is untouched, exactly as with balance_adjustment: the broker
+    holds margin against real equity, and a cap measured against a floor
+    would believe it had room it does not have.
+
+    0 (the default) means no floor.
+    """
+    return float(slave_config.get("min_risk_capital", 0.0) or 0.0)
+
+
+def risk_figures(
+    slave_config: Dict[str, Any], balance: float, equity: float
+) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """The (balance, equity) RISK is measured against, or a refusal.
+
+    The standing adjustment first, then the floor. Shared by both engines
+    so mirror and autonomous cannot drift: they size through one
+    compute_size already, and the figures they hand it should come from
+    one place too.
+    """
+    adjustment = resolve_balance_adjustment(slave_config)
+    floor = resolve_min_risk_capital(slave_config)
+
+    adjusted_balance = (balance or 0.0) + adjustment
+    adjusted_equity = (equity or 0.0) + adjustment
+
+    if adjustment and (adjusted_balance <= 0 or adjusted_equity <= 0):
+        return None, None, (
+            f"balance_adjustment of {adjustment:+,.0f} would put the account "
+            f"at {adjusted_balance:,.0f} balance / {adjusted_equity:,.0f} "
+            f"equity, which is not something risk can be measured against"
+        )
+
+    if floor > 0:
+        adjusted_balance = max(adjusted_balance, floor)
+        adjusted_equity = max(adjusted_equity, floor)
+
+    if adjusted_balance <= 0 or adjusted_equity <= 0:
+        return None, None, (
+            f"the account reports {adjusted_balance:,.0f} balance / "
+            f"{adjusted_equity:,.0f} equity, which is not something risk "
+            f"can be measured against"
+        )
+
+    return adjusted_balance, adjusted_equity, None
 
 
 def resolve_risk_scale(

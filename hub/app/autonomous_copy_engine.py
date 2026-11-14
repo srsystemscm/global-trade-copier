@@ -21,6 +21,7 @@ from app.session_gate import SessionGateMixin
 from app.sizing import (
     resolve_balance_adjustment,
     capital_base_amount, compute_size, merge_sizing, resolve_risk_scale,
+    risk_figures,
     resolve_sizing_config,
 )
 from app.contract_roll import roll_sequence, volume_crossover
@@ -545,17 +546,15 @@ class AutonomousCopyEngine(SessionGateMixin):
         watchdog's drawdown alert stays on the real figure too: an alert
         about money that is not there is not an alert.
         """
-        adjustment = resolve_balance_adjustment(self.slave_config)
-        if not adjustment:
+        balance, equity, reason = risk_figures(
+            self.slave_config, account.balance or 0.0, account.equity or 0.0)
+        if reason is not None:
+            return None, reason
+        if balance == (account.balance or 0.0) and equity == (account.equity or 0.0):
+            # Nothing configured. Hand back the broker's own object rather
+            # than a copy of it, so an unconfigured slave is byte for byte
+            # what it was before any of this existed.
             return account, None
-        balance = (account.balance or 0.0) + adjustment
-        equity = (account.equity or 0.0) + adjustment
-        if balance <= 0 or equity <= 0:
-            return None, (
-                f"balance_adjustment of {adjustment:+,.0f} would put the "
-                f"account at {balance:,.0f} balance / {equity:,.0f} equity, "
-                f"which is not something risk can be measured against"
-            )
         return AccountSummary(balance=balance, equity=equity), None
 
     async def _preflight_routes(self) -> None:

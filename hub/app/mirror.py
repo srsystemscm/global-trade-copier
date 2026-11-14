@@ -43,7 +43,8 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 from app.contract_specs import ContractSpec
 from app.sizing import (capital_base_amount, compute_size,
-                        resolve_balance_adjustment, resolve_risk_scale)
+                        resolve_balance_adjustment, resolve_risk_scale,
+                        risk_figures)
 
 logger = logging.getLogger(__name__)
 
@@ -312,7 +313,14 @@ def plan_by_risk(
     # the autonomous engine applies it: it is a fact about the account, not
     # about one strategy's sizing mode. Added to both figures so it lands
     # whichever capital_base is in force.
-    adjustment = resolve_balance_adjustment(slave_config)
+    # The same helper the autonomous engine uses, so the two cannot drift:
+    # they already size through one compute_size, and the figures handed to
+    # it come from one place too. This is what carries min_risk_capital
+    # into mirror mode -- both MT5 slaves are mirror, so applying the
+    # adjustment here by hand would have left the floor reaching neither.
+    risk_balance, risk_equity, refusal = risk_figures(slave_config, balance, equity)
+    if refusal is not None:
+        return None, f"{target_symbol}: {refusal}"
 
     # compute_size, not arithmetic of our own. This is the same function
     # ibkr-paper-1 sizes through, so "port the risk the way it ports
@@ -325,8 +333,8 @@ def plan_by_risk(
         master_lots=0.0,
         entry_price=price,
         stop_price=sl,
-        account_balance=balance + adjustment,
-        account_equity=equity + adjustment,
+        account_balance=risk_balance,
+        account_equity=risk_equity,
         contract_spec=contract_spec,
         risk_scale=float(resolve_risk_scale(slave_config, None, magic) or 0.0),
     )
@@ -349,7 +357,7 @@ def plan_by_risk(
     # derives it, and it names which base it is.
     base = sizing.get("capital_base", "balance")
     capital = capital_base_amount(
-        base, balance + adjustment, equity + adjustment,
+        base, risk_balance, risk_equity,
         float(sizing.get("fixed_offset", 0.0) or 0.0),
         float(sizing.get("fixed_amount", 0.0) or 0.0),
     )
