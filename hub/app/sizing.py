@@ -234,6 +234,102 @@ def resolve_risk_scale(
     return float(slave_config.get("risk_scale", 1.0))
 
 
+# The leading digit of a magic names the timeframe the strategy runs on.
+# Chris's scheme; the shipped default, overridable per slave by
+# `bar_size_by_magic_prefix`, and switched off by setting that to {}.
+DEFAULT_BAR_SIZE_BY_MAGIC_PREFIX = {
+    "1": "1 day",
+    "2": "4 hours",
+    "3": "1 hour",
+    "4": "1 week",
+}
+
+
+def bar_size_for_magic_prefix(
+    magic: Optional[int], table: Optional[Dict[str, Any]] = None
+) -> Optional[str]:
+    """The timeframe a magic's FIRST digit names, or None.
+
+    None for anything the table does not name. Never a guess: the test
+    magics 5555, 7001 and 9999 all start outside 1-4, and inventing a
+    timeframe for them would be worse than the default they get now.
+    """
+    if magic is None:
+        return None
+    if table is None:
+        table = DEFAULT_BAR_SIZE_BY_MAGIC_PREFIX
+    if not table:
+        return None      # explicitly disabled
+    digits = str(abs(int(magic)))
+    if not digits:
+        return None
+    value = table.get(digits[0])
+    return (str(value) or None) if value is not None else None
+
+
+def resolve_bar_size(
+    slave_config: Dict[str, Any],
+    route_bar_size: Optional[str] = None,
+    magic: Optional[int] = None,
+) -> Optional[str]:
+    """Which bars this leg's ATR is measured on.
+
+    Four places can say, most specific first:
+
+    1. the ROUTE, which already names a (symbol, magic) pair
+    2. `bar_size_by_magic`, keyed by the EA's whole magic number -- the
+       exception, for one strategy that does not follow the scheme
+    3. the magic's LEADING DIGIT: 1 daily, 2 H4, 3 H1, 4 weekly. A rule
+       rather than a list, so a strategy deployed today measures
+       correctly today. Set `bar_size_by_magic_prefix` to change the map
+       or to {} to switch it off
+    4. `bar_size` on the slave
+
+    None means the adapter's own default, which is daily -- what every
+    route meant before any of this existed.
+
+    THE PER-MAGIC TABLE IS THE POINT. A timeframe is a property of the
+    strategy that set the stop, not of the instrument it lands on or of
+    the account. A weekly system signals off weekly data and executes on
+    the daily bar at Monday's open, because MT4 has no weekly execution
+    bar -- but its stop was measured in weekly ATRs, so translating that
+    multiple against a DAILY ATR makes the stop roughly a fifth of its
+    intended width. Risk sizing divides by stop distance, so the position
+    comes out several times too large, and nothing on any screen says so.
+
+    Putting it on the route instead would need a route per magic, and
+    could not serve a mirror slave at all -- those have no routes and
+    still take a selection of strategies.
+
+    JSON object keys are strings, so an integer magic is looked up both
+    ways rather than silently missing a table written by hand.
+    """
+    if route_bar_size:
+        return route_bar_size
+
+    if magic is not None:
+        by_magic = slave_config.get("bar_size_by_magic") or {}
+        if isinstance(by_magic, dict):
+            for key in (str(magic), magic):
+                if key in by_magic:
+                    value = by_magic[key]
+                    # An empty string is not a timeframe. Returned as None
+                    # so it means "the default" rather than reaching an
+                    # adapter as a bar size it has to reject.
+                    return str(value) or None
+
+    # The scheme. Below the explicit table so one odd strategy can opt
+    # out, above the slave default so a slave-wide bar_size does not
+    # flatten every timeframe back to one.
+    from_prefix = bar_size_for_magic_prefix(
+        magic, slave_config.get("bar_size_by_magic_prefix")
+    )
+    if from_prefix:
+        return from_prefix
+
+    return slave_config.get("bar_size") or None
+
+
 def compute_size(
     *,
     sizing_config: Dict[str, Any],

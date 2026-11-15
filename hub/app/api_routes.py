@@ -416,6 +416,13 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         # decides what gets traded was live in the engine and absent from
         # every screen that shows the slave.
         "sizing": slave.config.get("sizing"),
+        # Which bars each strategy's ATR is measured on. Surfaced because
+        # a stop translated against the wrong timeframe is wrong by a
+        # multiple and nothing else on screen would show it -- and because
+        # a mirror slave has no routes, so this table is the only place it
+        # can be said at all.
+        "bar_size_by_magic": slave.config.get("bar_size_by_magic") or None,
+        "bar_size": slave.config.get("bar_size") or None,
         "risk_management": slave.config.get("risk_management") if mode == "autonomous" else None,
         # Both decide whether a signal becomes a trade at all, and both were
         # invisible: netting.allow_opposing is why a hedged leg copies or is

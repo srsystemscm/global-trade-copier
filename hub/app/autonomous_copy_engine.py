@@ -24,6 +24,7 @@ from app.sizing import (
     resolve_risk_scale,
     risk_figures,
     resolve_sizing_config,
+    resolve_bar_size,
 )
 from app.contract_roll import roll_sequence, volume_crossover
 from app import deferred_store, position_store
@@ -685,7 +686,11 @@ class AutonomousCopyEngine(SessionGateMixin):
             return None, blocked
 
         atr_period = route.atr_period or self.atr_period
-        bar_size = route.bar_size
+        # Route first, then this slave's per-magic table, then its
+        # default. A weekly strategy's stop was measured in weekly ATRs;
+        # translating that against a daily ATR would make the stop a fifth
+        # of its width and the position several times too large.
+        bar_size = resolve_bar_size(self.slave_config, route.bar_size, signal.magic)
 
         try:
             bars = await self.adapter.get_price_history(
