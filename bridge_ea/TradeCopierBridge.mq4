@@ -25,7 +25,12 @@
 //+------------------------------------------------------------------+
 #property strict
 #property version   "1.04"
-#define   BRIDGE_VERSION "1.03"
+// MUST match #property version above. MQL has no way to read that from
+// code, so the two are kept in step by hand -- and they had already
+// drifted once: the property said 1.04 while this said 1.03, which would
+// have had every master reporting the wrong build through the very
+// handshake added to stop that happening.
+#define   BRIDGE_VERSION "1.04"
 
 #include <Zmq/Zmq.mqh>
 
@@ -308,7 +313,22 @@ string JsonEscape(string raw)
 //+------------------------------------------------------------------+
 void SendHeartbeat()
   {
-   string json = StringFormat("{\"account\":\"%d\",\"ts\":%.3f}", AccountNumber(), (double)TimeGMT());
+   // The build each master is running, said by the master itself.
+   //
+   // Without this, the only way to tell two builds apart is to hash the
+   // .ex4 files -- which is how an afternoon went: a bridge was deployed
+   // to the wrong terminal, a fix was believed to be live that was not,
+   // and three different binaries of one EA existed with nothing on any
+   // screen to say so. At four to eight masters that stops being an
+   // annoyance and becomes unanswerable.
+   //
+   // On the HEARTBEAT rather than the signal: it arrives every few
+   // seconds whether or not anything trades, so the hub knows the version
+   // of a master that has been quiet all session -- which is exactly the
+   // one somebody is asking about.
+   string json = StringFormat(
+      "{\"account\":\"%d\",\"bridge_version\":\"%s\",\"ts\":%.3f}",
+      AccountNumber(), BRIDGE_VERSION, (double)TimeGMT());
    ZmqMsg msg(json);
    pushSocket.send(msg);
   }

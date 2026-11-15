@@ -325,6 +325,10 @@ def test_the_snapshot_reports_slaves_masters_and_risk():
         "account": "11558127",
         "last_signal_at": "2025-11-13T20:05:02Z",
         "last_heartbeat_at": "2025-11-13T20:09:58Z",
+        # None because this fake receiver reports no version, which is
+        # what a master on a bridge older than 1.04 looks like. "Not
+        # known" is the honest answer and the tab can say so.
+        "bridge_version": None,
     }]
 
     by_id = {s["id"]: s for s in snapshot["slaves"]}

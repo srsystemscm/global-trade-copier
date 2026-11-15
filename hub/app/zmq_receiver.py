@@ -26,6 +26,11 @@ class ZmqReceiver:
         self.pull_sock: zmq.asyncio.Socket | None = None
         self._tasks: list[asyncio.Task] = []
         self.last_heartbeat: dict[str, float] = {}
+        # Which build each master is running, as the master itself reports
+        # it. Sent by TradeCopierBridge 1.04 and up; a master on anything
+        # older simply never appears here, and "unknown" is the honest
+        # answer for it rather than a guess.
+        self.bridge_version: dict[str, str] = {}
 
     def _bind(self) -> None:
         self.sub_sock = self.ctx.socket(zmq.SUB)
@@ -54,9 +59,22 @@ class ZmqReceiver:
             try:
                 data = json.loads(msg.decode("utf-8"))
                 account = str(data.get("account", "unknown"))
+                version = data.get("bridge_version")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 account = "unknown"
+                version = None
             self.last_heartbeat[account] = time.time()
+            if version:
+                previous = self.bridge_version.get(account)
+                self.bridge_version[account] = str(version)
+                if previous and previous != str(version):
+                    # Worth a line in the log: a master's build changing
+                    # under a running hub means somebody recompiled and
+                    # reattached, and that is the moment behaviour changes.
+                    logger.info(
+                        "master account=%s is now running bridge %s (was %s)",
+                        account, version, previous,
+                    )
             logger.debug("heartbeat from account=%s", account)
 
     async def start(self) -> None:

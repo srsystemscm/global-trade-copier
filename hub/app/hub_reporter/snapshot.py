@@ -194,6 +194,7 @@ def _masters(receiver: Any) -> List[Dict[str, Any]]:
     the threshold is the tab's to choose.
     """
     heartbeats: Dict[str, float] = dict(getattr(receiver, "last_heartbeat", {}) or {})
+    versions: Dict[str, str] = dict(getattr(receiver, "bridge_version", {}) or {})
     signals = _last_signal_by_account()
     accounts = sorted(set(heartbeats) | set(signals))
     return [
@@ -201,6 +202,11 @@ def _masters(receiver: Any) -> List[Dict[str, Any]]:
             "account": account,
             "last_signal_at": iso(signals.get(account)),
             "last_heartbeat_at": iso(heartbeats.get(account)),
+            # Which build this master is running, as the master says.
+            # None where its bridge predates 1.04: "not known" is the
+            # honest answer, and a tab can show it as such rather than
+            # implying everything is current.
+            "bridge_version": versions.get(account),
         }
         for account in accounts
     ]
