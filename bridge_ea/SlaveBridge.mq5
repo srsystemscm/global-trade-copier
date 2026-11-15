@@ -34,8 +34,8 @@
 //|   1.05 2026-11-12 MARGIN command, from OrderCalcMargin            |
 //|   1.06 2026-11-12 a named SYMBOLS read waits for a price          |
 //+------------------------------------------------------------------+
-#property version   "1.06"
-#define   BRIDGE_VERSION "1.06"
+#property version   "1.07"
+#define   BRIDGE_VERSION "1.07"
 
 #include <Zmq/Zmq.mqh>
 
@@ -46,6 +46,10 @@ input int  Slippage             = 5;     // deviation (points) allowed on market
 input long MagicNumber          = 0;     // stamped on every copier position
 input int  SymbolsReplyMax      = 200;   // most symbols one SYMBOLS reply may carry,
                                          // for the "match" and Market Watch forms
+input int  BarsReplyMax         = 400;   // most bars one BARS reply may carry. An ATR
+                                         // wants period+5, so 400 covers any period
+                                         // worth using while keeping the reply inside
+                                         // one socket message
 input bool AllowNettingAccount  = false; // see the OnInit guard -- read it before setting true
 input bool AllowVolumeSplit     = true;  // open a volume above the symbol's maximum as
                                          // several deals held together as one group
@@ -195,6 +199,8 @@ string HandleCommand(string json)
       return HandleAccount();
    if(cmd == "MARGIN")
       return HandleMargin(json);
+   if(cmd == "BARS")
+      return HandleBars(json);
 
    return JsonError("unknown cmd '" + cmd + "'");
   }
@@ -1048,6 +1054,113 @@ string HandleSymbols(string json)
    return "{\"status\":\"ok\",\"count\":" + IntegerToString(n)
         + ",\"truncated\":" + (truncated ? "true" : "false")
         + (namesOnly ? ",\"names\":[" : ",\"symbols\":[") + items + "]}";
+  }
+
+//| Completed bars, for the hub to compute this slave's own ATR.       |
+//|                                                                    |
+//| Autonomous mode sets its stop from the SLAVE's volatility, not the |
+//| master's: the master states how many ATRs away its stop was, and   |
+//| that multiple has to be measured against the instrument actually   |
+//| being traded. Nothing here answered bars, so MT4Adapter.           |
+//| get_price_history raised and an autonomous MT slave refused every  |
+//| signal -- running, configured, trading nothing.                     |
+//|                                                                    |
+//| {"cmd":"BARS","symbol":"ETHUSD","timeframe":"D1","count":20}        |
+//|   -> {"status":"ok","count":20,"bars":[{"h":..,"l":..,"c":..},..]}  |
+//|                                                                    |
+//| Oldest first, because the hub walks them forward using the previous|
+//| close as the gap reference.                                         |
+string HandleBars(string json)
+  {
+   string symbol = JsonGetString(json, "symbol");
+   string tfName = JsonGetString(json, "timeframe");
+   int    count  = (int)JsonGetDouble(json, "count");
+
+   if(count <= 0)
+      count = 20;
+   if(count > BarsReplyMax)
+      count = BarsReplyMax;   // a reply has to fit the socket
+
+   if(!SymbolKnownToServer(symbol))
+      return JsonError(symbol + " is not carried by this server");
+
+   ENUM_TIMEFRAMES tf = TimeframeFromName(tfName);
+   if(tf == (ENUM_TIMEFRAMES)-1)
+      return JsonError("unknown timeframe '" + tfName + "'");
+
+   // Same courtesy as SymbolSpecJson: an operator's Market Watch is
+   // theirs. CopyRates on an unselected symbol can come back empty, so it
+   // has to be selected -- and then put back as it was.
+   bool wasSelected = (bool)SymbolInfoInteger(symbol, SYMBOL_SELECT);
+   if(!wasSelected)
+      SymbolSelect(symbol, true);
+
+   MqlRates rates[];
+   // Oldest first. The hub needs chronological order and getting this
+   // backwards would invert every gap in the ATR without failing.
+   ArraySetAsSeries(rates, false);
+
+   // start_pos 1, NOT 0. Bar 0 is still forming, and a partial range
+   // reads as a quiet day -- which would size the next position too
+   // large, in the direction nobody notices.
+   int got = 0;
+   for(int attempt = 0; attempt < 20; attempt++)      // ~2s
+     {
+      got = CopyRates(symbol, tf, 1, count, rates);
+      if(got >= count)
+         break;
+      // A symbol just added, or a timeframe never opened on a chart, has
+      // no history until the terminal fetches it. The first call is what
+      // ASKS for it, so returning here would make every cold symbol a
+      // permanent failure.
+      Sleep(100);
+     }
+
+   if(!wasSelected)
+      SymbolSelect(symbol, false);
+
+   if(got <= 0)
+      return JsonError("no " + tfName + " history for " + symbol
+                       + " (CopyRates error " + IntegerToString(GetLastError()) + ")");
+
+   int    d     = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   string items = "";
+   for(int i = 0; i < got; i++)
+     {
+      if(i > 0)
+         items += ",";
+      items += "{\"h\":" + DoubleToString(rates[i].high,  d)
+             + ",\"l\":" + DoubleToString(rates[i].low,   d)
+             + ",\"c\":" + DoubleToString(rates[i].close, d) + "}";
+     }
+
+   // `count` is what was DELIVERED, not what was asked for. The hub
+   // decides whether that is enough for the period it wants, and a reply
+   // that overstated it would have it compute an ATR from thin air.
+   return "{\"status\":\"ok\",\"symbol\":" + JsonQuote(symbol)
+        + ",\"timeframe\":" + JsonQuote(tfName)
+        + ",\"count\":" + IntegerToString(got)
+        + ",\"bars\":[" + items + "]}";
+  }
+
+//| The hub names timeframes the way MQL does, so the mapping lives     |
+//| here rather than as an integer the caller has to know.              |
+//| -1 means unrecognised: refused, never quietly defaulted, because a  |
+//| stop measured on the wrong timeframe is wrong without looking it.   |
+ENUM_TIMEFRAMES TimeframeFromName(const string name)
+  {
+   string n = name;
+   StringToUpper(n);
+   if(n == "M1")  return PERIOD_M1;
+   if(n == "M5")  return PERIOD_M5;
+   if(n == "M15") return PERIOD_M15;
+   if(n == "M30") return PERIOD_M30;
+   if(n == "H1")  return PERIOD_H1;
+   if(n == "H4")  return PERIOD_H4;
+   if(n == "D1")  return PERIOD_D1;
+   if(n == "W1")  return PERIOD_W1;
+   if(n == "MN1") return PERIOD_MN1;
+   return (ENUM_TIMEFRAMES)-1;
   }
 
 //| True when the SERVER carries this symbol for this account, whether |

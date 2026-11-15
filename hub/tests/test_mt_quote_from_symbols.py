@@ -99,10 +99,21 @@ def test_an_old_ea_still_degrades_rather_than_erroring():
         asyncio.run(a.get_quote("ETHUSD"))
 
 
-def test_price_history_is_still_the_remaining_gap():
-    """Honest about what this does NOT finish. Autonomous mode also needs
-    the slave's own ATR, and no EA command answers bars yet -- so a
-    routed MT slave is still not a working autonomous slave."""
-    a = _adapter()
-    with pytest.raises(NotImplementedError):
-        asyncio.run(a.get_price_history("ETHUSD", 14))
+def test_the_other_half_of_autonomous_mode_is_now_wired_too():
+    """This test used to assert the opposite -- that price history was
+    still the remaining gap -- and it was right when written. BARS landed
+    in SlaveBridge 1.07 shortly after, so the gap closed.
+
+    Kept rather than deleted because the pairing is the point: autonomous
+    mode needs BOTH a price to measure from and the slave's own ATR to
+    measure, and neither alone makes a routed MT slave work. See
+    test_mt_autonomous.py for that half.
+    """
+    assert MT4Adapter.get_price_history is not None
+    import inspect
+    src = inspect.getsource(MT4Adapter.get_price_history)
+    assert "NotImplementedError" not in src, (
+        "price history raises again, so an autonomous MT slave is back to "
+        "refusing every signal"
+    )
+    assert '"cmd": "BARS"' in src

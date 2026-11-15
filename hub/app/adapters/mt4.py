@@ -40,6 +40,42 @@ def _level(value) -> Optional[float]:
     return level if level != 0.0 else None
 
 
+# The hub names bar sizes the IBKR way ("1 day", "4 hours"); MQL names
+# timeframes its own way. Translated here rather than in the EA so the
+# mapping is testable, and so a route reads the same whichever broker it
+# lands on.
+_MQL_TIMEFRAMES = {
+    "1 min": "M1", "5 mins": "M5", "15 mins": "M15", "30 mins": "M30",
+    "1 hour": "H1", "4 hours": "H4", "1 day": "D1", "1 week": "W1",
+    "1 month": "MN1",
+}
+
+
+def _mql_timeframe(bar_size: Optional[str]) -> str:
+    """An MQL timeframe name for one of the hub's bar sizes.
+
+    Daily by default, which is what every route omitting `bar_size` has
+    always meant. An unrecognised size is REFUSED rather than defaulted:
+    a stop measured on the wrong timeframe is wrong without looking it,
+    and silently substituting D1 for a route that asked for H4 would size
+    every position on that route against the wrong volatility.
+    """
+    if not bar_size:
+        return "D1"
+    key = bar_size.strip().lower()
+    if key in _MQL_TIMEFRAMES:
+        return _MQL_TIMEFRAMES[key]
+    # Tolerate the singular/plural the other way round, since config is
+    # typed by a person: "15 min" and "4 hour" mean the obvious thing.
+    for known, mql in _MQL_TIMEFRAMES.items():
+        if known.rstrip("s") == key.rstrip("s"):
+            return mql
+    raise AdapterRejectedError(
+        f"unrecognised bar size {bar_size!r} for an MT slave -- expected one of "
+        f"{', '.join(sorted(_MQL_TIMEFRAMES))}"
+    )
+
+
 class MT4Adapter(BrokerAdapter):
     """Talks to a slave MT4 bridge EA over a ZMQ REQ/REP pair, speaking
     OPEN / MODIFY / CLOSE / PING / POSITIONS.
@@ -300,11 +336,19 @@ class MT4Adapter(BrokerAdapter):
             return await self._request(command, retries=0)
         except AdapterRejectedError as exc:
             if "unknown cmd" in str(exc).lower():
+                # The version named is the one that introduced the
+                # command being asked for, not the newest: telling an
+                # operator to recompile for 1.07 when their 1.03 EA only
+                # lacks BARS sends them to the wrong conclusion about what
+                # is broken.
+                needs = {"SYMBOLS": "1.03", "ACCOUNT": "1.03",
+                         "MARGIN": "1.05", "BARS": "1.07"}.get(name, "1.07")
                 logger.warning(
                     "slave=%s EA predates the %s command -- recompile "
-                    "bridge_ea/SlaveBridge.mq5 (1.03 or later) in this terminal "
-                    "to enable account-based sizing for this slave",
-                    self.slave_id, name,
+                    "bridge_ea/SlaveBridge.mq5 (%s or later) in this terminal. "
+                    "SYMBOLS and ACCOUNT enable risk-based sizing; BARS enables "
+                    "autonomous mode, which needs this slave's own ATR",
+                    self.slave_id, name, needs,
                 )
                 raise NotImplementedError(
                     f"slave EA predates the {name} command"
@@ -315,7 +359,50 @@ class MT4Adapter(BrokerAdapter):
         self, symbol: str, period: int, month_slot: int = 0,
         contract_id: Optional[int] = None, bar_size: Optional[str] = None
     ) -> List[Bar]:
-        raise NotImplementedError("MT4Adapter (mirror mode) does not support price history / ATR")
+        """Completed bars from the terminal, via BARS (SlaveBridge 1.07+).
+
+        The last thing standing between an MT slave and autonomous mode.
+        Autonomous sets its stop from the SLAVE's own volatility -- the
+        master says how many ATRs away its stop was, and that multiple has
+        to be measured against the instrument actually being traded.
+
+        `period + 5`, matching the IBKR adapter: compute_atr needs
+        period + 1 and refuses fewer, so asking for exactly the minimum
+        makes one missing bar the difference between a position and a
+        refusal.
+
+        month_slot and contract_id are accepted and ignored. An MT server
+        quotes one series per symbol name; a futures CFD's roll is the
+        broker's business, not ours.
+        """
+        want = period + 5
+        reply = await self._ask_tolerating_old_ea(
+            {
+                "cmd": "BARS",
+                "symbol": symbol,
+                "timeframe": _mql_timeframe(bar_size),
+                "count": want,
+            },
+            "BARS",
+        )
+
+        rows = reply.get("bars") or []
+        bars = [
+            Bar(high=float(r["h"]), low=float(r["l"]), close=float(r["c"]))
+            for r in rows
+        ]
+        # Judged here, not in the EA: the EA reports what it DELIVERED and
+        # the hub decides whether that is enough for the period it wants.
+        # A cold symbol, or a timeframe never opened on a chart, comes back
+        # short while the terminal is still fetching.
+        if len(bars) < period + 1:
+            raise AdapterError(
+                f"{symbol} returned {len(bars)} {_mql_timeframe(bar_size)} bar(s) "
+                f"and a {period}-period ATR needs {period + 1} -- the terminal may "
+                f"not have downloaded this history yet; open the symbol on a chart "
+                f"at that timeframe once"
+            )
+        return bars
 
     async def get_quote(
         self, symbol: str, month_slot: int = 0, contract_id: Optional[int] = None
