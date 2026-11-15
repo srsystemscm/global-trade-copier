@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 from app.contract_specs import ContractSpec
-from app.sizing import (capital_base_amount, compute_size,
+from app.sizing import (apply_master_risk, capital_base_amount, compute_size,
                         resolve_balance_adjustment, resolve_risk_scale,
                         risk_figures)
 
@@ -239,6 +239,9 @@ def plan_by_risk(
     balance: float,
     equity: float,
     magic: Optional[int] = None,
+    # What the master staked, as a fraction of its own account. Replaces
+    # this slave's configured percentage when the bridge reports it.
+    master_risk_fraction: Optional[float] = None,
 ) -> Tuple[Optional[MirrorPlan], Optional[str]]:
     """Size this signal as a percentage of the SLAVE's own capital.
 
@@ -329,7 +332,7 @@ def plan_by_risk(
     # instead of refusing it) and the max_risk_pct ceiling that stops that
     # minimum contract carrying more than the account agreed to.
     result = compute_size(
-        sizing_config=sizing,
+        sizing_config=apply_master_risk(sizing, master_risk_fraction),
         master_lots=0.0,
         entry_price=price,
         stop_price=sl,

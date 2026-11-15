@@ -171,6 +171,11 @@ TYPES: Dict[str, Reported] = {
         # kept: a refused CLOSE leaves the slave holding a position the
         # master has exited, which is nothing like a refused OPEN.
         "reason": _reason, "action": "action",
+        # Which target it would have become. A refusal naming no
+        # instrument cannot be told apart from a refusal of the whole
+        # signal, and on a slave routing one master symbol to several
+        # instruments that is most of the question.
+        "slave_symbol": "slave_symbol",
     }),
     "open_deferred": Reported(None, NOTICE, None, {
         "slave_symbol": "slave_symbol", "reason": _reason,

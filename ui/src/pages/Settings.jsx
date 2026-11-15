@@ -274,55 +274,55 @@ function RiskTab({ status, onChanged }) {
 
   return (
     <>
-      <div className="panel" style={{ marginBottom: 16 }}>
-        <h2 style={{ marginTop: 0 }}>Kill switch</h2>
-        <p className="muted small">
-          Stops every slave from copying immediately. Master signals are still logged for audit, just never fanned
-          out. Existing open positions are untouched -- this blocks new activity, it doesn't close anything.
-        </p>
+      {/* Two hub-wide switches on one row. Both are "stop trading"
+          controls and both are read at a glance rather than configured
+          often, so a panel each was mostly whitespace. The explanations
+          move to title text -- they matter when you reach for the
+          control, not every time you pass it. */}
+      <div className="panel hub-risk-row">
         {error && <div className="banner banner-error">{error}</div>}
-        <button
-          className={`btn ${risk.kill_switch_enabled ? "btn-danger" : "btn-primary"}`}
-          disabled={saving}
-          onClick={() => save({ kill_switch_enabled: !risk.kill_switch_enabled })}
-        >
-          {risk.kill_switch_enabled ? "Kill switch ON -- click to disable" : "Kill switch off -- click to enable"}
-        </button>
-      </div>
+        <div className="hub-risk-cell">
+          <span className="muted small">Kill switch</span>
+          <button
+            className={`btn btn-small ${risk.kill_switch_enabled ? "btn-danger" : ""}`}
+            disabled={saving}
+            title="Stops every slave copying immediately. Signals are still logged. Open positions are untouched -- this blocks new activity, it does not close anything."
+            onClick={() => save({ kill_switch_enabled: !risk.kill_switch_enabled })}
+          >
+            {risk.kill_switch_enabled ? "ON -- click to disable" : "off -- click to enable"}
+          </button>
+        </div>
 
-      <div className="panel" style={{ marginBottom: 16 }}>
-        <h2 style={{ marginTop: 0 }}>Trading hours</h2>
-        <p className="muted small">
-          UTC window during which new positions may be opened. Existing positions can always be modified/closed
-          regardless of this window.
-        </p>
-        <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
-          <input
-            type="checkbox"
-            checked={risk.trading_hours_enabled}
-            onChange={(e) => save({ trading_hours_enabled: e.target.checked })}
-          />
-          Enabled
-        </label>
-        <div className="form-grid" style={{ maxWidth: 300 }}>
-          <label>
-            Start (UTC)
+        <div className="hub-risk-cell">
+          <span
+            className="muted small"
+            title="UTC window in which new positions may be opened. Existing positions can always be modified or closed regardless."
+          >
+            Trading hours (UTC)
+          </span>
+          <div className="hub-hours">
+            <input
+              type="checkbox"
+              checked={risk.trading_hours_enabled}
+              onChange={(e) => save({ trading_hours_enabled: e.target.checked })}
+              title="Enable the window"
+            />
             <input
               type="time"
               value={risk.trading_hours_start}
+              disabled={!risk.trading_hours_enabled}
               onChange={(e) => setRisk({ ...risk, trading_hours_start: e.target.value })}
               onBlur={(e) => save({ trading_hours_start: e.target.value })}
             />
-          </label>
-          <label>
-            End (UTC)
+            <span className="muted">to</span>
             <input
               type="time"
               value={risk.trading_hours_end}
+              disabled={!risk.trading_hours_enabled}
               onChange={(e) => setRisk({ ...risk, trading_hours_end: e.target.value })}
               onBlur={(e) => save({ trading_hours_end: e.target.value })}
             />
-          </label>
+          </div>
         </div>
       </div>
 
@@ -348,30 +348,65 @@ function RiskTab({ status, onChanged }) {
 }
 
 function SlaveRisk({ slave, knownAccounts, onSaved }) {
+  // Folded by default. Six slaves of open detail is a page nobody reads;
+  // the summary line is what answers "is this one set up as I think".
+  // Remembered per slave so a card someone is working in stays open
+  // across the refresh that follows every save.
+  const [open, setOpen] = useState(() => {
+    try {
+      return localStorage.getItem(`gtc.riskCard.${slave.id}`) === "open";
+    } catch {
+      return false;
+    }
+  });
   const [editing, setEditing] = useState(false);
   const [editingMagic, setEditingMagic] = useState(false);
   const [editingMasters, setEditingMasters] = useState(false);
   const [editingScale, setEditingScale] = useState(false);
-  const [editingBasis, setEditingBasis] = useState(false);
   const [editingRoll, setEditingRoll] = useState(false);
   const [showRoutes, setShowRoutes] = useState(false);
 
+  function toggle() {
+    const next = !open;
+    setOpen(next);
+    try {
+      localStorage.setItem(`gtc.riskCard.${slave.id}`, next ? "open" : "shut");
+    } catch {
+      // A browser refusing storage still folds, it just forgets.
+    }
+  }
+
   return (
-    <div className="slave-risk">
-      <div className="slave-risk-head">
+    <div className={`slave-risk ${open ? "is-open" : ""}`}>
+      <div className="slave-risk-head" onClick={toggle} role="button" tabIndex={0}
+           onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") toggle(); }}>
         <div>
+          <span className="fold-caret">{open ? "\u25be" : "\u25b8"}</span>{" "}
           <strong>{slave.name}</strong>{" "}
           <span className="muted small">
             {slave.broker_type} &middot; {slave.mode}
           </span>
-          <div className="slave-risk-sizing">{slave.sizing_summary}</div>
+          {/* The one line worth seeing folded: what it stakes and what
+              it stakes it against. */}
+          <div className="slave-risk-sizing">
+            {slave.sizing_summary}
+            {describeBasis(slave) !== "the broker's own balance" && (
+              <span className="muted"> &middot; {describeBasis(slave)}</span>
+            )}
+          </div>
         </div>
-        {!slave.sizing_per_route && (
-          <button className="btn btn-small" onClick={() => setEditing((v) => !v)}>
+        {!slave.sizing_per_route && open && (
+          <button
+            className="btn btn-small"
+            onClick={(e) => { e.stopPropagation(); setEditing((v) => !v); }}
+          >
             {editing ? "Cancel" : "Edit"}
           </button>
         )}
       </div>
+
+      {!open ? null : (
+      <>
 
       <div className="slave-risk-flags">
         {slave.netting?.allow_opposing && (
@@ -440,25 +475,6 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
         />
       )}
 
-      {/* What that percentage is a percentage OF. Directly under the
-          sizing line because the two are read together: "1% of balance"
-          means nothing without knowing which balance. */}
-      <div className="slave-risk-row">
-        <div>
-          <span className="muted small">Risk measured against</span>
-          <div className="slave-risk-sizing">{describeBasis(slave)}</div>
-        </div>
-        <button className="btn btn-small" onClick={() => setEditingBasis((v) => !v)}>
-          {editingBasis ? "Cancel" : "Edit"}
-        </button>
-      </div>
-      {editingBasis && (
-        <RiskBasisForm
-          slave={slave}
-          onDone={() => { setEditingBasis(false); onSaved && onSaved(); }}
-        />
-      )}
-
       {/* Per-EA risk. The strategies are sized for a CFD account; the
           futures and ETF legs have far less leverage, so the same signal
           is a different amount of risk once it lands there. */}
@@ -517,6 +533,8 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
         </div>
       )}
       {showRoutes && <RouteTable routes={slave.routes} />}
+      </>
+      )}
     </div>
   );
 }
@@ -788,7 +806,7 @@ function RiskScaleForm({ slave, onDone }) {
   if (!full) return <p className="muted small">Loading...</p>;
 
   return (
-    <div className="slave-risk-form">
+    <div className="slave-risk-form with-notes">
       {err && <div className="banner banner-error">{err}</div>}
 
       <label>
@@ -802,10 +820,13 @@ function RiskScaleForm({ slave, onDone }) {
         />
       </label>
 
+      {/* Magic and its scale on ONE row, which is the whole point: the
+          question is always "what is strategy 1001 set to", and a value
+          a column away from its label is read wrong. */}
       <div className="scale-rows">
         <div className="scale-head">
-          <span>Magic</span>
-          <span>Scale</span>
+          <span>Strategy (magic)</span>
+          <span>Risk scale</span>
           <span />
         </div>
         {rows.map((r, i) => (
@@ -839,17 +860,15 @@ function RiskScaleForm({ slave, onDone }) {
         </button>
       </div>
 
-      <p className="muted small">
-        1.0 is the strategy&apos;s own target risk, unchanged. The origin EAs each risk a
-        fixed share of the account they run on, so 1.0 on a futures or ETF slave means the
-        same share of THAT account -- which is usually too much, because there is far less
-        leverage there than on the CFD account the strategy was sized for. 0 means do not
-        trade this strategy on this slave at all.
-      </p>
-      <p className="muted small">
-        A route that sets its own scale wins over this table, and this table wins over the
-        slave-wide value above it.
-      </p>
+      <aside className="side-note">
+        <p>
+          <strong>1.0</strong> takes the whole of what the master staked on that strategy.
+          The same share on a futures or ETF slave is usually too much -- far less leverage
+          than the CFD account it was sized for. <strong>0</strong> means do not trade this
+          strategy here at all.
+        </p>
+        <p>A route with its own scale wins over this table; this table wins over the slave-wide value.</p>
+      </aside>
 
       <div className="slave-actions">
         <button className="btn btn-small" onClick={save} disabled={busy}>
@@ -1235,10 +1254,16 @@ function SlaveRiskForm({ slave, onDone }) {
         setFull(got);
         setForm({
           mode: sz.mode === "pct_risk" ? "pct_risk" : "mirror_lots",
-          risk_pct: sz.risk_pct != null ? +(sz.risk_pct * 100).toFixed(4) : 1,
+          // Kept even though there is no field for it: a slave configured
+          // before the master published its own risk still has one, and
+          // saving must not silently delete the fallback that sizes every
+          // signal from a bridge too old to say.
+          risk_pct: sz.risk_pct,
           capital_base: sz.capital_base || "balance",
           max_risk_pct: sz.max_risk_pct != null ? +(sz.max_risk_pct * 100).toFixed(4) : "",
           allow_opposing: !!(got.config.netting || {}).allow_opposing,
+          balance_adjustment: got.config.balance_adjustment != null ? String(got.config.balance_adjustment) : "",
+          min_risk_capital: got.config.min_risk_capital != null ? String(got.config.min_risk_capital) : "",
         });
       } catch (e) {
         setErr(e.message);
@@ -1259,11 +1284,30 @@ function SlaveRiskForm({ slave, onDone }) {
         delete config.sizing;
       } else {
         const sizing = { ...(config.sizing || {}), mode: "pct_risk" };
-        sizing.risk_pct = Number(form.risk_pct) / 100;
+        // Untouched. There is no field for it any more -- the master's own
+        // risk is used -- but it remains the fallback for a bridge that
+        // cannot report one, and deleting it here would silently stop
+        // those signals sizing at all.
+        if (form.risk_pct != null) sizing.risk_pct = form.risk_pct;
         sizing.capital_base = form.capital_base;
         if (form.max_risk_pct === "" || form.max_risk_pct === null) delete sizing.max_risk_pct;
         else sizing.max_risk_pct = Number(form.max_risk_pct) / 100;
         config.sizing = sizing;
+      }
+
+      const adj = String(form.balance_adjustment).trim();
+      if (adj === "" || Number(adj) === 0) delete config.balance_adjustment;
+      else {
+        if (Number.isNaN(Number(adj))) throw new Error("the balance adjustment must be a number");
+        config.balance_adjustment = Number(adj);
+      }
+
+      const flr = String(form.min_risk_capital).trim();
+      if (flr === "" || Number(flr) === 0) delete config.min_risk_capital;
+      else {
+        const n = Number(flr);
+        if (Number.isNaN(n) || n < 0) throw new Error("the floor must be 0 or more");
+        config.min_risk_capital = n;
       }
 
       config.netting = { ...(config.netting || {}), allow_opposing: !!form.allow_opposing };
@@ -1288,46 +1332,82 @@ function SlaveRiskForm({ slave, onDone }) {
         Sizing
         <select value={form.mode} onChange={(e) => setForm({ ...form, mode: e.target.value })}>
           <option value="mirror_lots">Mirror the master&apos;s lots</option>
-          <option value="pct_risk">Risk a percentage of this account</option>
+          <option value="pct_risk">Risk what the master risked</option>
         </select>
       </label>
 
       {form.mode === "pct_risk" && (
         <>
-          <label>
-            Risk per signal (%)
-            <input
-              type="number"
-              step="0.05"
-              min="0"
-              value={form.risk_pct}
-              onChange={(e) => setForm({ ...form, risk_pct: e.target.value })}
-            />
-          </label>
-          <label>
-            Measured against
-            <select
-              value={form.capital_base}
-              onChange={(e) => setForm({ ...form, capital_base: e.target.value })}
-            >
-              <option value="balance">Balance</option>
-              <option value="equity">Equity</option>
-            </select>
-          </label>
-          <label>
-            Refuse above (%) <span className="muted small">blank for no ceiling</span>
-            <input
-              type="number"
-              step="0.05"
-              min="0"
-              value={form.max_risk_pct}
-              onChange={(e) => setForm({ ...form, max_risk_pct: e.target.value })}
-            />
-          </label>
+          <p className="muted small">
+            The share the master staked on each signal, taken from what its order actually risked
+            rather than from a percentage typed here. Per-strategy scale decides how much of it this
+            slave takes.
+          </p>
+
+          <div className="field-row">
+            <label>
+              Measured against
+              <select
+                value={form.capital_base}
+                onChange={(e) => setForm({ ...form, capital_base: e.target.value })}
+              >
+                <option value="balance">Balance</option>
+                <option value="equity">Equity</option>
+              </select>
+            </label>
+            <label>
+              Refuse above (%)
+              <input
+                type="number"
+                step="0.05"
+                min="0"
+                value={form.max_risk_pct}
+                placeholder="none"
+                onChange={(e) => setForm({ ...form, max_risk_pct: e.target.value })}
+              />
+            </label>
+          </div>
           <p className="muted small">
             The smallest tradeable size can already risk more than the target -- one gold future on a
-            wide stop does. When it exceeds the ceiling the leg is refused rather than sized up, so a
-            ceiling too close to the target means that instrument simply will not trade.
+            wide stop does. Over the ceiling the leg is refused rather than sized up, so a ceiling
+            close to the target means that instrument simply will not trade.
+          </p>
+
+          {/* Folded in from its own row: this is what the share is a
+              share OF, and the two are only meaningful together. */}
+          <div className="field-row">
+            <label>
+              Balance adjustment
+              <input
+                type="number"
+                step="1000"
+                value={form.balance_adjustment}
+                placeholder="0"
+                onChange={(e) => setForm({ ...form, balance_adjustment: e.target.value })}
+              />
+            </label>
+            <label>
+              Never size below
+              <input
+                type="number"
+                step="1000"
+                min="0"
+                value={form.min_risk_capital}
+                placeholder="no floor"
+                onChange={(e) => setForm({ ...form, min_risk_capital: e.target.value })}
+              />
+            </label>
+          </div>
+          <p className="muted small">
+            <strong>Adjustment</strong> corrects a figure that is wrong: 250k pays 50k in tax, the
+            broker reports 200k, +50,000 keeps sizing as if it were still 250k, because a withdrawal
+            is not a drawdown. <strong>Floor</strong> overrides a figure that is right: that account
+            draws to 175k and sizing carries on at the floor.
+          </p>
+          <p className="muted small">
+            A floor is not free -- 1% of a 250,000 floor is 2,500, which on an account holding
+            175,000 is 1.43% of it, and the gap widens as the drawdown does. Margin is never measured
+            against either; the broker holds it against real equity.
           </p>
         </>
       )}

@@ -146,6 +146,7 @@ class CopyEngine(SessionGateMixin):
             # a different amount of risk on a futures leg, and that is set
             # per magic rather than per slave.
             magic=signal.magic,
+            master_risk_fraction=signal.master_risk_fraction,
         )
 
     async def _fit_margin(self, plan, signal):
