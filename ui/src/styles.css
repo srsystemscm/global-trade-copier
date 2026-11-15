@@ -757,3 +757,13 @@ code {
   padding-left: 12px;
 }
 .side-note p { margin: 0 0 8px; }
+
+.mode-row { display: flex; gap: 16px; flex-wrap: wrap; }
+.mode-choice {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-direction: row;
+  font-size: 13px;
+  color: var(--text);
+}

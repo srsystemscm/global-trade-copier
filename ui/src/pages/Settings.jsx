@@ -362,7 +362,6 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
   const [editing, setEditing] = useState(false);
   const [editingMagic, setEditingMagic] = useState(false);
   const [editingMasters, setEditingMasters] = useState(false);
-  const [editingScale, setEditingScale] = useState(false);
   const [editingRoll, setEditingRoll] = useState(false);
   const [showRoutes, setShowRoutes] = useState(false);
 
@@ -389,7 +388,7 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
           {/* The one line worth seeing folded: what it stakes and what
               it stakes it against. */}
           <div className="slave-risk-sizing">
-            {slave.sizing_summary}
+            {describeHeadline(slave)}
             {describeBasis(slave) !== "the broker's own balance" && (
               <span className="muted"> &middot; {describeBasis(slave)}</span>
             )}
@@ -459,40 +458,22 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
 
       {/* Which signals reach this slave at all. A filter decides that
           before sizing ever runs, so it belongs above the routes. */}
+      {/* ONE row, because a strategy and the risk it carries here are a
+          single decision. They were two, and a scale a section away from
+          the magic it belongs to is read wrong. */}
       <div className="slave-risk-row">
         <div>
-          <span className="muted small">Strategies accepted</span>
-          <div className="slave-risk-sizing">{slave.magic_filter_summary}</div>
+          <span className="muted small">Strategy selection</span>
+          <div className="slave-risk-sizing">{describeSelection(slave)}</div>
         </div>
         <button className="btn btn-small" onClick={() => setEditingMagic((v) => !v)}>
           {editingMagic ? "Cancel" : "Edit"}
         </button>
       </div>
       {editingMagic && (
-        <MagicFilterForm
+        <StrategyForm
           slave={slave}
           onDone={() => { setEditingMagic(false); onSaved && onSaved(); }}
-        />
-      )}
-
-      {/* Per-EA risk. The strategies are sized for a CFD account; the
-          futures and ETF legs have far less leverage, so the same signal
-          is a different amount of risk once it lands there. */}
-      <div className="slave-risk-row">
-        <div>
-          <span className="muted small">Risk per strategy</span>
-          <div className="slave-risk-sizing">
-            {describeScale(slave)}
-          </div>
-        </div>
-        <button className="btn btn-small" onClick={() => setEditingScale((v) => !v)}>
-          {editingScale ? "Cancel" : "Edit"}
-        </button>
-      </div>
-      {editingScale && (
-        <RiskScaleForm
-          slave={slave}
-          onDone={() => { setEditingScale(false); onSaved && onSaved(); }}
         />
       )}
 
@@ -597,6 +578,27 @@ function RouteTable({ routes }) {
       </p>
     </div>
   );
+}
+
+function describeHeadline(slave) {
+  // The old line read "1.00% of balance" -- a percentage that is no
+  // longer edited anywhere, because sizing comes from what the master
+  // actually staked. Saying it invites someone to go looking for a field
+  // that is not there.
+  const sizing = slave.sizing_summary || "";
+  if (!/\d+\.\d+% of/.test(sizing)) return sizing;   // routes, lots, etc.
+
+  const scale = slave.risk_scale ?? 1;
+  const byMagic = Object.keys(slave.risk_scale_by_magic || {}).length;
+  const base = slave.sizing_summary.includes("equity") ? "equity" : "balance";
+
+  let head = `what the master staked, of this ${base}`;
+  if (scale !== 1) head += ` x${scale}`;
+  if (byMagic) head += `, ${byMagic} strategy override${byMagic === 1 ? "" : "s"}`;
+
+  const cap = /capped ([\d.]+%)/.exec(sizing);
+  if (cap) head += ` \u00b7 refuse above ${cap[1]}`;
+  return head;
 }
 
 function describeBasis(slave) {
@@ -1017,6 +1019,213 @@ function AccountList({ label, hint, values, onChange }) {
   );
 }
 
+function describeSelection(slave) {
+  const mf = slave.magic_filter;
+  const scales = slave.risk_scale_by_magic || {};
+  const base = slave.risk_scale ?? 1;
+
+  if (mf && mf.accept === "none") return "no strategies -- nothing is copied";
+  if (!mf || (mf.allow == null && !(mf.deny || []).length)) {
+    const all = base === 1 ? "every strategy, full size" : `every strategy x${base}`;
+    return all;
+  }
+  const allow = mf.allow || [];
+  if (!allow.length) return "every strategy except those denied";
+  return allow
+    .map((m) => {
+      const sc = scales[String(m)] ?? scales[m];
+      return sc != null && sc !== 1 ? `${m} x${sc}` : String(m);
+    })
+    .join(", ");
+}
+
+function StrategyForm({ slave, onDone }) {
+  const [full, setFull] = useState(null);
+  const [mode, setMode] = useState("none");
+  const [rows, setRows] = useState([]);
+  const [base, setBase] = useState(1);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const got = await api.getSlave(slave.id);
+        setFull(got);
+        const mf = got.config.magic_filter;
+        const scales = got.config.risk_scale_by_magic || {};
+        setBase(got.config.risk_scale ?? 1);
+
+        let listed = [];
+        let m = "none";
+        if (mf == null) m = "all";
+        else if (Array.isArray(mf)) { m = "listed"; listed = mf.map(String); }
+        else if (mf.accept === "none") m = "none";
+        else if (mf.accept === "all") m = "all";
+        else if (mf.allow && mf.allow.length) { m = "listed"; listed = mf.allow.map(String); }
+        else if (mf.allow == null) m = "all";
+
+        setMode(m);
+        setRows(listed.map((magic) => ({
+          magic,
+          scale: String(scales[magic] ?? scales[Number(magic)] ?? 1),
+        })));
+      } catch (e) {
+        setErr(e.message);
+      }
+    })();
+  }, [slave.id]);
+
+  function setRow(i, patch) {
+    setRows(rows.map((r, j) => (i === j ? { ...r, ...patch } : r)));
+  }
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const config = { ...full.config };
+
+      if (mode === "all") {
+        delete config.magic_filter;
+      } else if (mode === "none") {
+        config.magic_filter = { accept: "none" };
+      } else {
+        const allow = [];
+        const scales = {};
+        for (const r of rows) {
+          const magic = String(r.magic).trim();
+          if (!magic) continue;
+          if (!/^\d+$/.test(magic)) throw new Error(`"${magic}" is not a magic number`);
+          if (allow.includes(Number(magic))) throw new Error(`magic ${magic} is listed twice`);
+          allow.push(Number(magic));
+
+          const sc = String(r.scale).trim();
+          if (sc === "") continue;
+          const n = Number(sc);
+          // 0 is a real instruction -- do not trade this strategy here.
+          if (Number.isNaN(n) || n < 0) throw new Error(`scale for ${magic} must be 0 or more`);
+          if (n !== 1) scales[magic] = n;
+        }
+        if (!allow.length) {
+          throw new Error("add at least one magic, or choose accept none");
+        }
+        config.magic_filter = { allow };
+        if (Object.keys(scales).length) config.risk_scale_by_magic = scales;
+        else delete config.risk_scale_by_magic;
+      }
+
+      if (Number(base) === 1) delete config.risk_scale;
+      else config.risk_scale = Number(base);
+
+      await api.patchSlave(slave.id, { config });
+      onDone();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (err && !full) return <div className="banner banner-error">{err}</div>;
+  if (!full) return <p className="muted small">Loading...</p>;
+
+  return (
+    <div className="slave-risk-form with-notes">
+      {err && <div className="banner banner-error">{err}</div>}
+
+      <div className="mode-row">
+        {[
+          ["none", "Accept none"],
+          ["listed", "Accept listed"],
+          ["all", "Accept all"],
+        ].map(([value, label]) => (
+          <label key={value} className="mode-choice">
+            <input
+              type="radio"
+              name={`sel-${slave.id}`}
+              checked={mode === value}
+              onChange={() => setMode(value)}
+            />
+            {label}
+          </label>
+        ))}
+      </div>
+
+      {mode === "listed" && (
+        <div className="scale-rows">
+          <div className="scale-head">
+            <span>Strategy (magic)</span>
+            <span>Risk scale</span>
+            <span />
+          </div>
+          {rows.map((r, i) => (
+            <div className="scale-row" key={i}>
+              <input
+                value={r.magic}
+                placeholder="1001"
+                onChange={(e) => setRow(i, { magic: e.target.value })}
+              />
+              <input
+                type="number"
+                step="0.05"
+                min="0"
+                value={r.scale}
+                onChange={(e) => setRow(i, { scale: e.target.value })}
+              />
+              <button
+                className="btn btn-small btn-danger"
+                onClick={() => setRows(rows.filter((_, j) => j !== i))}
+              >
+                Remove
+              </button>
+            </div>
+          ))}
+          <button
+            className="btn btn-small"
+            onClick={() => setRows([...rows, { magic: "", scale: "1" }])}
+          >
+            + Add magic
+          </button>
+        </div>
+      )}
+
+      {mode !== "none" && (
+        <label>
+          All strategies on this slave x
+          <input
+            type="number"
+            step="0.05"
+            min="0"
+            value={base}
+            onChange={(e) => setBase(e.target.value)}
+          />
+        </label>
+      )}
+
+      <aside className="side-note">
+        <p>
+          <strong>Accept none</strong> is where a slave starts: a master running every strategy
+          should not port all of them here the moment it connects. Opt each one in.
+        </p>
+        <p>
+          <strong>Risk scale</strong> is how much of what the master staked this slave takes.
+          1.0 is all of it; the same share on a futures or ETF leg is usually too much, with far
+          less leverage than the CFD account it was sized for. <strong>0</strong> means do not
+          trade that strategy here.
+        </p>
+        <p>A route with its own scale wins over this; this wins over the slave-wide value.</p>
+      </aside>
+
+      <div className="slave-actions">
+        <button className="btn btn-small" onClick={save} disabled={busy}>
+          {busy ? "Saving..." : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function MagicList({ label, hint, values, onChange }) {
   return (
     <div className="magic-list">
@@ -1262,6 +1471,11 @@ function SlaveRiskForm({ slave, onDone }) {
           capital_base: sz.capital_base || "balance",
           max_risk_pct: sz.max_risk_pct != null ? +(sz.max_risk_pct * 100).toFixed(4) : "",
           allow_opposing: !!(got.config.netting || {}).allow_opposing,
+          max_legs: (got.config.netting || {}).max_legs ?? "",
+          max_aggregate_risk_pct:
+            (got.config.netting || {}).max_aggregate_risk_pct != null
+              ? +((got.config.netting || {}).max_aggregate_risk_pct * 100).toFixed(4)
+              : "",
           balance_adjustment: got.config.balance_adjustment != null ? String(got.config.balance_adjustment) : "",
           min_risk_capital: got.config.min_risk_capital != null ? String(got.config.min_risk_capital) : "",
         });
@@ -1310,7 +1524,22 @@ function SlaveRiskForm({ slave, onDone }) {
         config.min_risk_capital = n;
       }
 
-      config.netting = { ...(config.netting || {}), allow_opposing: !!form.allow_opposing };
+      const netting = { ...(config.netting || {}), allow_opposing: !!form.allow_opposing };
+      const legs = String(form.max_legs).trim();
+      if (legs === "") delete netting.max_legs;
+      else {
+        const n = Number(legs);
+        if (!Number.isInteger(n) || n < 1) throw new Error("max legs must be a whole number of 1 or more");
+        netting.max_legs = n;
+      }
+      const agg = String(form.max_aggregate_risk_pct).trim();
+      if (agg === "") delete netting.max_aggregate_risk_pct;
+      else {
+        const n = Number(agg);
+        if (Number.isNaN(n) || n <= 0) throw new Error("the combined risk cap must be above 0");
+        netting.max_aggregate_risk_pct = n / 100;
+      }
+      config.netting = netting;
 
       await api.patchSlave(slave.id, { config });
       onDone();
@@ -1411,6 +1640,40 @@ function SlaveRiskForm({ slave, onDone }) {
           </p>
         </>
       )}
+
+      {/* These decide whether a signal becomes a trade at all, and were
+          reachable only by editing config. Same form as sizing because
+          they are read together: how much, and how much is too much. */}
+      <div className="field-row">
+        <label>
+          Max legs per symbol
+          <input
+            type="number"
+            step="1"
+            min="1"
+            value={form.max_legs}
+            placeholder="no limit"
+            onChange={(e) => setForm({ ...form, max_legs: e.target.value })}
+          />
+        </label>
+        <label>
+          Max combined risk per symbol (%)
+          <input
+            type="number"
+            step="0.5"
+            min="0"
+            value={form.max_aggregate_risk_pct}
+            placeholder="no limit"
+            onChange={(e) => setForm({ ...form, max_aggregate_risk_pct: e.target.value })}
+          />
+        </label>
+      </div>
+      <p className="muted small">
+        Several strategies on one symbol are a single correlated bet. The leg cap counts
+        same-side positions; the combined cap adds up what they risk together and refuses the
+        one that would cross it. A leg with no stop cannot be measured, so the combined cap
+        refuses rather than guesses.
+      </p>
 
       <label className="checkbox-row">
         <input

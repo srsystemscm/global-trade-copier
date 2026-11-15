@@ -336,3 +336,55 @@ def test_the_refusal_message_survives_a_magic_list_and_a_catch_all():
     message = describe_refusal(config, sig(magic=9999, symbol="BTCUSD"))
     assert "no route for symbol=BTCUSD magic=9999" in message
     assert "[1001, 1002]" in message
+
+
+# ================================================== accepting nothing
+#
+# Strategies are opted IN. A master running every strategy should not
+# port all of them to every slave the moment it connects, so a slave
+# starts by taking none and each one is added deliberately.
+#
+# Said explicitly rather than as an empty allow-list: `{"allow": []}`
+# stays a refused mistake, because that is what a selection looks like
+# when something went wrong building it, and failing open there is the
+# one direction this must not fail.
+
+def test_accept_none_takes_nothing():
+    f = magic_filter.parse({"magic_filter": {"accept": "none"}})
+    ok, why = f.accepts(sig(magic=1001))
+    assert ok is False
+    assert "accepts no strategies" in why
+    assert f.describe() == "no strategies"
+
+
+def test_accept_none_is_configured_so_the_hub_can_tell():
+    """None means "takes everything" to the hub. A slave taking nothing
+    must not look the same as one nobody has touched."""
+    f = magic_filter.parse({"magic_filter": {"accept": "none"}})
+    assert f.configured is True
+    assert f.as_dict() == {"accept": "none", "allow": None, "deny": []}
+
+
+def test_accept_all_is_the_same_as_no_filter():
+    assert magic_filter.parse({"magic_filter": {"accept": "all"}}).accepts(sig(magic=7))[0] is True
+
+
+def test_an_empty_allow_list_is_still_refused():
+    """The distinction this whole design rests on: choosing to take
+    nothing is `accept: none`, while an allow-list that came out empty is
+    a bug in whatever built it."""
+    with pytest.raises(ValueError, match="allows nothing"):
+        magic_filter.parse({"magic_filter": {"allow": []}})
+
+
+def test_an_unknown_accept_value_is_refused():
+    with pytest.raises(ValueError, match="accept"):
+        magic_filter.parse({"magic_filter": {"accept": "some"}})
+
+
+def test_no_filter_still_means_every_strategy():
+    """NOT changed to accept-none. Every slave running today has no
+    filter, and flipping the default would stop all of them trading at
+    the next restart -- silently, because a slave taking nothing looks
+    exactly like a quiet market."""
+    assert magic_filter.parse({}).accepts(sig(magic=1001))[0] is True
