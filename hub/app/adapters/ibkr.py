@@ -114,6 +114,17 @@ class IBKRAdapter(BrokerAdapter):
     # in ib_async re-establishes it, so the watchdog has to.
     requires_session_recovery = True
 
+    # What IBKR will take on an entry. Checked here rather than left to the
+    # broker because a bad value comes back as a rejected order in a log
+    # nobody is reading at 18:00 on a Sunday -- and the whole point of the
+    # setting is that the order rests until Monday.
+    #
+    # Deliberately not the full IBKR list: OPG, FOK and DTC have no meaning
+    # for an entry this engine places, and accepting them would let a route
+    # be written that silently never fills.
+    ENTRY_TIFS = ("DAY", "GTC", "GTD", "IOC")
+
+
     def __init__(
         self,
         slave_id: str,
@@ -193,6 +204,8 @@ class IBKRAdapter(BrokerAdapter):
         # await_entry_fill(). Popped on collection, so a long-resting order
         # holds one entry and nothing accumulates.
         self._entry_trades: Dict[int, object] = {}
+        # slave_ticket -> how long this particular entry may rest
+        self._entry_waits: Dict[int, float] = {}
         self._exit_trades: Dict[int, object] = {}
 
     @staticmethod
@@ -496,7 +509,20 @@ class IBKRAdapter(BrokerAdapter):
         else:
             entry = ib_mod.MarketOrder(action, order.size)
         entry.outsideRth = order.outside_rth
-        entry.tif = self.entry_tif
+        # The ROUTE's value wins, falling back to this slave's default. It
+        # used to be the slave's always, which is why an ETF entry could not
+        # be made to survive the session it was placed in: every route on
+        # ibkr-etf-1 got DAY, and a DAY order placed at 18:00 ET expires
+        # that evening rather than resting into Monday's pre-market.
+        tif = (order.tif or self.entry_tif or "DAY").upper()
+        if tif not in self.ENTRY_TIFS:
+            # Refused here, not sent. An order IBKR rejects for a bad TIF is
+            # a position that silently never opens.
+            raise AdapterError(
+                f"{tif!r} is not a time in force this adapter will place on an "
+                f"entry (accepts {', '.join(self.ENTRY_TIFS)})"
+            )
+        entry.tif = tif
         # The copier's own reference, which the broker hands back on its
         # statement. Set on the entry AND on both protective legs below, so
         # every execution belonging to this position is recognisable as
@@ -582,6 +608,13 @@ class IBKRAdapter(BrokerAdapter):
                     self.slave_id, label, slave_ticket, status, why,
                 )
         self._entry_trades[slave_ticket] = trade
+        # How long THIS entry may rest, remembered beside the trade because
+        # _collect_fill is handed a ticket and no longer has the order. A
+        # GTC entry with the adapter's 900s clock is cancelled by us a
+        # quarter of an hour in, so the TIF alone would have changed
+        # nothing -- the pair has to travel together.
+        if order.entry_timeout is not None:
+            self._entry_waits[slave_ticket] = float(order.entry_timeout)
         logger.info(
             "IBKRAdapter[%s] opened %s %s x%s -> ticket=%s", self.slave_id, action, order.symbol, order.size, slave_ticket
         )
@@ -802,9 +835,15 @@ class IBKRAdapter(BrokerAdapter):
         # so different clocks.
         is_limit = getattr(trade.order, "orderType", "") == "LMT"
         timeout = self.entry_timeout if is_limit else self.fill_timeout
+        # A route that asked for its own wait gets it -- but only for a
+        # limit. A market order that has not filled in ten seconds has
+        # something wrong with it whatever the route says.
+        if is_limit and slave_ticket in self._entry_waits:
+            timeout = self._entry_waits[slave_ticket]
         price, size = await self._await_fill(trade, "entry", timeout)
         if price is not None:
             self._entry_trades.pop(slave_ticket, None)
+            self._entry_waits.pop(slave_ticket, None)
         return price, size
 
     async def _settle_cancel(self, trade, label: str, timeout: float = 5.0):
@@ -879,6 +918,7 @@ class IBKRAdapter(BrokerAdapter):
         position nobody asked for.
         """
         trade = self._entry_trades.pop(slave_ticket, None)
+        self._entry_waits.pop(slave_ticket, None)
         pos = self._positions.get(slave_ticket)
 
         # Last look before cancelling. The fill may have landed while this

@@ -61,6 +61,19 @@ class Route:
     # the spread is the point -- a limit sitting at the bid in a thin
     # evening book is a signal that quietly never becomes a position.
     limit_offset_pct: float = 0.0
+    # How long the entry stays alive at the broker, and how long this engine
+    # waits for it. Both were adapter-wide, which is what stopped a Sunday
+    # evening ETF entry from ever working: DAY expires at that session's
+    # close, so an order placed at 18:00 ET cannot survive to Monday's
+    # pre-market, and the 900s abandon timer cancelled it long before the
+    # TIF mattered anyway.
+    #
+    # They are a pair. GTC without a longer wait is still cancelled by this
+    # engine; a longer wait without GTC leaves the engine watching an order
+    # the broker already expired. Setting one and not the other is the
+    # configuration that looks right and does nothing.
+    tif: Optional[str] = None
+    entry_timeout: Optional[float] = None
     # Which way this route trades. None takes both, which is right for a
     # futures leg that can be short as easily as long. An ETF leg usually
     # cannot: the long-side proxies here have no inverse twin, so without
@@ -187,6 +200,10 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                     order_type=entry.get("order_type", "market"),
                     outside_rth=bool(entry.get("outside_rth", False)),
                     limit_offset_pct=float(entry.get("limit_offset_pct", 0.0)),
+                    tif=(None if entry.get("tif") is None
+                         else str(entry["tif"]).upper()),
+                    entry_timeout=(None if entry.get("entry_timeout") is None
+                                   else float(entry["entry_timeout"])),
                     direction=(None if entry.get("direction") is None
                                else str(entry["direction"]).upper()),
                     target_direction=(None if entry.get("target_direction") is None

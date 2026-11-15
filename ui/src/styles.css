@@ -767,3 +767,10 @@ code {
   font-size: 13px;
   color: var(--text);
 }
+
+/* The mode cell is a label plus the control that changes it, stacked so
+   the sentence explaining the consequence sits under the thing it warns
+   about rather than beside it. */
+.mode-cell { display: flex; flex-direction: column; gap: 0.25rem; align-items: flex-start; }
+.mode-cell select { font-size: 0.85em; padding: 0.15rem 0.3rem; }
+.mode-cell .banner-error { margin: 0.2rem 0 0; font-size: 0.8em; }

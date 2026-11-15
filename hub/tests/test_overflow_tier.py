@@ -14,6 +14,11 @@ exactly when the overflow product earns its place.
 Both checks therefore move inside the loop. Only an exhausted list refuses
 the signal, and a signal turned away by policy is still reported as a
 refusal rather than as an arithmetic failure.
+
+Since 2026-11-15 the AGGREGATE RISK cap overflows too, where it used to
+stop the whole list. See
+test_the_aggregate_risk_cap_overflows_to_the_next_instrument for why that
+reversed, and the two tests after it for why it is not a bypass.
 """
 import asyncio
 
@@ -174,18 +179,56 @@ def test_a_single_candidate_route_behaves_exactly_as_before():
 
 # ---------------- a rule is not a capacity limit ------------------------
 
-def test_the_aggregate_risk_cap_does_not_overflow():
-    """The subtle one. The cap exists because several systems on one symbol
-    are a single correlated bet, and BITU and BITX track the same
-    underlying. Overflowing to escape it would defeat the cap while looking
-    exactly like compliance."""
+def test_the_aggregate_risk_cap_overflows_to_the_next_instrument():
+    """REVERSED on 2026-11-15, and the old reasoning is worth keeping
+    because it is the plausible one.
+
+    It said: the cap exists because several systems on one symbol are a
+    single correlated bet, BITU and BITX track the same underlying, and
+    overflowing to escape the cap would defeat it while looking exactly
+    like compliance. So the refusal was `overflowable=False`.
+
+    That misreads why a route names several instruments. It is ACCESS and
+    CAPACITY, not conviction: a weekly and a daily system stacking safely
+    needs two or three futures contracts plus an ETF leg, and US margin is
+    running out around the same point anyway. The cap is a bottleneck on
+    ONE instrument, not a budget for the underlying.
+
+    It is not an escape hatch, which is what the next test pins: the
+    fallback gets its own aggregate check against its own book."""
     broker, _, _ = _run(
         _Broker(), _cfg(["BITU", "BITX"],
                         netting={"max_aggregate_risk_pct": 0.045}),
         [_sig(1), _sig(2), _sig(3)])
     symbols = [o["symbol"] for o in broker.opened]
-    # 2% a leg: two fit under 4.5%, and the third must not escape to BITX
-    assert symbols == ["BITU", "BITU"], symbols
+    # 2% a leg: two fit under 4.5% on BITU, and the third goes to BITX
+    # rather than being thrown away.
+    assert symbols == ["BITU", "BITU", "BITX"], symbols
+
+
+def test_the_overflow_instrument_is_checked_rather_than_waved_through():
+    """Why the reversal above is not a bypass.
+
+    With only BITU on the route there is nowhere to overflow TO, so the
+    cap binds exactly as it always did: two legs fit under 4.5% and the
+    third is refused. The flag changed where a full book sends a signal,
+    not whether the ceiling holds."""
+    broker, _, _ = _run(
+        _Broker(), _cfg(["BITU"],
+                        netting={"max_aggregate_risk_pct": 0.045}),
+        [_sig(1), _sig(2), _sig(3)])
+    assert [o["symbol"] for o in broker.opened] == ["BITU", "BITU"]
+
+
+def test_an_exhausted_list_under_the_aggregate_cap_is_still_refused():
+    """Overflow buys one more instrument, not unlimited stacking: once
+    every name on the route is at its ceiling the signal is refused, and
+    reported as a refusal rather than as an arithmetic failure."""
+    _, _, events = _run(
+        _Broker(), _cfg(["BITU", "BITX"],
+                        netting={"max_aggregate_risk_pct": 0.045}),
+        [_sig(i) for i in range(1, 7)])
+    assert "netting_refused" in [n for n, _ in events]
 
 
 def test_an_unmeasurable_cap_does_not_overflow():

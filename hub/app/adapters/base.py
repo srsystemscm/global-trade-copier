@@ -67,6 +67,16 @@ class OrderRequest:
     # priced the same way as the entry. Without it the adapter would have to
     # guess, and a market exit cannot fill outside regular hours.
     limit_offset_pct: float = 0.0
+    # Time in force for the ENTRY, and how long to wait for it. None on
+    # either means "use the adapter's own default", which is what every
+    # route did before these existed.
+    #
+    # The case they are for: an ETF leg opened from a CFD signal at 18:00
+    # ET, or over a weekend. A DAY order expires at that session's close, so
+    # it can never reach Monday's pre-market -- and the adapter-wide 900s
+    # abandon timer cancelled it a quarter of an hour in regardless.
+    tif: Optional[str] = None
+    entry_timeout: Optional[float] = None
     # Whether to place broker-side stop/target orders at all. ETF legs set
     # this false: those orders do not execute in extended hours, so resting
     # them achieves nothing while leaving GTC orders to strand. Those legs

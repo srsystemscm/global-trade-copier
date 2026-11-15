@@ -98,9 +98,10 @@ function GeneralTab({ config, onChanged }) {
         </tbody>
       </table>
       <p className="muted small">
-        How a slave copies is chosen when it is added and is fixed while it runs -- it selects
-        the engine, so changing it would swap one engine for another underneath positions the
-        new one knows nothing about. To change it, add the slave again with the other setting.
+        How a slave copies selects the engine, so switching it stops one and starts the other.
+        Only possible while the slave is flat: the incoming engine would otherwise adopt open
+        positions and protect them under rules they were never opened under -- mirror aims at
+        the master&apos;s own stop, autonomous trails its own from ATR.
       </p>
 
       <div className="form-grid" style={{ marginTop: 16, maxWidth: 360 }}>
@@ -208,7 +209,9 @@ function SlavesTab({ status, onChanged }) {
             <tr key={s.id}>
               <td>{s.name}</td>
               <td>{s.broker_type}</td>
-              <td>{s.mode_label || s.mode}</td>
+              <td>
+                <ModeCell slave={s} onChanged={onChanged} />
+              </td>
               <td>{s.paused ? "paused" : s.running ? "running" : "stopped"}</td>
               <td>
                 <button className="btn btn-small" onClick={() => togglePause(s)}>
@@ -549,7 +552,7 @@ function RouteTable({ routes }) {
               <td>
                 {r.target.join(" / ")}
                 {r.target.length > 1 && (
-                  <span className="muted small"> (first that resolves)</span>
+                  <span className="muted small"> (next one on capacity)</span>
                 )}
               </td>
               <td>
@@ -561,6 +564,24 @@ function RouteTable({ routes }) {
               <td>
                 {r.order_type}
                 {r.outside_rth && <span className="badge badge-warn">outside RTH</span>}
+                {/* The pair that decides whether an evening entry can still
+                    be open at the next session. One without the other is
+                    the setting that looks right and does nothing, so both
+                    are shown and a lone TIF is flagged. */}
+                {r.tif && <span className="badge">{r.tif}</span>}
+                {r.tif && r.tif !== "DAY" && !r.entry_timeout && (
+                  <span
+                    className="badge badge-warn"
+                    title="This engine still cancels the unfilled entry on its own default clock, so the longer TIF changes nothing. Set entry_timeout too."
+                  >
+                    no wait set
+                  </span>
+                )}
+                {r.entry_timeout && (
+                  <span className="muted small">
+                    {" "}rests {Math.round(r.entry_timeout / 60)}m
+                  </span>
+                )}
               </td>
               <td>{r.month_slot ?? <span className="muted">--</span>}</td>
               <td>
@@ -581,6 +602,57 @@ function RouteTable({ routes }) {
         Read-only for now. These decide what a signal becomes -- which contract month, who holds
         the stop, whether it may work outside regular hours.
       </p>
+    </div>
+  );
+}
+
+function ModeCell({ slave, onChanged }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const raw = slave.mode === "autonomous" ? "autonomous" : "mirror";
+  const other = raw === "autonomous" ? "mirror" : "autonomous";
+
+  async function switchTo(next) {
+    if (next === raw) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      // Only the mode travels. Sending the whole config back would make a
+      // read-modify-write out of what is meant to be one decision, and
+      // anything edited elsewhere since this page loaded would be undone.
+      const full = await api.getSlave(slave.id);
+      await api.patchSlave(slave.id, { config: { ...full.config, mode: next } });
+      onChanged && onChanged();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mode-cell">
+      <div>{slave.mode_label || slave.mode}</div>
+      <select
+        value={raw}
+        disabled={busy || slave.mode_editable === false}
+        onChange={(e) => switchTo(e.target.value)}
+      >
+        <option value="mirror">mirror</option>
+        <option value="autonomous">autonomous</option>
+      </select>
+      {slave.mode_editable === false && (
+        <div className="muted small">
+          {slave.mode_locked_reason
+            ? `locked -- ${slave.mode_locked_reason}`
+            : "locked"}
+        </div>
+      )}
+      {busy && <div className="muted small">restarting the engine...</div>}
+      {err && <div className="banner banner-error">{err}</div>}
+      {!busy && !err && slave.mode_editable !== false && (
+        <div className="muted small">switching restarts as {other}</div>
+      )}
     </div>
   );
 }

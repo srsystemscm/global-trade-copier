@@ -198,15 +198,46 @@ def test_entry_tif_defaults_to_day():
 
 
 def test_entry_and_close_state_a_tif():
-    """Both placements, not just the entry: the closing order hit 10349 too."""
+    """Both placements, not just the entry: the closing order hit 10349 too.
+
+    What matters here is that a TIF is STATED rather than left to IBKR's
+    account-level order preset, which supplies DAY and reports it as error
+    10349 -- cancelling and re-creating the order before it fills, so
+    anything watching order state sees a failure that is not one.
+
+    The entry's value became per-route on 2026-11-15, so it is now a local
+    resolved from the route and the slave default. The requirement is
+    unchanged: something is assigned, and it is never left unset.
+    """
     import inspect
     import re
     from app.adapters.ibkr import IBKRAdapter
 
     open_src = re.sub(r"\s+", " ", inspect.getsource(IBKRAdapter.open))
     close_src = re.sub(r"\s+", " ", inspect.getsource(IBKRAdapter.close))
-    assert "entry.tif = self.entry_tif" in open_src
+    assert "entry.tif = tif" in open_src
+    assert "order.tif or self.entry_tif" in open_src, (
+        "the route's value no longer reaches the order, so every entry is "
+        "back to the slave-wide default"
+    )
     assert "closing_order.tif = self.entry_tif" in close_src
+
+
+def test_an_entry_tif_the_adapter_cannot_place_is_refused():
+    """A TIF IBKR rejects is a position that silently never opens -- and
+    the setting exists precisely for orders placed when nobody is
+    watching."""
+    import pytest
+
+    from app.adapters.base import AdapterError
+    from app.adapters.ibkr import IBKRAdapter
+
+    assert "GTC" in IBKRAdapter.ENTRY_TIFS
+    assert "DAY" in IBKRAdapter.ENTRY_TIFS
+    # Meaningless for an entry this engine places: accepting them would let
+    # a route be written that never fills.
+    assert "OPG" not in IBKRAdapter.ENTRY_TIFS
+    assert "FOK" not in IBKRAdapter.ENTRY_TIFS
 
 
 def test_brackets_keep_their_own_tif():

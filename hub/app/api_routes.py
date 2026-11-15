@@ -219,13 +219,22 @@ def _route_rows(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         rows.append({
             "symbol": route.get("symbol"),
             "magic": route.get("magic"),
-            # A route may name several targets and take the first that
-            # resolves, so this is a list as often as a string.
+            # A route may name several targets. The first that resolves is
+            # taken -- and, since 2026-11-15, the next one is tried when a
+            # book is at its leg or aggregate-risk capacity, which is what
+            # the extra names are for.
             "target": target if isinstance(target, list) else [target],
             "direction": route.get("direction"),
             "target_direction": route.get("target_direction"),
             "order_type": route.get("order_type") or "market",
             "outside_rth": bool(route.get("outside_rth")),
+            # How long the entry lives at the broker, and how long this
+            # engine waits for it. Shown because the pair is what decides
+            # whether a leg opened in the evening can still be open at the
+            # next session -- and because setting one without the other is
+            # the configuration that looks right and does nothing.
+            "tif": route.get("tif"),
+            "entry_timeout": route.get("entry_timeout"),
             # False means the copier holds the stop itself and the broker
             # has no resting order -- worth seeing, because it decides
             # whether the position is protected while the hub is down.
@@ -376,11 +385,18 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         # The raw value stays -- the hub reporter sends it, and the ATR and
         # contract-roll sections key off it. This is the line for a reader.
         "mode_label": describe_mode(slave.config),
-        # It is fixed when the engine starts, because changing it swaps
-        # CopyEngine for AutonomousCopyEngine. Said here so no screen has to
-        # offer a control that would save cleanly and change nothing until a
-        # restart, under positions the other engine does not know about.
-        "mode_editable": False,
+        # Switchable, but only while the slave is flat. Changing it swaps
+        # CopyEngine for AutonomousCopyEngine, and position_store is keyed
+        # by slave, so the incoming engine would adopt open positions and
+        # protect them under rules they were never opened under -- one aims
+        # at the master's stop level, the other trails its own from ATR.
+        # Reported rather than left for the UI to guess, so the control is
+        # disabled for the same reason the API refuses.
+        "mode_editable": not held_position_count(engine),
+        "mode_locked_reason": (
+            f"holding {held_position_count(engine)} position(s)"
+            if held_position_count(engine) else None
+        ),
         "enabled": slave.enabled,
         "paused": engine.paused if engine is not None else slave.paused,
         "running": engine is not None,
@@ -505,6 +521,55 @@ async def get_one_slave(slave_id: str):
     }
 
 
+def held_position_count(engine) -> int:
+    """How many positions this engine is managing. 0 when there is none."""
+    return len(getattr(engine, "_positions", {}) or {})
+
+
+def _refuse_switch_while_holding(slave_id: str, engine, switching: tuple) -> None:
+    """A mode switch is only safe on a flat slave.
+
+    The two engines protect a position differently -- mirror aims at the
+    master's own stop level, autonomous trails its own from ATR -- and
+    position_store is keyed by SLAVE, not by engine. So the incoming engine
+    genuinely would adopt these on restore() and start managing them under
+    rules they were never opened under.
+
+    Refusing is the only answer that does not silently change what is
+    protecting live money. Not a warning: there is nothing the operator
+    could do about it afterwards except notice.
+    """
+    held = held_position_count(engine)
+    if not held:
+        return
+    raise HTTPException(409, (
+        f"{slave_id} is holding {held} position(s). Switching from "
+        f"{switching[0]} to {switching[1]} starts a different engine, and it would "
+        f"take these over under different stop handling than they were opened "
+        f"with. Close them, or wait for them to close, then switch."
+    ))
+
+
+def _mode_switch(slave, config) -> Optional[tuple]:
+    """(from, to) when this edit changes which engine runs, else None.
+
+    Pulled out because a mode change has to be decided before anything is
+    written: it is refused whole when the slave holds positions, and a
+    half-applied switch would leave the stored config describing an engine
+    that is not the one running.
+    """
+    if not config or "mode" not in config:
+        return None
+    before = (slave.config or {}).get("mode", "mirror")
+    after = config.get("mode") or "mirror"
+    if after not in ("mirror", "autonomous"):
+        raise HTTPException(400, (
+            f"{after!r} is not a mode -- it chooses the engine, and there are "
+            f"two: 'mirror' or 'autonomous'"
+        ))
+    return None if after == before else (before, after)
+
+
 @router.patch("/slaves/{slave_id}")
 async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
     slave = get_slave(slave_id)
@@ -513,6 +578,14 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
 
     takes = _validated_magic_filter(payload.config)
     from_masters = _validated_master_filter(payload.config)
+
+    # A mode change is not a config edit; it is a different engine. Worked
+    # out before anything is written, because the switch has to be refused
+    # whole rather than half-applied.
+    switching = _mode_switch(slave, payload.config)
+    if switching is not None:
+        _refuse_switch_while_holding(
+            slave_id, _find_engine(request, slave_id), switching)
 
     if payload.name is not None or payload.config is not None:
         slave = update_slave(slave_id, name=payload.name, config=payload.config)
@@ -532,6 +605,27 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
             # when no engine is running, which is a no-op the bus ignores.
             request.app.state.bus.set_magic_filter(slave_id, takes)
             request.app.state.bus.set_master_filter(slave_id, from_masters)
+
+        if switching is not None:
+            # Same stop/start the enabled toggle does, in the same order and
+            # for the same reason: start_engine_for_slave reads the mode
+            # from the stored config, so the write above has to land first.
+            engine = _find_engine(request, slave_id)
+            if engine is not None:
+                await stop_engine(engine, request.app.state.bus)
+                request.app.state.engines.remove(engine)
+            slave = get_slave(slave_id)
+            if slave.enabled:
+                engine = await start_engine_for_slave(
+                    slave, request.app.state.bus, request.app.state.events,
+                    request.app.state.notifier,
+                )
+                request.app.state.engines.append(engine)
+            logger.warning(
+                "slave=%s switched from %s to %s -- %s engine now running",
+                slave_id, switching[0], switching[1],
+                switching[1] if slave.enabled else "no",
+            )
 
     if payload.paused is not None:
         set_paused(slave_id, payload.paused)

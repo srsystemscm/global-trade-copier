@@ -895,16 +895,31 @@ class AutonomousCopyEngine(SessionGateMixin):
             )
             ceiling = capital * float(cap_pct)
             if total > ceiling:
-                # Not overflowable. The cap exists because several systems on
-                # one symbol are a single correlated bet, and a sibling
-                # product on the same underlying is the same bet -- escaping
-                # the cap by changing ticker would defeat it while looking
-                # like compliance.
-                return Refusal(overflowable=False, reason=(
+                # OVERFLOWABLE, and the reasoning here was wrong until
+                # 2026-11-15. It read the candidate list as an escape hatch:
+                # a sibling product on the same underlying is the same bet,
+                # so letting a full book fall through to another ticker
+                # would defeat the cap while looking like compliance.
+                #
+                # That misreads what the list is for. A route names several
+                # instruments because of ACCESS and CAPACITY, not conviction
+                # -- 2-3 futures contracts plus an ETF leg is how a weekly
+                # and a daily system stack safely once one book is full, and
+                # US margin is running out around the same point anyway. The
+                # cap is a bottleneck on one instrument, not a budget for
+                # the underlying.
+                #
+                # It is not an escape hatch, because the next candidate gets
+                # its OWN aggregate check against its OWN positions: it can
+                # only be taken if that book genuinely has room. What this
+                # refuses is stacking past the ceiling on THIS instrument,
+                # which is exactly what it still does.
+                return Refusal(overflowable=True, reason=(
                     f"{len(existing)} leg(s) already risk {sum(held_risks):.2f} on "
                     f"{symbol}; adding {new_risk:.2f} would make {total:.2f}, over "
                     f"the {float(cap_pct):.2%} aggregate ceiling of {ceiling:.2f}. "
-                    f"These net into ONE position, so the limit is across them."
+                    f"These net into ONE position on {symbol}, so the limit is across "
+                    f"them -- trying the next instrument on this route."
                 ))
         return None
 
@@ -1047,6 +1062,12 @@ class AutonomousCopyEngine(SessionGateMixin):
             limit_price=limit_price,
             outside_rth=route.outside_rth,
             limit_offset_pct=route.limit_offset_pct,
+            # Only the ENTRY carries these. A contract roll below builds its
+            # own OrderRequest and deliberately does not: a roll is a market
+            # order on a futures contract, where the session the ETF legs
+            # need to outlive does not apply.
+            tif=route.tif,
+            entry_timeout=route.entry_timeout,
             broker_brackets=route.broker_brackets,
         )
         requested_at = time.time()
