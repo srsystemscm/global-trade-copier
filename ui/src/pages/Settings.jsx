@@ -428,6 +428,17 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
       </div>
 
       <div className="slave-risk-flags">
+        {/* The refusal ceiling sits with the other limits, not in the
+            sizing line. It is not how much this slave stakes -- it is the
+            point at which it declines to stake at all. */}
+        {describeCeiling(slave) != null && (
+          <span
+            className="badge badge-warn"
+            title="A signal whose risk works out above this share of capital is refused outright rather than trimmed"
+          >
+            refuse above {(describeCeiling(slave) * 100).toFixed(2)}%
+          </span>
+        )}
         {slave.netting?.allow_opposing && (
           <span className="badge badge-warn" title="A signal opposing what this account already holds is copied rather than refused">
             opposing legs allowed
@@ -682,19 +693,39 @@ function describeHeadline(slave) {
   if (/mirrors the master's lots/.test(sizing)) {
     return "NO RISK SIZING -- sends the master's lot count unchanged";
   }
-  if (!/\d+\.\d+% of/.test(sizing)) return sizing;   // routes, lots, etc.
+  if (!/\d+\.\d+% of/.test(sizing)) return sizing;   // lots, or something new
 
+  // RISK SCALE LEADS, and no percentage appears here at all.
+  //
+  // The percentages are internal calibration: risk_pct is overridden by
+  // whatever the master's order actually staked, and max_risk_pct is a
+  // refusal threshold. Neither is the dial anybody turns. Risk scale is --
+  // it is the calibration between what the EA signalled and what this
+  // slave takes of it -- so it is the thing the folded line has to show,
+  // and it shows even at 1.00 because "unscaled" is a setting too.
+  //
+  // The ceiling has not been dropped: it moved to a badge beside the leg
+  // and aggregate limits, which is what it is.
   const scale = slave.risk_scale ?? 1;
   const byMagic = Object.keys(slave.risk_scale_by_magic || {}).length;
-  const base = slave.sizing_summary.includes("equity") ? "equity" : "balance";
+  const base = sizing.includes("equity") ? "equity" : "balance";
 
-  let head = `what the master staked, of this ${base}`;
-  if (scale !== 1) head += ` x${scale}`;
-  if (byMagic) head += `, ${byMagic} strategy override${byMagic === 1 ? "" : "s"}`;
-
-  const cap = /capped ([\d.]+%)/.exec(sizing);
-  if (cap) head += ` \u00b7 refuse above ${cap[1]}`;
+  let head = `risk scale x${Number(scale).toFixed(2)}`;
+  head += ` of what the master staked, against this ${base}`;
+  if (byMagic) {
+    head += ` \u00b7 ${byMagic} strategy override${byMagic === 1 ? "" : "s"}`;
+  }
   return head;
+}
+
+/** The refusal ceiling, as a limit rather than as sizing. */
+function describeCeiling(slave) {
+  const direct = (slave.sizing || {}).max_risk_pct;
+  if (typeof direct === "number") return direct;
+  // A route-sized slave carries no slave-level block, so read it off the
+  // summary the hub already built rather than re-deriving it here.
+  const found = /capped ([\d.]+)%/.exec(slave.sizing_summary || "");
+  return found ? Number(found[1]) / 100 : null;
 }
 
 function describeBasis(slave) {

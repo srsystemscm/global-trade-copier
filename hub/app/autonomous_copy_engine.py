@@ -217,6 +217,15 @@ class AutonomousCopyEngine(SessionGateMixin):
                 )
             self._positions[key] = pos
             restored += 1
+
+        # Which of those have an entry still resting at the broker. Kept in
+        # memory only: it describes this run, not the position, and
+        # persisting it would outlive the fact.
+        #
+        # Asked once, here, rather than per monitor pass -- a position read
+        # every fifteen seconds for every leg is a cost paid for a state
+        # that changes once.
+        await self._mark_pending_entries()
         if restored:
             logger.info("slave=%s restored %d open position(s) across the restart",
                         self.slave_id, restored)
@@ -1491,6 +1500,12 @@ class AutonomousCopyEngine(SessionGateMixin):
                         account, master_ticket, slave_symbol, slave_ticket)
                 return
             if which == "entry":
+                # It filled, so it is a position now. Cleared here rather
+                # than left to the next restart, so trailing resumes within
+                # this run.
+                for pos in self._positions.values():
+                    if pos.get("slave_ticket") == slave_ticket:
+                        pos.pop("entry_pending", None)
                 trade_registry.record_fill(
                     self.slave_id, account, master_ticket, slave_symbol,
                     slave_price=price, slave_lots=size, filled_at=time.time(),
@@ -1934,8 +1949,66 @@ class AutonomousCopyEngine(SessionGateMixin):
                 to_contract=nxt.local_symbol,
             )
 
+    async def _mark_pending_entries(self) -> None:
+        """Flag restored positions whose entry is still working.
+
+        reconcile_slave now leaves such a row OPEN with its state intact,
+        which is what keeps a later CLOSE able to find the leg. The cost
+        is that restore() loads a position the broker does not hold yet,
+        and the trailing monitor must not act on one.
+
+        Conservative on every failure: an entry that cannot be confirmed
+        filled is treated as pending, because declining to move a stop is
+        recoverable and moving the wrong one is not.
+        """
+        if not self._positions:
+            return
+        read_orders = getattr(self.adapter, "get_working_orders", None)
+        if read_orders is None:
+            return      # the broker's entries never rest; nothing to mark
+        try:
+            working = await read_orders()
+        except NotImplementedError:
+            return
+        except Exception as exc:  # noqa: BLE001 -- any adapter or socket fault
+            logger.warning(
+                "slave=%s could not read working orders at restore (%s) -- "
+                "trailing is held off for every restored position until the "
+                "next restart, rather than risk moving a stop for an entry "
+                "that never filled",
+                self.slave_id, exc,
+            )
+            for pos in self._positions.values():
+                pos["entry_pending"] = True
+            return
+
+        refs = {str(o.order_ref) for o in working if o.order_ref}
+        symbols = {o.symbol for o in working if o.symbol}
+        held = 0
+        for key, pos in self._positions.items():
+            master_account, master_ticket, slave_symbol = key
+            ref = order_ref(master_account, master_ticket, slave_symbol)
+            if ref in refs or slave_symbol in symbols:
+                pos["entry_pending"] = True
+                held += 1
+        if held:
+            logger.warning(
+                "slave=%s %d restored position(s) still have an unfilled entry "
+                "at the broker -- tracked so a CLOSE reaches them, but not "
+                "trailed until the fill is seen",
+                self.slave_id, held,
+            )
+
     async def _check_risk(self, key: Tuple[str, int, str], pos: dict) -> None:
         _master_account, _master_ticket, target_symbol = key
+
+        # The entry has not filled, so there is no position to protect.
+        # Moving a stop here would act on whatever sl_order_id happens to
+        # hold -- None on an unbracketed route, a live order on a
+        # bracketed one.
+        if pos.get("entry_pending"):
+            return
+
         quote = await self.adapter.get_quote(target_symbol, month_slot=pos.get("month_slot", 0))
         sign = 1 if pos["direction"] == "BUY" else -1
         favorable_move = sign * (quote - pos["entry_price"])

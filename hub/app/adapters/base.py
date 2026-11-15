@@ -92,6 +92,22 @@ class OrderRequest:
 
 
 @dataclass
+class WorkingOrder:
+    """An order live at the broker with nothing filled against it yet.
+
+    `order_ref` is the join that matters: it is the string WE chose, so a
+    registry row can be matched to a working order without trusting the
+    broker to hand back an id we can recognise. Same reference the Flex
+    reconciliation keys on.
+    """
+
+    order_ref: Optional[str]
+    symbol: str
+    broker_order_id: Optional[str] = None
+    status: str = ""
+
+
+@dataclass
 class OrderResult:
     slave_ticket: int
     price: Optional[float] = None
@@ -318,3 +334,24 @@ class BrokerAdapter(abc.ABC):
 
     @abc.abstractmethod
     async def get_open_positions(self, account_type: str) -> List[Position]: ...
+
+    async def get_working_orders(self) -> List["WorkingOrder"]:
+        """Orders live at the broker that have not filled.
+
+        A third state, and the one reconciliation had no way to see. It
+        compared registry rows against POSITIONS, so a resting limit
+        answered "no position" and the row was marked CLOSED -- while the
+        order was still working. It then filled into a position nothing
+        was tracking.
+
+        That window used to be 15 minutes, the adapter's abandon timer. A
+        route carrying `tif: GTC` and a 26-hour wait, which is what an
+        evening ETF entry needs, makes it a day.
+
+        NotImplementedError by default: only a broker that can answer this
+        should, and reconciliation degrades to its old behaviour for the
+        rest rather than guessing.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot report working orders"
+        )

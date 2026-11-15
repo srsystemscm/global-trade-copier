@@ -14,6 +14,7 @@ from app.adapters.base import (
     OrderRequest,
     OrderResult,
     Position,
+    WorkingOrder,
 )
 from app.atr import Bar
 from app.contract_specs import get_contract_spec
@@ -1332,6 +1333,48 @@ class IBKRAdapter(BrokerAdapter):
             expiry=contract.lastTradeDateOrContractMonth,
             multiplier=multiplier,
         )
+
+    async def get_working_orders(self) -> List[WorkingOrder]:
+        """Entries still resting at IB, by the reference we stamped.
+
+        Deliberately entries only. A protective stop or target is also a
+        working order, and counting those would make every open position
+        look like it had an unfilled entry -- so the two legs this adapter
+        places alongside an entry are filtered out by their own action
+        being opposite to the entry's. Simpler and more robust: the
+        protective legs are placed as STP/LMT children, and only the
+        PARENT carries no parentId.
+
+        Reads the session's own view rather than asking IB again: ib_async
+        keeps openTrades() current from the order stream, and a fresh
+        reqAllOpenOrders on a reconnect that has not settled returns
+        nothing, which would read as "no working orders" -- the exact
+        wrong answer here.
+        """
+        ib = self._require_ib()
+        out: List[WorkingOrder] = []
+        for trade in ib.openTrades():
+            order = getattr(trade, "order", None)
+            status = getattr(getattr(trade, "orderStatus", None), "status", "") or ""
+            if order is None:
+                continue
+            # Anything terminal is not working, whatever the list says.
+            if status in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
+                continue
+            # A child leg (stop/target) hangs off a parent; an entry does
+            # not. Without this every protected position reports a working
+            # entry it does not have.
+            if getattr(order, "parentId", 0):
+                continue
+            contract = getattr(trade, "contract", None)
+            out.append(WorkingOrder(
+                order_ref=(getattr(order, "orderRef", "") or None),
+                symbol=(getattr(contract, "localSymbol", "")
+                        or getattr(contract, "symbol", "") or ""),
+                broker_order_id=(str(getattr(order, "permId", "") or "") or None),
+                status=status,
+            ))
+        return out
 
     async def restore_position(self, slave_ticket: int, state: dict) -> None:
         contract_id = state.get("contract_id")
