@@ -330,6 +330,40 @@ async def _positions_within(engine, account_types):
     return task.result()
 
 
+def describe_mode(config: Dict[str, Any]) -> str:
+    """What this slave actually does with a signal, in words.
+
+    The raw value is "mirror" or "autonomous" and both have stopped being
+    true descriptions of anything. "mirror" is read as "copies the master's
+    lots", and that is what it meant when a mirror slave had no sizing of
+    its own. Two of the four live slaves are mode=mirror with a pct_risk
+    block: they size from their own capital through the same compute_size
+    the autonomous engines use, and mirror nothing but the stop LEVEL. A
+    word on screen that means the opposite of what it says is worse than no
+    word, because somebody sizes a position against it.
+
+    What the mode genuinely decides is two things, so say those:
+
+      where the stop comes from   the master's level, or this slave's ATR
+      what gets traded            the same symbol, or a routed instrument
+
+    Returned from here rather than built in the UI so the dashboard, the
+    slave cards and the ops hub cannot drift into three different answers.
+    """
+    mode = (config or {}).get("mode", "mirror")
+    routes = (config or {}).get("routes") or []
+
+    if mode == "autonomous":
+        stop = "own stops from ATR"
+        where = f"{len(routes)} routed instrument{'' if len(routes) == 1 else 's'}" if routes else "routed"
+        return f"{stop}, {where}"
+
+    # Mirror. The stop is the master's either way; the size is the question.
+    if (config or {}).get("sizing"):
+        return "master's stops, own size"
+    return "master's stops and lots"
+
+
 async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
     engine = _find_engine(request, slave.id)
     mode = slave.config.get("mode", "mirror")
@@ -339,6 +373,14 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         "name": slave.name,
         "broker_type": slave.broker_type,
         "mode": mode,
+        # The raw value stays -- the hub reporter sends it, and the ATR and
+        # contract-roll sections key off it. This is the line for a reader.
+        "mode_label": describe_mode(slave.config),
+        # It is fixed when the engine starts, because changing it swaps
+        # CopyEngine for AutonomousCopyEngine. Said here so no screen has to
+        # offer a control that would save cleanly and change nothing until a
+        # restart, under positions the other engine does not know about.
+        "mode_editable": False,
         "enabled": slave.enabled,
         "paused": engine.paused if engine is not None else slave.paused,
         "running": engine is not None,

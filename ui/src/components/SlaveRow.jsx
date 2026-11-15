@@ -28,7 +28,7 @@ export default function SlaveRow({ slave, onTogglePause, onRemove }) {
         <td>
           <div className="slave-name">{slave.name}</div>
           <div className="slave-meta">
-            {slave.broker_type} &middot; {slave.mode}
+            {slave.broker_type} &middot; {slave.mode_label || slave.mode}
           </div>
         </td>
         <td>

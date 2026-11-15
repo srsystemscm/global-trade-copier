@@ -97,6 +97,11 @@ function GeneralTab({ config, onChanged }) {
           )}
         </tbody>
       </table>
+      <p className="muted small">
+        How a slave copies is chosen when it is added and is fixed while it runs -- it selects
+        the engine, so changing it would swap one engine for another underneath positions the
+        new one knows nothing about. To change it, add the slave again with the other setting.
+      </p>
 
       <div className="form-grid" style={{ marginTop: 16, maxWidth: 360 }}>
         <label>
@@ -193,7 +198,7 @@ function SlavesTab({ status, onChanged }) {
           <tr>
             <th>Name</th>
             <th>Broker</th>
-            <th>Mode</th>
+            <th>How it copies</th>
             <th>Status</th>
             <th></th>
           </tr>
@@ -203,7 +208,7 @@ function SlavesTab({ status, onChanged }) {
             <tr key={s.id}>
               <td>{s.name}</td>
               <td>{s.broker_type}</td>
-              <td>{s.mode}</td>
+              <td>{s.mode_label || s.mode}</td>
               <td>{s.paused ? "paused" : s.running ? "running" : "stopped"}</td>
               <td>
                 <button className="btn btn-small" onClick={() => togglePause(s)}>
@@ -383,7 +388,7 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
           <span className="fold-caret">{open ? "\u25be" : "\u25b8"}</span>{" "}
           <strong>{slave.name}</strong>{" "}
           <span className="muted small">
-            {slave.broker_type} &middot; {slave.mode}
+            {slave.broker_type} &middot; {slave.mode_label || slave.mode}
           </span>
           {/* The one line worth seeing folded: what it stakes and what
               it stakes it against. */}
