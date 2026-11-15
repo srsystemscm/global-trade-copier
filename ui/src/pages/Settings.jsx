@@ -97,12 +97,6 @@ function GeneralTab({ config, onChanged }) {
           )}
         </tbody>
       </table>
-      <p className="muted small">
-        How a slave copies selects the engine, so switching it stops one and starts the other.
-        Only possible while the slave is flat: the incoming engine would otherwise adopt open
-        positions and protect them under rules they were never opened under -- mirror aims at
-        the master&apos;s own stop, autonomous trails its own from ATR.
-      </p>
 
       <div className="form-grid" style={{ marginTop: 16, maxWidth: 360 }}>
         <label>
@@ -225,6 +219,12 @@ function SlavesTab({ status, onChanged }) {
           ))}
         </tbody>
       </table>
+      <p className="muted small">
+        How a slave copies selects the engine, so switching it stops one and starts the other.
+        Only possible while the slave is flat: the incoming engine would otherwise adopt open
+        positions and protect them under rules they were never opened under -- mirror aims at
+        the master&apos;s own stop, autonomous trails its own from ATR.
+      </p>
 
       {wizardOpen && (
         <ConnectionWizard
@@ -390,9 +390,7 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
         <div>
           <span className="fold-caret">{open ? "\u25be" : "\u25b8"}</span>{" "}
           <strong>{slave.name}</strong>{" "}
-          <span className="muted small">
-            {slave.broker_type} &middot; {slave.mode_label || slave.mode}
-          </span>
+          <span className="muted small">{slave.broker_type}</span>
           {/* The one line worth seeing folded: what it stakes and what
               it stakes it against. */}
           <div className="slave-risk-sizing">
@@ -414,6 +412,20 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
 
       {!open ? null : (
       <>
+
+      {/* The mode was PRINTED in the head above and changeable only from the
+          Slaves tab, which is a different screen. Chris switched a slave to
+          mirror while testing and found no way back, because this is the
+          card the work happens on. Shown where it is read. */}
+      <div className="slave-risk-row">
+        <div>
+          <span className="muted small">How it copies</span>
+          <div className="slave-risk-sizing">
+            {slave.mode_label || slave.mode}
+          </div>
+        </div>
+        <ModeCell slave={slave} onChanged={onSaved} compact />
+      </div>
 
       <div className="slave-risk-flags">
         {slave.netting?.allow_opposing && (
@@ -606,7 +618,7 @@ function RouteTable({ routes }) {
   );
 }
 
-function ModeCell({ slave, onChanged }) {
+function ModeCell({ slave, onChanged, compact }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const raw = slave.mode === "autonomous" ? "autonomous" : "mirror";
@@ -632,7 +644,7 @@ function ModeCell({ slave, onChanged }) {
 
   return (
     <div className="mode-cell">
-      <div>{slave.mode_label || slave.mode}</div>
+      {!compact && <div>{slave.mode_label || slave.mode}</div>}
       <select
         value={raw}
         disabled={busy || slave.mode_editable === false}
@@ -663,6 +675,13 @@ function describeHeadline(slave) {
   // actually staked. Saying it invites someone to go looking for a field
   // that is not there.
   const sizing = slave.sizing_summary || "";
+  // "10 routes, all mirrors the master's lots" is what ibkr-paper-1 read
+  // after its sizing block was deleted -- true of the config and alarming
+  // to find on a futures slave, which is exactly when it needs saying
+  // loudly rather than as a tally.
+  if (/mirrors the master's lots/.test(sizing)) {
+    return "NO RISK SIZING -- sends the master's lot count unchanged";
+  }
   if (!/\d+\.\d+% of/.test(sizing)) return sizing;   // routes, lots, etc.
 
   const scale = slave.risk_scale ?? 1;
@@ -1634,13 +1653,26 @@ function SlaveRiskForm({ slave, onDone }) {
     <div className="slave-risk-form">
       {err && <div className="banner banner-error">{err}</div>}
 
+      {/* "Mirror the master's lots" was read as the ENGINE mode, because
+          the card said "autonomous"/"mirror" above it with no control. It
+          is a different axis -- HOW MUCH, not which engine -- and picking
+          it deletes the sizing block. So the word "mirror" is gone from
+          here, and the consequence is stated rather than implied. */}
       <label>
-        Sizing
+        How much
         <select value={form.mode} onChange={(e) => setForm({ ...form, mode: e.target.value })}>
-          <option value="mirror_lots">Mirror the master&apos;s lots</option>
           <option value="pct_risk">Risk what the master risked</option>
+          <option value="mirror_lots">Copy the master&apos;s lot count as-is</option>
         </select>
       </label>
+      {form.mode === "mirror_lots" && (
+        <p className="muted small">
+          <strong>This is not the engine mode.</strong> It removes this slave&apos;s risk
+          sizing: the master&apos;s lot count is sent to the broker unchanged, so a CFD lot
+          becomes that many futures contracts or shares. Use <em>How it copies</em> above to
+          change engines.
+        </p>
+      )}
 
       {form.mode === "pct_risk" && (
         <>

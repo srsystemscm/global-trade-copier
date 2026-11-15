@@ -320,7 +320,38 @@ class MT4Adapter(BrokerAdapter):
     async def get_quote(
         self, symbol: str, month_slot: int = 0, contract_id: Optional[int] = None
     ) -> float:
-        raise NotImplementedError("MT4Adapter (mirror mode) does not support quotes")
+        """The current mid, from the SYMBOLS reply the EA already sends.
+
+        This used to raise NotImplementedError and read "mirror mode does
+        not support quotes", which was true of the adapter and not of the
+        bridge: SYMBOLS has carried `bid` and `ask` since SlaveBridge 1.03,
+        for sizing. Nothing was missing but the wiring.
+
+        The MID rather than the side being traded. A quote here is the level
+        the stop distance is measured FROM, so using ask for a BUY and bid
+        for a SELL would make the same stop a different distance depending
+        on direction -- the spread, counted as risk on one side and not the
+        other. The adapter's own fills still cross the spread; this is the
+        reference, not the execution.
+
+        month_slot and contract_id are accepted and ignored: an MT server
+        quotes one symbol per name, and a futures CFD's roll is the broker's
+        business rather than ours.
+        """
+        spec = await self.get_symbol_spec(symbol)
+        if spec.bid > 0 and spec.ask > 0:
+            return (spec.bid + spec.ask) / 2.0
+        # One side present is still a price. A symbol quoting neither is not
+        # tradeable right now, and saying so beats returning 0.0 -- which
+        # would size a position against a stop distance of the entire price.
+        one = spec.bid or spec.ask
+        if one > 0:
+            return float(one)
+        raise AdapterError(
+            f"no quote for {symbol} on this slave's server -- the symbol is "
+            f"carried but neither side is quoting, so nothing can be priced "
+            f"against it"
+        )
 
     async def get_open_positions(self, account_type: Optional[str] = None) -> List[Position]:
         """Open market positions on the slave account, via the EA's POSITIONS
