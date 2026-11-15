@@ -46,7 +46,10 @@ export default function SlaveRow({ slave, onTogglePause, onRemove }) {
             <>
               {scale !== 1 && <span>x{scale}</span>}
               {byMagic > 0 && (
-                <span className="badge" title="Strategies with their own scale on this slave">
+                <span
+                  className="badge"
+                  title="Strategies with their own figure, which multiplies this slave's intake calibration"
+                >
                   {byMagic} per-EA
                 </span>
               )}

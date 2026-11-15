@@ -368,6 +368,8 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
     }
   });
   const [editing, setEditing] = useState(false);
+  const [editingScale, setEditingScale] = useState(false);
+  const [editingBasis, setEditingBasis] = useState(false);
   const [editingMagic, setEditingMagic] = useState(false);
   const [editingMasters, setEditingMasters] = useState(false);
   const [editingRoll, setEditingRoll] = useState(false);
@@ -427,6 +429,62 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
         <ModeCell slave={slave} onChanged={onSaved} compact />
       </div>
 
+      {/* The folded headline reads "risk scale x1.00 of what the master
+          staked" and there was NOWHERE on this card to change it. The only
+          field for it sat inside Strategy selection, labelled "All
+          strategies on this slave", and only appeared once a selection mode
+          other than Accept none was chosen -- so the number the card leads
+          with had no visible control at all. Chris, twice: "there is no
+          field to adjust the slave level risk scale. there is text claiming
+          whats staked, but no adjustment field still."
+
+          Shown unconditionally, INCLUDING for a route-sized slave. Risk
+          scale is read off the slave config even when every route carries
+          its own sizing -- resolve_risk_scale() takes slave_config -- so
+          "sizing is per route, nothing to edit here" was never true of
+          this one value. ibkr-etf-1 is exactly that slave. */}
+      <div className="slave-risk-row">
+        <div>
+          <span className="muted small">Risk calibration</span>
+          <div className="slave-risk-sizing">{describeScale(slave)}</div>
+        </div>
+        <button className="btn btn-small" onClick={() => setEditingScale((v) => !v)}>
+          {editingScale ? "Cancel" : "Edit"}
+        </button>
+      </div>
+      {editingScale && (
+        <RiskScaleForm
+          slave={slave}
+          onDone={() => { setEditingScale(false); onSaved && onSaved(); }}
+        />
+      )}
+
+      {/* THE SAME DEFECT, found by generalising the test rather than by
+          anyone hitting it: RiskBasisForm was written in full and never
+          mounted either, while describeBasis() has been printing
+          "+100,000 adjustment, never below 250,000" in the head all along.
+          Text claiming a number, no field for it -- which is the complaint
+          that started this, one row up.
+
+          It edits balance_adjustment and min_risk_capital, and both change
+          every size this slave calculates, so being settable only by a
+          PATCH against the API was not a small gap. */}
+      <div className="slave-risk-row">
+        <div>
+          <span className="muted small">Capital basis</span>
+          <div className="slave-risk-sizing">{describeBasis(slave)}</div>
+        </div>
+        <button className="btn btn-small" onClick={() => setEditingBasis((v) => !v)}>
+          {editingBasis ? "Cancel" : "Edit"}
+        </button>
+      </div>
+      {editingBasis && (
+        <RiskBasisForm
+          slave={slave}
+          onDone={() => { setEditingBasis(false); onSaved && onSaved(); }}
+        />
+      )}
+
       <div className="slave-risk-flags">
         {/* The refusal ceiling sits with the other limits, not in the
             sizing line. It is not how much this slave stakes -- it is the
@@ -461,8 +519,10 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
 
       {slave.sizing_per_route && (
         <p className="muted small">
-          Sizing is set on each of those individually, not on the slave as a whole, so there is
-          nothing to edit here -- a slave-level value would save cleanly and never be read.
+          Risk <em>sizing</em> is set on each route individually, not on the slave as a whole, so
+          there is no sizing block to edit here -- a slave-level one would save cleanly and never
+          be read. Risk <em>scale</em> above is the exception: it is read off the slave whether or
+          not the routes size themselves.
         </p>
       )}
 
@@ -640,11 +700,13 @@ function ModeCell({ slave, onChanged, compact }) {
     setBusy(true);
     setErr(null);
     try {
-      // Only the mode travels. Sending the whole config back would make a
-      // read-modify-write out of what is meant to be one decision, and
-      // anything edited elsewhere since this page loaded would be undone.
-      const full = await api.getSlave(slave.id);
-      await api.patchSlave(slave.id, { config: { ...full.config, mode: next } });
+      // Only the mode travels. Sending back a config this component had
+      // been holding would make a read-modify-write out of what is meant
+      // to be one decision, and anything edited elsewhere since the page
+      // loaded would be undone. ModeCell always read fresh here -- the
+      // other six forms did not, which is what this now matches.
+      const config = await currentConfig(slave.id);
+      await api.patchSlave(slave.id, { config: { ...config, mode: next } });
       onChanged && onChanged();
     } catch (e) {
       setErr(e.message);
@@ -710,9 +772,16 @@ function describeHeadline(slave) {
   const byMagic = Object.keys(slave.risk_scale_by_magic || {}).length;
   const base = sizing.includes("equity") ? "equity" : "balance";
 
-  let head = `risk scale x${Number(scale).toFixed(2)}`;
+  // "Risk calibration", Chris's term and the right one: this is not
+  // a size, it is the ratio between what the EA signalled and what
+  // this slave takes of it.
+  let head = `risk calibration x${Number(scale).toFixed(2)}`;
   head += ` of what the master staked, against this ${base}`;
   if (byMagic) {
+    // "override" is the right word for the screen even though the
+    // dials multiply: what the reader needs to know from the folded
+    // line is that some strategies are not on the headline figure.
+    // The product itself is spelled out on the Risk calibration row.
     head += ` \u00b7 ${byMagic} strategy override${byMagic === 1 ? "" : "s"}`;
   }
   return head;
@@ -768,7 +837,7 @@ function RiskBasisForm({ slave, onDone }) {
     setBusy(true);
     setErr(null);
     try {
-      const config = { ...full.config };
+      const config = await currentConfig(slave.id);
 
       const adj = adjustment.trim();
       if (adj === "" || Number(adj) === 0) delete config.balance_adjustment;
@@ -854,17 +923,48 @@ function RiskBasisForm({ slave, onDone }) {
   );
 }
 
+/**
+ * The slave's CURRENT config, re-read at the moment of saving.
+ *
+ * Every form here PATCHes the whole config, and PATCH /slaves/{id}
+ * replaces rather than merges -- so a form saving the snapshot it loaded
+ * on open silently restores every value changed since. That is not
+ * hypothetical: risk_scale 0.50 was set on ibkr-paper-1 and wiped twice
+ * in twenty minutes by exactly this, from forms that had been open the
+ * whole time.
+ *
+ * Re-reading shrinks the window from "as long as the form was open" to
+ * one round trip. It is not real concurrency control -- two saves inside
+ * that window still lose one -- and the proper fix is for each form to
+ * send only the keys it owns against a merging endpoint.
+ */
+async function currentConfig(slaveId) {
+  const got = await api.getSlave(slaveId);
+  return { ...got.config };
+}
+
 function describeScale(slave) {
   const byMagic = slave.risk_scale_by_magic || {};
   const entries = Object.entries(byMagic);
   const base = slave.risk_scale ?? 1;
+  // The dials MULTIPLY: intake x strategy. So the per-strategy figures
+  // are shown with the product they actually produce -- "2002 x0.50 (=
+  // x0.25)" -- because that product is the number being asked about, and
+  // multiplying two decimals in your head is how a position comes out
+  // four times the size intended.
   const baseText =
-    base === 1 ? "every strategy at full target risk" : `all strategies x${base}`;
+    base === 1
+      ? "every signal taken in full"
+      : `x${Number(base).toFixed(2)} of signal at intake`;
   if (entries.length === 0) return baseText;
   const listed = entries
-    .map(([magic, scale]) => `${magic} x${scale}`)
+    .map(([magic, scale]) => {
+      const each = `${magic} x${Number(scale).toFixed(2)}`;
+      const net = Number(base) * Number(scale);
+      return base === 1 ? each : `${each} (= x${net.toFixed(2)})`;
+    })
     .join(", ");
-  return `${baseText}; ${listed}`;
+  return `${baseText}; then ${listed}`;
 }
 
 function RiskScaleForm({ slave, onDone }) {
@@ -916,7 +1016,7 @@ function RiskScaleForm({ slave, onDone }) {
         table[magic] = scale;
       }
 
-      const config = { ...full.config };
+      const config = await currentConfig(slave.id);
       if (Number(base) === 1) delete config.risk_scale;
       else config.risk_scale = Number(base);
       if (Object.keys(table).length === 0) delete config.risk_scale_by_magic;
@@ -938,8 +1038,16 @@ function RiskScaleForm({ slave, onDone }) {
     <div className="slave-risk-form with-notes">
       {err && <div className="banner banner-error">{err}</div>}
 
+      {/* The number the folded headline reads out, labelled in the same
+          words so the line and its control are recognisably one thing.
+
+          This is the INTAKE figure: how much of any incoming signal this
+          venue takes, which is a property of the venue's leverage rather
+          than of any strategy. The per-strategy figures below multiply
+          it, so this one applies to every signal whether or not the
+          strategy has a row of its own. */}
       <label>
-        All strategies on this slave
+        Risk calibration &mdash; this slave takes this much of every signal &times;
         <input
           type="number"
           step="0.05"
@@ -955,7 +1063,7 @@ function RiskScaleForm({ slave, onDone }) {
       <div className="scale-rows">
         <div className="scale-head">
           <span>Strategy (magic)</span>
-          <span>Risk scale</span>
+          <span>&times; on top of intake</span>
           <span />
         </div>
         {rows.map((r, i) => (
@@ -996,7 +1104,16 @@ function RiskScaleForm({ slave, onDone }) {
           than the CFD account it was sized for. <strong>0</strong> means do not trade this
           strategy here at all.
         </p>
-        <p>A route with its own scale wins over this table; this table wins over the slave-wide value.</p>
+        <p>
+          A strategy listed here <strong>multiplies</strong> the intake figure above &mdash; it
+          does not replace it. An EA signalling 2% of balance, into a slave calibrated 0.50, with
+          this strategy at 0.50, trades <strong>0.5% &mdash; a quarter of the original signal</strong>.
+        </p>
+        <p>
+          <strong>1.00 means no further adjustment</strong>, which is what most strategies want:
+          they simply inherit the slave's intake figure. It does not mean full size.
+        </p>
+        <p>A route with its own figure multiplies in turn, on top of both.</p>
       </aside>
 
       <div className="slave-actions">
@@ -1058,7 +1175,7 @@ function MasterFilterForm({ slave, knownAccounts, onDone }) {
         );
       }
 
-      const config = { ...full.config };
+      const config = await currentConfig(slave.id);
       if (allow.length === 0 && deny.length === 0) {
         delete config.master_filter;
       } else {
@@ -1105,7 +1222,7 @@ function MasterFilterForm({ slave, knownAccounts, onDone }) {
         Magic numbers are per master and WILL collide: every fxDreema project numbers its
         strategies from 1001, so two masters each running their first EA both stamp 1001. A
         slave that follows both cannot tell them apart -- an accepted magic takes both, and a
-        per-strategy risk scale resizes both. Naming the masters is what makes the strategy
+        per-strategy calibration resizes both. Naming the masters is what makes the strategy
         list mean something.
       </p>
       <div className="slave-actions">
@@ -1149,12 +1266,15 @@ function AccountList({ label, hint, values, onChange }) {
 function describeSelection(slave) {
   const mf = slave.magic_filter;
   const scales = slave.risk_scale_by_magic || {};
-  const base = slave.risk_scale ?? 1;
 
   if (mf && mf.accept === "none") return "no strategies -- nothing is copied";
   if (!mf || (mf.allow == null && !(mf.deny || []).length)) {
-    const all = base === 1 ? "every strategy, full size" : `every strategy x${base}`;
-    return all;
+    // WHICH strategies, not how much they stake. This read "every
+    // strategy x0.5", echoing the slave's intake calibration into a row
+    // about selection -- two rows showing one number, with this one
+    // implying the selection screen is where it is set. It is not; the
+    // Risk calibration row above owns it.
+    return "every strategy";
   }
   const allow = mf.allow || [];
   if (!allow.length) return "every strategy except those denied";
@@ -1170,7 +1290,6 @@ function StrategyForm({ slave, onDone }) {
   const [full, setFull] = useState(null);
   const [mode, setMode] = useState("none");
   const [rows, setRows] = useState([]);
-  const [base, setBase] = useState(1);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
 
@@ -1181,7 +1300,6 @@ function StrategyForm({ slave, onDone }) {
         setFull(got);
         const mf = got.config.magic_filter;
         const scales = got.config.risk_scale_by_magic || {};
-        setBase(got.config.risk_scale ?? 1);
 
         let listed = [];
         let m = "none";
@@ -1211,7 +1329,7 @@ function StrategyForm({ slave, onDone }) {
     setBusy(true);
     setErr(null);
     try {
-      const config = { ...full.config };
+      const config = await currentConfig(slave.id);
 
       if (mode === "all") {
         delete config.magic_filter;
@@ -1242,8 +1360,11 @@ function StrategyForm({ slave, onDone }) {
         else delete config.risk_scale_by_magic;
       }
 
-      if (Number(base) === 1) delete config.risk_scale;
-      else config.risk_scale = Number(base);
+      // risk_scale is deliberately NOT written here any more. This form
+      // patches the whole config from the snapshot it loaded on open, so
+      // while it also owned the slave-wide scale, saving a strategy
+      // selection could quietly put back a scale changed on the Risk scale
+      // row in the meantime.
 
       await api.patchSlave(slave.id, { config });
       onDone();
@@ -1283,7 +1404,7 @@ function StrategyForm({ slave, onDone }) {
         <div className="scale-rows">
           <div className="scale-head">
             <span>Strategy (magic)</span>
-            <span>Risk scale</span>
+            <span>Calibration</span>
             <span />
           </div>
           {rows.map((r, i) => (
@@ -1317,18 +1438,20 @@ function StrategyForm({ slave, onDone }) {
         </div>
       )}
 
-      {mode !== "none" && (
-        <label>
-          All strategies on this slave x
-          <input
-            type="number"
-            step="0.05"
-            min="0"
-            value={base}
-            onChange={(e) => setBase(e.target.value)}
-          />
-        </label>
-      )}
+      {/* The slave-wide scale USED TO BE EDITED HERE, and it was the only
+          place it could be. That is how it came to be invisible: the card
+          leads with "risk scale x1.00" and the field for it was two
+          sections down, inside a form about which strategies are accepted,
+          and hidden entirely while the mode was Accept none.
+
+          It now lives on the Risk scale row, where the text is. Two
+          editors of one JSON key is also a clobbering hazard -- each
+          patches the whole config from its own snapshot -- so this one is
+          gone rather than duplicated. */}
+      <p className="muted small">
+        The default, and per-strategy figures that replace it, are on the{" "}
+        <strong>Risk calibration</strong> row above.
+      </p>
 
       <aside className="side-note">
         <p>
@@ -1336,7 +1459,8 @@ function StrategyForm({ slave, onDone }) {
           should not port all of them here the moment it connects. Opt each one in.
         </p>
         <p>
-          <strong>Risk scale</strong> is how much of what the master staked this slave takes.
+          <strong>Risk calibration</strong> is how much of what the master staked this slave
+          takes, and the figure here multiplies it rather than replacing it.
           1.0 is all of it; the same share on a futures or ETF leg is usually too much, with far
           less leverage than the CFD account it was sized for. <strong>0</strong> means do not
           trade that strategy here.
@@ -1353,138 +1477,8 @@ function StrategyForm({ slave, onDone }) {
   );
 }
 
-function MagicList({ label, hint, values, onChange }) {
-  return (
-    <div className="magic-list">
-      <span className="muted small">
-        {label} <span className="muted small">-- {hint}</span>
-      </span>
-      {values.map((v, i) => (
-        <div className="magic-row" key={i}>
-          <input
-            value={v}
-            placeholder="1001"
-            onChange={(e) => onChange(values.map((x, j) => (i === j ? e.target.value : x)))}
-          />
-          <button
-            className="btn btn-small btn-danger"
-            onClick={() => onChange(values.filter((_, j) => j !== i))}
-          >
-            Remove
-          </button>
-        </div>
-      ))}
-      <button className="btn btn-small" onClick={() => onChange([...values, ""])}>
-        + Add magic
-      </button>
-    </div>
-  );
-}
-
-function MagicFilterForm({ slave, onDone }) {
-  const [full, setFull] = useState(null);
-  // One magic number per field. A comma-separated box reads fine until a
-  // stray character turns the whole list into one unparseable string, and
-  // an allow-list that fails to parse is a slave that stops trading.
-  const [allowRows, setAllowRows] = useState([]);
-  const [denyRows, setDenyRows] = useState([]);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState(null);
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const got = await api.getSlave(slave.id);
-        const mf = got.config.magic_filter;
-        setFull(got);
-        if (Array.isArray(mf)) setAllowRows(mf.map(String));
-        else if (mf && typeof mf === "object") {
-          setAllowRows((mf.allow || []).map(String));
-          setDenyRows((mf.deny || []).map(String));
-        }
-      } catch (e) {
-        setErr(e.message);
-      }
-    })();
-  }, [slave.id]);
-
-  function parseRows(rows, where) {
-    const out = [];
-    for (const raw of rows) {
-      const t = String(raw).trim();
-      if (!t) continue;
-      if (!/^\d+$/.test(t)) throw new Error(`"${t}" in ${where} is not a magic number`);
-      const n = Number(t);
-      if (out.includes(n)) throw new Error(`magic ${n} is listed twice in ${where}`);
-      out.push(n);
-    }
-    return out;
-  }
-
-  async function save() {
-    setBusy(true);
-    setErr(null);
-    try {
-      const allowList = parseRows(allowRows, "the accept list");
-      const denyList = parseRows(denyRows, "the never-accept list");
-      const clash = allowList.filter((n) => denyList.includes(n));
-      if (clash.length) {
-        throw new Error(
-          `magic ${clash.join(", ")} is in both lists -- deny wins, so it would never trade`,
-        );
-      }
-      const config = { ...full.config };
-      if (allowList.length === 0 && denyList.length === 0) {
-        delete config.magic_filter;
-      } else {
-        const next = {};
-        // An EMPTY allow-list is not the same as no allow-list: it would
-        // stop every signal. Only send the key when it has members.
-        if (allowList.length) next.allow = allowList;
-        if (denyList.length) next.deny = denyList;
-        config.magic_filter = next;
-      }
-      await api.patchSlave(slave.id, { config });
-      onDone();
-    } catch (e) {
-      setErr(e.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  if (err && !full) return <div className="banner banner-error">{err}</div>;
-  if (!full) return <p className="muted small">Loading...</p>;
-
-  return (
-    <div className="slave-risk-form">
-      {err && <div className="banner banner-error">{err}</div>}
-      <MagicList
-        label="Accept only these"
-        hint="none listed = accept every strategy"
-        values={allowRows}
-        onChange={setAllowRows}
-      />
-      <MagicList
-        label="Never accept these"
-        hint="applied after the list above"
-        values={denyRows}
-        onChange={setDenyRows}
-      />
-      <p className="muted small">
-        One master terminal can run many EAs, each stamping its own magic number. This decides
-        which of them this slave copies. Leaving both blank accepts every signal -- which is what
-        every slave does today.
-      </p>
-      <div className="slave-actions">
-        <button className="btn btn-small" onClick={save} disabled={busy}>
-          {busy ? "Saving..." : "Save"}
-        </button>
-      </div>
-    </div>
-  );
-}
-
+/* MagicList went with MagicFilterForm, its only caller. AccountList
+   below is the one MasterFilterForm still uses. */
 function ContractRollForm({ slave, onDone }) {
   const [full, setFull] = useState(null);
   const [form, setForm] = useState(null);
@@ -1512,7 +1506,7 @@ function ContractRollForm({ slave, onDone }) {
     setBusy(true);
     setErr(null);
     try {
-      const config = { ...full.config };
+      const config = await currentConfig(slave.id);
       config.contract_roll = {
         ...(config.contract_roll || {}),
         enabled: !!form.enabled,
@@ -1619,7 +1613,7 @@ function SlaveRiskForm({ slave, onDone }) {
       // Read-modify-write, deliberately. PATCH replaces config_json whole,
       // so routes, mirror_map, host and ports have to travel back
       // untouched or they are deleted by omission.
-      const config = { ...full.config };
+      const config = await currentConfig(slave.id);
 
       if (form.mode === "mirror_lots") {
         delete config.sizing;
