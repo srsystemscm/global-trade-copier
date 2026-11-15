@@ -627,7 +627,26 @@ def test_the_reference_identifies_a_protective_fill_as_ours():
     assert summary.clean is True
 
 
-def test_an_execution_with_no_reference_of_ours_is_untracked_and_believed():
+def test_an_execution_with_no_reference_of_ours_is_reported_but_not_alerted():
+    """CHANGED 2026-11-15, and the original belief was wrong.
+
+    This test used to assert `clean is False` -- that once a statement
+    carried references at all, an execution without one was worth
+    raising. The first real statement with references disproved it: 33
+    orders matched, and all 142 unmatched ones carried no reference and
+    were dated before stamping began. A 30-day statement spans the era
+    before the copier stamped anything, so that rule alerts every day for
+    a month, and an alert that is wrong every day is one nobody reads.
+
+    The copier stamps every order it places. One without a stamp either
+    predates the stamping or was not placed by this copier -- neither is
+    drift. It is still REPORTED; it just cannot raise the alarm.
+
+    What this gives up: a position opened by hand at the broker no longer
+    makes a Flex pass unclean. That is covered -- startup reconciliation
+    reports broker positions with no registry row separately, which is
+    where the live GC_Z and MBT_X legs show up.
+    """
     slave = ibkr_slave()
     registry_row(slave, 900001, price=4040.7, lots=1.0, order_ref=REF)
 
@@ -638,9 +657,10 @@ def test_an_execution_with_no_reference_of_ours_is_untracked_and_believed():
     summary = compare(parse_statement(someone_else))
 
     assert summary.matched == 1
-    assert [u["ib_order_id"] for u in summary.untracked] == ["555555"]
-    assert summary.untracked_reliable is True, "the statement carries refs"
-    assert summary.clean is False, "and now it is worth raising"
+    untracked = {u["ib_order_id"]: u for u in summary.untracked}
+    assert "555555" in untracked, "still reported"
+    assert untracked["555555"]["ours"] is False
+    assert summary.clean is True, "reported, not alerted"
 
 
 def test_a_statement_with_no_references_at_all_is_not_believed():
@@ -672,3 +692,38 @@ def test_the_reference_says_which_master_trade_a_leg_came_from():
     assert ref == "gtc:11558127:999031902:M2K"
     assert ref.startswith("gtc:"), "marked as this copier's"
     assert len(ref) <= 40, "IBKR truncates an over-long orderRef silently"
+
+
+# ============== an unstamped order is history, not drift
+#
+# Measured against the first real statement that contained references
+# (2026-11-15, query 1709272): 33 orders matched on the copier's own
+# orderReference, 0 mismatched, and 142 unmatched -- every one of which
+# carried NO reference and was dated before stamping began.
+#
+# Judged per STATEMENT, `untracked_reliable` was true (some rows did carry
+# references) so all 142 counted, the pass was unclean, and it would have
+# alerted every day for a month. An alert that is wrong every day is one
+# nobody reads.
+#
+# The copier stamps every order it places. An execution with no stamp
+# either predates the stamping or was not placed by this copier, and
+# neither is drift.
+
+def test_our_own_order_with_no_registry_row_still_alerts():
+    """The case the alert exists for, and the one that must survive the
+    fix above: the copier stamped it, so it placed it -- and has no record
+    of it. That is real untracked volume."""
+    slave = ibkr_slave()
+    registry_row(slave, 900001, price=4040.7, lots=1.0, order_ref=REF)
+
+    orphan = order_ref("44964870", 999999999, "MGC")
+    drifted = statement(
+        execution("1", "exec-a", "900001", 1, 4040.7, order_ref=REF),
+        execution("7", "exec-y", "777777", 2, 3900.0, order_ref=orphan),
+    )
+    summary = compare(parse_statement(drifted))
+
+    untracked = {u["ib_order_id"]: u for u in summary.untracked}
+    assert untracked["777777"]["ours"] is True
+    assert summary.clean is False, "volume the copier placed and lost must alert"

@@ -20,7 +20,8 @@ from app.risk_controls import is_within_trading_hours
 from app.session_gate import SessionGateMixin
 from app.sizing import (
     resolve_balance_adjustment,
-    capital_base_amount, compute_size, merge_sizing, resolve_risk_scale,
+    apply_master_risk, capital_base_amount, compute_size, merge_sizing,
+    resolve_risk_scale,
     risk_figures,
     resolve_sizing_config,
 )
@@ -691,6 +692,15 @@ class AutonomousCopyEngine(SessionGateMixin):
             quote = await self.adapter.get_quote(
                 target_symbol, month_slot=route.month_slot)
         except AdapterError as exc:
+            # INFO, not debug. A market this slave cannot price is not
+            # routine: it is the difference between "declined to trade"
+            # and "could not", and somebody reading the log afterwards is
+            # usually asking exactly that.
+            logger.info(
+                "slave=%s no quote for %s (%s) -- cannot price the stop, "
+                "so this target cannot be sized",
+                self.slave_id, target_symbol, exc,
+            )
             return None, f"no quote ({exc})"
 
         traded_direction = route.target_direction or signal.direction
@@ -707,6 +717,11 @@ class AutonomousCopyEngine(SessionGateMixin):
 
         sizing_config = merge_sizing(
             resolve_sizing_config(self.slave_config, target_symbol), route.sizing)
+        # What the master actually staked, where the bridge says. Replaces
+        # the slave's own percentage rather than multiplying it: the slave
+        # copies this strategy's risk, scaled, and a second percentage of
+        # its own would be a number to keep in step with the EA by hand.
+        sizing_config = apply_master_risk(sizing_config, signal.master_risk_fraction)
         risk_scale = resolve_risk_scale(self.slave_config, route.risk_scale, signal.magic)
         sizing_result = compute_size(
             sizing_config=sizing_config,
@@ -944,13 +959,29 @@ class AutonomousCopyEngine(SessionGateMixin):
                 "; ".join("%s: %s" % r for r in rejected),
             )
             if refused:
-                # Still reported as a refusal: the signal was turned away by
-                # policy, not by arithmetic, and that is the thing worth
-                # seeing in the ledger.
+                # Turned away by POLICY. Kept as its own type because the
+                # hub classes it differently: a netting refusal is the
+                # system working as configured.
                 await self._emit(
                     "netting_refused", signal=signal,
                     slave_symbol=candidates[0], direction=signal.direction,
                     reason="; ".join(refused))
+            else:
+                # Turned away by CIRCUMSTANCE -- no quote, no history, a
+                # size that rounded to nothing. This used to emit nothing
+                # at all, so the hub saw a master order with no leg beside
+                # it and no reason anywhere: the tab could not tell "this
+                # slave declined" from "this slave was never asked".
+                #
+                # Observed on 2026-11-15: IBKR's usfuture data farm went
+                # inactive mid-session and every later ETH signal produced
+                # no IBKR leg and no explanation. The copier was behaving
+                # correctly and had no way to say so.
+                await self._emit(
+                    "signal_refused", signal=signal,
+                    slave_symbol=candidates[0] if candidates else None,
+                    reason="; ".join("%s: %s" % r for r in rejected)
+                           or "no route produced a tradeable plan")
             return
 
         if rejected:

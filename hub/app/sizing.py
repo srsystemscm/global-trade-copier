@@ -161,6 +161,40 @@ def risk_figures(
     return adjusted_balance, adjusted_equity, None
 
 
+def apply_master_risk(
+    sizing_config: Dict[str, Any], master_fraction: Optional[float]
+) -> Dict[str, Any]:
+    """Size from what the MASTER actually staked, where it said.
+
+    The origin EAs each risk a fixed share of the account they run on. A
+    slave that copies them should stake the same share of ITS account,
+    adjusted by whatever risk_scale says -- so the slave does not need a
+    percentage of its own, and the one it used to carry was a second
+    number that had to be kept in step with the EA by hand.
+
+    MEASURED, not declared. master_fraction comes from risk_amount /
+    balance in the signal, which is what the order really staked after a
+    lot size was rounded and a stop was pulled to the broker's minimum.
+    An EA changed without telling anyone changes this automatically.
+
+    Falls back to the configured risk_pct when the master cannot say --
+    a bridge older than 1.04, an order with no stop, a balance of zero.
+    The fallback matters: without it, a slave would silently stop sizing
+    the moment an old master connected, which is a worse failure than
+    using a number somebody typed.
+
+    Only touches pct_risk. The other modes do not express risk as a
+    fraction of anything, so there is nothing for a fraction to replace.
+    """
+    if master_fraction is None or master_fraction <= 0:
+        return sizing_config
+    if (sizing_config or {}).get("mode") != "pct_risk":
+        return sizing_config
+    out = dict(sizing_config)
+    out["risk_pct"] = float(master_fraction)
+    return out
+
+
 def resolve_risk_scale(
     slave_config: Dict[str, Any],
     route_scale: Optional[float] = None,

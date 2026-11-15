@@ -405,7 +405,8 @@ class Summary:
         """
         if self.mismatched:
             return False
-        return not (self.untracked and self.untracked_reliable)
+        alertable = [u for u in self.untracked if u.get("ours")]
+        return not (alertable and self.untracked_reliable)
 
     def as_detail(self) -> Dict[str, Any]:
         return {
@@ -477,7 +478,24 @@ def compare(statement: FlexStatement, stored: int = 0, already_had: int = 0) -> 
         if order_id in protective:
             summary.protective += 1
             continue
-        summary.untracked.append({**fill.as_dict(), "note": "no registry row"})
+        # An order carrying no reference of ours cannot be drift: the
+        # copier stamps every order it places, so one without a stamp
+        # either predates the stamping or was not placed by the copier at
+        # all. Reported, never alerted.
+        #
+        # Measured on the first statement that contained real references:
+        # 33 matched, and ALL 142 unmatched orders carried no reference,
+        # dated before stamping began. Judged per statement rather than
+        # per row, those 142 would have alerted every day for a month and
+        # taught everyone to ignore the alert.
+        stamped = bool((fill.order_ref or "").strip())
+        summary.untracked.append({
+            **fill.as_dict(),
+            "note": ("no registry row" if stamped
+                     else "no registry row, and no reference of ours -- "
+                          "older than the stamping, or not this copier's"),
+            "ours": stamped,
+        })
 
     return summary
 

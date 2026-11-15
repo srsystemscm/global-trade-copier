@@ -583,6 +583,10 @@ async def get_status(request: Request):
             "sub_port": settings.zmq_sub_port,
             "pull_port": settings.zmq_pull_port,
             "last_heartbeat_by_account": receiver.last_heartbeat,
+            # Which build each master is running, so nobody has to hash
+            # .ex4 files to find out. Absent for a master on a bridge
+            # older than 1.04.
+            "bridge_version_by_account": getattr(receiver, "bridge_version", {}),
         },
         "slaves": slaves,
     }

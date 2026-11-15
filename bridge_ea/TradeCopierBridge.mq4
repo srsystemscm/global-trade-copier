@@ -24,8 +24,13 @@
 //|   1.03 2026-11-11 CLOSE publishes the exit price, not the entry    |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.03"
-#define   BRIDGE_VERSION "1.03"
+#property version   "1.04"
+// MUST match #property version above. MQL has no way to read that from
+// code, so the two are kept in step by hand -- and they had already
+// drifted once: the property said 1.04 while this said 1.03, which would
+// have had every master reporting the wrong build through the very
+// handshake added to stop that happening.
+#define   BRIDGE_VERSION "1.04"
 
 #include <Zmq/Zmq.mqh>
 
@@ -212,18 +217,73 @@ void PublishSignal(string action, OrderSnapshot &o)
   {
    string direction = (o.type == OP_BUY) ? "BUY" : "SELL";
    double atr = iATR(o.symbol, AtrTimeframe, AtrPeriod, 0);
+
+   // What this order actually put at risk, and what it was risked against.
+   //
+   // MEASURED, not declared. The EA's own setting says it intends 2% of
+   // the account; this says what the order it sent really stakes if the
+   // stop is hit. The two differ whenever a lot size was rounded, a stop
+   // was pulled to the broker's minimum distance, or somebody changed the
+   // EA and forgot. A declared figure cannot notice any of that, and a
+   // slave sizing from one would be trusting a number nothing checks --
+   // the shape of mistake that made the Flex join match 0 of 109 rows.
+   //
+   // Only this EA can compute it: the tick value belongs to the MASTER's
+   // symbol on the MASTER's broker, and the copier never sees either.
+   string riskJson = RiskJson(o);
+
    string json = StringFormat(
       "{\"ticket\":%d,\"symbol\":\"%s\",\"action\":\"%s\",\"direction\":\"%s\"," +
       "\"lots\":%.2f,\"price\":%.5f,\"sl\":%.5f,\"tp\":%.5f,\"atr\":%.5f," +
-      "\"magic\":%d,\"comment\":\"%s\",\"account\":\"%d\",\"ts\":%.3f}",
+      "\"magic\":%d,\"comment\":\"%s\",\"account\":\"%d\",%s\"ts\":%.3f}",
       o.ticket, o.symbol, action, direction,
       o.lots, o.price, o.sl, o.tp, atr,
       o.magic, JsonEscape(o.comment),
-      AccountNumber(), (double)TimeGMT());
+      AccountNumber(), riskJson, (double)TimeGMT());
 
    ZmqMsg msg(json);
    pubSocket.send(msg);
    Print(action, " ticket=", o.ticket, " -> ", json);
+  }
+
+//+------------------------------------------------------------------+
+//| What the order stakes, and the account it stakes it against.       |
+//|                                                                    |
+//| Returns a JSON fragment ending in a comma, or an empty string when |
+//| nothing can be said. Three fields, deliberately raw:               |
+//|                                                                    |
+//|   risk_amount   money lost if the stop is hit, in deposit currency |
+//|   balance       AccountBalance() at the moment of the signal       |
+//|   equity        AccountEquity() likewise                           |
+//|                                                                    |
+//| The FRACTION is not sent. It is risk_amount / balance and the hub  |
+//| can divide; sending both the inputs and the result invites them to |
+//| disagree, and then nobody knows which to believe.                  |
+//|                                                                    |
+//| risk_amount is omitted entirely when the order has no stop. A      |
+//| position with no stop does not risk a known amount -- it risks     |
+//| everything -- and sending 0 would read as "risks nothing", which   |
+//| is the opposite. The hub treats an absent field as "not known".    |
+//+------------------------------------------------------------------+
+string RiskJson(OrderSnapshot &o)
+  {
+   string out = StringFormat("\"balance\":%.2f,\"equity\":%.2f,",
+                             AccountBalance(), AccountEquity());
+
+   if(o.sl <= 0.0)
+      return out;   // no stop: the amount at risk is not a number
+
+   double tickValue = MarketInfo(o.symbol, MODE_TICKVALUE);
+   double tickSize  = MarketInfo(o.symbol, MODE_TICKSIZE);
+   if(tickSize <= 0.0 || tickValue <= 0.0)
+      return out;   // the terminal cannot price this symbol's tick
+
+   double distance = MathAbs(o.price - o.sl);
+   if(distance <= 0.0)
+      return out;
+
+   double risk = (distance / tickSize) * tickValue * o.lots;
+   return out + StringFormat("\"risk_amount\":%.2f,", risk);
   }
 
 //+------------------------------------------------------------------+
@@ -253,7 +313,22 @@ string JsonEscape(string raw)
 //+------------------------------------------------------------------+
 void SendHeartbeat()
   {
-   string json = StringFormat("{\"account\":\"%d\",\"ts\":%.3f}", AccountNumber(), (double)TimeGMT());
+   // The build each master is running, said by the master itself.
+   //
+   // Without this, the only way to tell two builds apart is to hash the
+   // .ex4 files -- which is how an afternoon went: a bridge was deployed
+   // to the wrong terminal, a fix was believed to be live that was not,
+   // and three different binaries of one EA existed with nothing on any
+   // screen to say so. At four to eight masters that stops being an
+   // annoyance and becomes unanswerable.
+   //
+   // On the HEARTBEAT rather than the signal: it arrives every few
+   // seconds whether or not anything trades, so the hub knows the version
+   // of a master that has been quiet all session -- which is exactly the
+   // one somebody is asking about.
+   string json = StringFormat(
+      "{\"account\":\"%d\",\"bridge_version\":\"%s\",\"ts\":%.3f}",
+      AccountNumber(), BRIDGE_VERSION, (double)TimeGMT());
    ZmqMsg msg(json);
    pushSocket.send(msg);
   }

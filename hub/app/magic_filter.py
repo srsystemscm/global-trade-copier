@@ -91,6 +91,17 @@ class MagicFilter:
     # it was written to stop.
     allow: Optional[FrozenSet[int]] = None
     deny: FrozenSet[int] = frozenset()
+    # "this slave takes no strategy at all", said explicitly.
+    #
+    # Distinct from an empty allow-list, which stays a refused mistake:
+    # `{"allow": []}` is what a selection looks like when something went
+    # wrong building it, and failing open there would be the one
+    # direction this must not fail. Saying `accept: none` is a choice.
+    #
+    # It is how a slave starts when strategies are opted IN rather than
+    # out -- a master running every strategy should not port all of them
+    # to every slave the moment it connects.
+    accept_none: bool = False
     # Whatever an imported entry said each magic was, by magic number.
     # Never used to decide anything -- it exists so a log line and the
     # Operations hub's Copier tab can say "US2000 trend" instead of 1001.
@@ -101,7 +112,7 @@ class MagicFilter:
 
     @property
     def configured(self) -> bool:
-        return self.allow is not None or bool(self.deny)
+        return self.accept_none or self.allow is not None or bool(self.deny)
 
     def accepts(self, signal: Signal) -> Tuple[bool, Optional[str]]:
         """Whether this slave takes the signal, and if not, why not.
@@ -112,6 +123,12 @@ class MagicFilter:
         """
         if not self.configured:
             return True, None
+
+        if self.accept_none:
+            return False, (
+                "this slave accepts no strategies: add the magic numbers it "
+                "should take, or set it to accept all"
+            )
 
         magic = signal.magic
         if magic is None:
@@ -146,6 +163,8 @@ class MagicFilter:
         )
 
     def describe(self) -> str:
+        if self.accept_none:
+            return "no strategies"
         if not self.configured:
             return "every magic"
         parts = []
@@ -167,6 +186,7 @@ class MagicFilter:
         if not self.configured:
             return None
         out: Dict[str, Any] = {
+            "accept": "none" if self.accept_none else "listed",
             "allow": None if self.allow is None else sorted(self.allow),
             "deny": sorted(self.deny),
         }
@@ -237,6 +257,18 @@ def parse(slave_config: Optional[Dict[str, Any]]) -> MagicFilter:
 
     labels: Dict[int, str] = {}
     if isinstance(raw, dict):
+        accept = raw.get("accept")
+        if accept not in (None, "all", "none", "listed"):
+            raise ValueError(
+                f"{KEY}.accept is {accept!r}; it takes 'all', 'none' or "
+                f"'listed'"
+            )
+        if accept == "all":
+            return ALL
+        if accept == "none":
+            # Deliberate, so an empty allow-list stays a refused mistake.
+            return MagicFilter(accept_none=True)
+
         allow_raw = raw.get("allow")
         allow = None if allow_raw is None else _magics(allow_raw, "allow", labels)
         deny_raw = raw.get("deny")
@@ -250,7 +282,7 @@ def parse(slave_config: Optional[Dict[str, Any]]) -> MagicFilter:
         # A key this does not know is a typo, and a typo in an allow-list
         # fails open -- which is the one direction this must not fail. The
         # exception is `source`, whose contents are nobody's business here.
-        unknown = set(raw) - {"allow", "deny", "source"}
+        unknown = set(raw) - {"accept", "allow", "deny", "source"}
         if unknown:
             raise ValueError(
                 f"{KEY} has unknown key(s) {sorted(unknown)}; it takes "
