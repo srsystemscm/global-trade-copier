@@ -118,19 +118,43 @@ def test_a_single_contract_cannot_be_fractionally_scaled():
 
 # ---------------- where it is read from ----------------------------------
 
-def test_the_route_overrides_the_slave():
-    """A slave can run at half size overall while one strategy on it runs at
-    a quarter."""
+def test_the_route_composes_with_the_slave():
+    """A slave can run at half size overall while one strategy on it runs
+    lighter still -- the question this has always asked, and it still has
+    an answer.
+
+    REWORKED 2026-11-15, when the dials stopped overriding and started
+    composing. It read `{"risk_scale": 0.5}, 0.25 == 0.25`, the route
+    replacing the slave. The route is now a further cut ON that slave, so
+    the same config gives 0.125. Chris's model: the slave figure says how
+    much of any signal this venue takes, the narrower figures say how this
+    strategy compares to the others, and neither should erase the other.
+    """
     assert resolve_risk_scale({"risk_scale": 0.5}, None) == 0.5
-    assert resolve_risk_scale({"risk_scale": 0.5}, 0.25) == 0.25
+    assert resolve_risk_scale({"risk_scale": 0.5}, 0.25) == 0.125
     assert resolve_risk_scale({}, None) == 1.0
     assert resolve_risk_scale({}, 2.0) == 2.0
+    # An unscaled slave leaves the route's figure alone, which is what
+    # makes every existing route-only config behave exactly as before.
+    assert resolve_risk_scale({}, 0.25) == 0.25
 
 
-def test_a_route_scale_of_one_overrides_a_slave_wide_cut():
-    """0 and 1.0 are real values, not 'unset' -- a route must be able to opt
-    back up to full size on a slave that is globally scaled down."""
-    assert resolve_risk_scale({"risk_scale": 0.25}, 1.0) == 1.0
+def test_a_route_scale_of_one_no_longer_exempts_it_from_the_slave_cut():
+    """A CAPABILITY DELIBERATELY LOST, pinned so the loss is visible.
+
+    This read "a route must be able to opt back up to full size on a
+    slave that is globally scaled down", asserting 1.0 against a slave at
+    0.25 gave 1.0. Under a product, 1.0 means "no further adjustment" and
+    the leg keeps the slave's 0.25. The two meanings cannot coexist: 1.0
+    is either the identity or an override, and composing needs it to be
+    the identity.
+
+    Exempting one leg is still possible, by reciprocal -- 4.0 against a
+    slave at 0.25 -- which is uglier and much rarer than the halving it
+    was blocking.
+    """
+    assert resolve_risk_scale({"risk_scale": 0.25}, 1.0) == 0.25
+    assert resolve_risk_scale({"risk_scale": 0.25}, 4.0) == 1.0
 
 
 def test_routes_carry_it():

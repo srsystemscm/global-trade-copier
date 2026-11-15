@@ -202,36 +202,63 @@ def resolve_risk_scale(
 ) -> float:
     """How much of the configured risk this leg carries.
 
-    Three places can say, most specific first:
+    A PRODUCT of three independent dials, each defaulting to 1.0:
 
-    1. the ROUTE, which already names a (symbol, magic) pair
-    2. `risk_scale_by_magic`, keyed by the EA's magic number
-    3. `risk_scale` on the slave
+        slave `risk_scale`  x  `risk_scale_by_magic[magic]`  x  route scale
 
-    1.0 is the default everywhere -- an absent setting must never quietly
-    resize anything.
+    Chris's model, in his own arithmetic: "most EA are going to send a 2%
+    risk of balance on signal. most slaves are going to be calibrated to
+    0.50 at the intake. on average each magic will then get a 1.0 risk
+    scale. some might get 0.50, which should effectively be 1/4 of the
+    original signal."
+
+        2% signal  x  0.50 slave intake  x  1.00 magic  =  1%
+        2% signal  x  0.50 slave intake  x  0.50 magic  =  0.5%  (a quarter)
+
+    They are different questions and that is why they compose. The slave
+    figure asks how much of ANY signal this venue should take, which is a
+    property of the venue's leverage. The per-magic figure asks how this
+    one strategy compares to the others, which is a property of the
+    strategy. Neither answer should erase the other.
+
+    THIS WAS FIRST-MATCH-WINS until 2026-11-15, and that gave 0.50 for the
+    last line above rather than 0.25: a strategy with its own figure never
+    saw the slave's intake calibration at all, so recalibrating a slave
+    silently skipped every strategy that had been individually tuned --
+    exactly the ones most likely to matter. Nothing live had either dial
+    set when this changed, so no position was resized by the change
+    itself.
+
+    ZERO still means "do not trade this here", and survives the product
+    intact: 0 times anything is 0, and a non-positive scale is refused
+    rather than sent.
 
     The per-magic table exists because leverage is not the same on every
-    venue. One EA sized for a CFD account is a different amount of risk
-    once its signal lands on a futures or ETF leg, and the knob that fixes
-    that belongs to the strategy rather than to the whole slave. Mirror
-    slaves have no routes at all, so without this they could only be
-    scaled wholesale.
+    venue. Mirror slaves have no routes at all, so without it they could
+    only be scaled wholesale.
 
     JSON object keys are strings, so an integer magic is looked up both
     ways rather than silently missing a table written by hand.
     """
-    if route_scale is not None:
-        return float(route_scale)
+    # `is None` rather than `or 1.0`, so an explicit 0 -- "do not trade
+    # anything here" -- is honoured rather than read as unset. A JSON null
+    # left by a form that cleared the field means unset, and must not
+    # reach float().
+    declared = slave_config.get("risk_scale")
+    scale = 1.0 if declared is None else float(declared)
 
     if magic is not None:
         by_magic = slave_config.get("risk_scale_by_magic") or {}
         if isinstance(by_magic, dict):
             for key in (str(magic), magic):
                 if key in by_magic:
-                    return float(by_magic[key])
+                    scale *= float(by_magic[key])
+                    break
 
-    return float(slave_config.get("risk_scale", 1.0))
+    if route_scale is not None:
+        scale *= float(route_scale)
+
+    return scale
 
 
 # The leading digit of a magic names the timeframe the strategy runs on.
