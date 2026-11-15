@@ -102,11 +102,26 @@ async def reconcile_slave(
             # exactly as it did, which is right for a broker whose entries
             # are market orders and never rest.
             pass
-        except AdapterError as exc:
+        except Exception as exc:
             # Could not ASK, which is not the same as "none working". Left
             # loud and NOT treated as empty: an empty set here would mark
             # every resting entry closed, the precise bug being fixed.
-            logger.error(
+            #
+            # `Exception`, not `AdapterError`, and that width is deliberate.
+            # It was AdapterError, and on 2026-11-15 the IBKR adapter raised
+            # AttributeError from this very call -- which sailed past here,
+            # out of reconcile_slave, out of start_engine_for_slave, and
+            # stopped BOTH IBKR slaves from starting at all, with open
+            # positions at the broker and the week about to open.
+            #
+            # Not reading working orders degrades reconciliation: rows stay
+            # open, which is the safe direction and is already handled
+            # below. Not starting the engine means nothing manages those
+            # positions at all. No bug in an optional adapter read is worth
+            # the second outcome, so every failure takes the first --
+            # logged with its traceback, because a swallowed exception here
+            # is how this would become permanent and invisible.
+            logger.exception(
                 "slave=%s reconciliation: could not read working orders (%s) -- "
                 "rows with an unfilled entry will be left OPEN rather than risk "
                 "closing one that is still live",

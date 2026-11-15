@@ -1422,9 +1422,23 @@ class IBKRAdapter(BrokerAdapter):
         nothing, which would read as "no working orders" -- the exact
         wrong answer here.
         """
-        ib = self._require_ib()
+        # self.ib, NOT self._require_ib(). The latter returns the ib_async
+        # MODULE, and this read `ib = self._require_ib()` followed by
+        # `ib.openTrades()` -- an AttributeError on the module, raised on
+        # the reconciliation path that every engine start runs through.
+        # Both IBKR slaves failed to start because of it on 2026-11-15
+        # 18:04, with real positions at the broker and the market opening:
+        # "the hub is running WITHOUT it".
+        #
+        # The name was the whole bug. Everywhere else in this file calls
+        # the module `ib_mod` and the client `self.ib`; calling the module
+        # `ib` here made the wrong line look exactly right.
+        if self.ib is None:
+            raise AdapterConnectionError(
+                "not connected, so IB's working orders cannot be read"
+            )
         out: List[WorkingOrder] = []
-        for trade in ib.openTrades():
+        for trade in self.ib.openTrades():
             order = getattr(trade, "order", None)
             status = getattr(getattr(trade, "orderStatus", None), "status", "") or ""
             if order is None:
