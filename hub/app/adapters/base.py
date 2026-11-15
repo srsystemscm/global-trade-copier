@@ -77,6 +77,15 @@ class OrderRequest:
     # abandon timer cancelled it a quarter of an hour in regardless.
     tif: Optional[str] = None
     entry_timeout: Optional[float] = None
+    # When a GTD entry expires at the broker. Seconds from now, or a
+    # session boundary like "rth_open" (app/order_timing.py); the adapter
+    # resolves it at placement, because "the next open" has no answer at
+    # config-load time.
+    #
+    # Required when `tif` is GTD. GTD used to be accepted and sent with no
+    # date, so a route asking to expire at the open got an order that never
+    # expires -- an entry resting days past the signal that justified it.
+    good_till: Optional[object] = None
     # Whether to place broker-side stop/target orders at all. ETF legs set
     # this false: those orders do not execute in extended hours, so resting
     # them achieves nothing while leaving GTC orders to strand. Those legs

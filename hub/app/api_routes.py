@@ -69,6 +69,60 @@ def _validated_magic_filter(config: Optional[Dict[str, Any]]):
         raise HTTPException(400, str(exc)) from exc
 
 
+def _validated_route_deadlines(config) -> None:
+    """Refuse a route whose entry_timeout or good_till cannot be read.
+
+    HERE is config-load time -- somebody is saving, and is there to read
+    the message. Routing does not validate, on purpose: it runs per
+    signal, so raising there would take a whole slave's routing down over
+    one mistyped word in one route.
+
+    The specs are strings like "rth_close" or "26h" (app/order_timing.py).
+    A typo in one is invisible until the evening a signal actually needs
+    it, which for an ETF leg means the one moment nobody is watching.
+    """
+    if not isinstance(config, dict):
+        return
+    routes = config.get("routes")
+    if not isinstance(routes, list):
+        return
+
+    from app.order_timing import OrderTimingError, resolve
+
+    for index, entry in enumerate(routes):
+        if not isinstance(entry, dict):
+            continue
+        for field in ("entry_timeout", "good_till"):
+            value = entry.get(field)
+            if value is None or isinstance(value, (int, float)):
+                continue
+            text = str(value).strip()
+            if not text:
+                continue
+            try:
+                resolve(text)
+            except OrderTimingError as exc:
+                where = entry.get("target") or entry.get("symbol") or f"#{index}"
+                raise HTTPException(
+                    400, f"route {where}: {field} {text!r} is not a deadline "
+                         f"this hub can resolve -- {exc}"
+                ) from exc
+
+        # GTD without a deadline is the specific misconfiguration that
+        # used to go out as an order that never expires.
+        tif = entry.get("tif")
+        if (isinstance(tif, str) and tif.strip().upper() == "GTD"
+                and entry.get("good_till") is None
+                and config.get("good_till") is None):
+            where = entry.get("target") or entry.get("symbol") or f"#{index}"
+            raise HTTPException(
+                400, f"route {where}: tif GTD needs good_till -- a session "
+                     f"boundary such as 'rth_close', or a number of seconds. "
+                     f"Without one the broker is sent an order with no expiry, "
+                     f"which is GTC by another name"
+            )
+
+
 def _validated_master_filter(config: Optional[Dict[str, Any]]):
     """Parse a config's master selection, or answer 400 saying what is wrong.
 
@@ -235,6 +289,10 @@ def _route_rows(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             # the configuration that looks right and does nothing.
             "tif": route.get("tif"),
             "entry_timeout": route.get("entry_timeout"),
+            # Only meaningful with GTD, and the one thing that makes GTD
+            # different from GTC. Shown beside them so "GTD" with nothing
+            # here is visible as the misconfiguration it is.
+            "good_till": route.get("good_till"),
             # False means the copier holds the stop itself and the broker
             # has no resting order -- worth seeing, because it decides
             # whether the position is protected while the hub is down.
@@ -489,6 +547,7 @@ async def create_slave(payload: SlaveCreate, request: Request):
         raise HTTPException(409, f"slave id {payload.id!r} already exists")
     _validated_magic_filter(payload.config)
     _validated_master_filter(payload.config)
+    _validated_route_deadlines(payload.config)
 
     slave = insert_slave(payload.id, payload.name, payload.broker_type, payload.config, payload.enabled)
 
@@ -604,6 +663,7 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
 
     takes = _validated_magic_filter(payload.config)
     from_masters = _validated_master_filter(payload.config)
+    _validated_route_deadlines(payload.config)
 
     # A mode change is not a config edit; it is a different engine. Worked
     # out before anything is written, because the switch has to be refused

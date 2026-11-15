@@ -1082,6 +1082,7 @@ class AutonomousCopyEngine(SessionGateMixin):
             # need to outlive does not apply.
             tif=route.tif,
             entry_timeout=route.entry_timeout,
+            good_till=route.good_till,
             broker_brackets=route.broker_brackets,
         )
         requested_at = time.time()

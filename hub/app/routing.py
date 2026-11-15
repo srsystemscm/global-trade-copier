@@ -73,7 +73,19 @@ class Route:
     # the broker already expired. Setting one and not the other is the
     # configuration that looks right and does nothing.
     tif: Optional[str] = None
-    entry_timeout: Optional[float] = None
+    # Seconds, or a session boundary like "rth_open" -- see
+    # app/order_timing.py. A boundary is resolved when the order is placed,
+    # which is the only time "the next open" has an answer.
+    entry_timeout: Optional[Any] = None
+    # The BROKER's deadline, used when `tif` is GTD: the same grammar as
+    # entry_timeout, resolved to IBKR's goodTillDate.
+    #
+    # GTD was accepted by the adapter's TIF list and then sent with no date
+    # at all, which IBKR either rejects or treats as GTC. So a route could
+    # ask for "expire at the open" and get "never expires" -- the failure
+    # mode being an entry that rests indefinitely, long after the signal
+    # that justified it has gone.
+    good_till: Optional[Any] = None
     # Which way this route trades. None takes both, which is right for a
     # futures leg that can be short as easily as long. An ETF leg usually
     # cannot: the long-side proxies here have no inverse twin, so without
@@ -105,6 +117,33 @@ class Route:
     # strategy may stack three legs where everything else on the slave
     # stacks none.
     netting: Optional[Dict[str, Any]] = None
+
+
+def _deadline(value: Any) -> Optional[Any]:
+    """A deadline as written: seconds, or a session-boundary spec.
+
+    DELIBERATELY DOES NOT VALIDATE. The first version of this resolved the
+    spec here to reject a typo early, which was wrong twice over: this
+    function runs on the SIGNAL path -- resolve_routes() is called per
+    signal, not at startup -- so a bad spec in one route would have raised
+    out of routing and stopped every signal to that slave from routing at
+    all. One mistyped word in one route, and the whole slave goes quiet.
+
+    A bad spec now costs exactly one order: the adapter refuses it with an
+    AdapterError naming the route's symbol, and the other routes are
+    unaffected. The typo is caught earlier anyway, at the API, where the
+    config is saved and someone is there to read the message -- see
+    _validated_route_deadlines in api_routes.py.
+
+    A number still becomes a float, as it always did.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+
+    text = str(value).strip()
+    return text or None
 
 
 def routing_is_strict(slave_config: Dict[str, Any]) -> bool:
@@ -202,8 +241,14 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                     limit_offset_pct=float(entry.get("limit_offset_pct", 0.0)),
                     tif=(None if entry.get("tif") is None
                          else str(entry["tif"]).upper()),
-                    entry_timeout=(None if entry.get("entry_timeout") is None
-                                   else float(entry["entry_timeout"])),
+                    # NOT float() any more. A timeout may be written as the
+                    # session boundary it means -- "rth_open" -- and
+                    # float("rth_open") is a ValueError that takes the whole
+                    # routing table down on load. A number still becomes a
+                    # float, so every existing `entry_timeout: 93600` parses
+                    # to exactly what it did before.
+                    entry_timeout=_deadline(entry.get("entry_timeout")),
+                    good_till=_deadline(entry.get("good_till")),
                     direction=(None if entry.get("direction") is None
                                else str(entry["direction"]).upper()),
                     target_direction=(None if entry.get("target_direction") is None

@@ -81,6 +81,10 @@ def create_adapter(slave: SlaveConfig) -> BrokerAdapter:
             exit_chase_steps=int(slave.config.get("exit_chase_steps", 4)),
             exit_chase_pct=float(slave.config.get("exit_chase_pct", 0.002)),
             entry_timeout=float(slave.config.get("entry_timeout", 900.0)),
+            # The slave-wide GTD deadline. No default: a GTD route with no
+            # deadline anywhere is refused at placement rather than sent to
+            # IBKR as an order that never expires.
+            good_till=slave.config.get("good_till"),
             account=slave.config.get("account"),
         )
 

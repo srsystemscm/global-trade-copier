@@ -208,15 +208,25 @@ def test_entry_and_close_state_a_tif():
     The entry's value became per-route on 2026-11-15, so it is now a local
     resolved from the route and the slave default. The requirement is
     unchanged: something is assigned, and it is never left unset.
+
+    Moved again later the same day, into _stamp_entry_timing(), when GTD
+    gained a deadline -- that decision needs more than one line and is
+    worth testing without a broker connection. open() delegates, which is
+    asserted below so the call cannot quietly go missing.
     """
     import inspect
     import re
     from app.adapters.ibkr import IBKRAdapter
 
     open_src = re.sub(r"\s+", " ", inspect.getsource(IBKRAdapter.open))
+    stamp_src = re.sub(r"\s+", " ", inspect.getsource(IBKRAdapter._stamp_entry_timing))
     close_src = re.sub(r"\s+", " ", inspect.getsource(IBKRAdapter.close))
-    assert "entry.tif = tif" in open_src
-    assert "order.tif or self.entry_tif" in open_src, (
+    assert "self._stamp_entry_timing(entry, order)" in open_src, (
+        "open() no longer stamps the entry at all, so IBKR's account preset "
+        "supplies DAY and reports it as error 10349"
+    )
+    assert "entry.tif = tif" in stamp_src
+    assert "order.tif or self.entry_tif" in stamp_src, (
         "the route's value no longer reaches the order, so every entry is "
         "back to the slave-wide default"
     )
@@ -226,10 +236,18 @@ def test_entry_and_close_state_a_tif():
 def test_an_entry_tif_the_adapter_cannot_place_is_refused():
     """A TIF IBKR rejects is a position that silently never opens -- and
     the setting exists precisely for orders placed when nobody is
-    watching."""
+    watching.
+
+    THE RAISE IS NOW EXECUTED, not just reasoned about. This test checked
+    the membership of ENTRY_TIFS and imported AdapterError without ever
+    reaching the line that raises it -- and that line referred to a name
+    the module had never imported. The refusal came out as NameError,
+    which the engine does not recognise as a broker refusal and does not
+    report as one. Nothing failed, because nothing ran it.
+    """
     import pytest
 
-    from app.adapters.base import AdapterError
+    from app.adapters.base import AdapterError, OrderRequest
     from app.adapters.ibkr import IBKRAdapter
 
     assert "GTC" in IBKRAdapter.ENTRY_TIFS
@@ -238,6 +256,15 @@ def test_an_entry_tif_the_adapter_cannot_place_is_refused():
     # a route be written that never fills.
     assert "OPG" not in IBKRAdapter.ENTRY_TIFS
     assert "FOK" not in IBKRAdapter.ENTRY_TIFS
+
+    class _Entry:
+        tif = None
+        goodTillDate = ""
+
+    with pytest.raises(AdapterError):
+        _adapter()._stamp_entry_timing(
+            _Entry(), OrderRequest(symbol="MGC", direction="BUY", size=1, tif="OPG")
+        )
 
 
 def test_brackets_keep_their_own_tif():

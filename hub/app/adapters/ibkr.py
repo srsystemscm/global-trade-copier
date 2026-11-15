@@ -8,6 +8,12 @@ from app.adapters.base import (
     MarginPreview,
     AccountSummary,
     ContractInfo,
+    # Was MISSING while open() already raised it for an unplaceable time in
+    # force, so that refusal came out as NameError -- which the engine does
+    # not recognise as a broker refusal and does not report as one. Nothing
+    # caught it because the only test of that path inspected ENTRY_TIFS
+    # rather than executing the raise.
+    AdapterError,
     AdapterConnectionError,
     AdapterRejectedError,
     BrokerAdapter,
@@ -18,6 +24,7 @@ from app.adapters.base import (
 )
 from app.atr import Bar
 from app.contract_specs import get_contract_spec
+from app.order_timing import OrderTimingError, resolve_good_till, seconds_until
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +148,7 @@ class IBKRAdapter(BrokerAdapter):
         exit_chase_steps: int = 4,
         exit_chase_pct: float = 0.002,
         entry_timeout: float = 900.0,
+        good_till: Optional[object] = None,
         account: Optional[str] = None,
     ) -> None:
         self.slave_id = slave_id
@@ -193,6 +201,10 @@ class IBKRAdapter(BrokerAdapter):
         # evening book for ten minutes is the plan. What must not happen is
         # resting forever -- see abandon_unfilled_entry().
         self.entry_timeout = entry_timeout
+        # The slave-wide GTD deadline, for routes that ask for GTD without
+        # naming one. No default: GTD with nothing to expire at is refused
+        # rather than quietly becoming GTC, which is what it did before.
+        self.entry_good_till = good_till
         # Which of the login's accounts this slave trades. Empty means
         # "work it out at connect time" -- see _resolve_account().
         self.account = account or ""
@@ -510,20 +522,8 @@ class IBKRAdapter(BrokerAdapter):
         else:
             entry = ib_mod.MarketOrder(action, order.size)
         entry.outsideRth = order.outside_rth
-        # The ROUTE's value wins, falling back to this slave's default. It
-        # used to be the slave's always, which is why an ETF entry could not
-        # be made to survive the session it was placed in: every route on
-        # ibkr-etf-1 got DAY, and a DAY order placed at 18:00 ET expires
-        # that evening rather than resting into Monday's pre-market.
-        tif = (order.tif or self.entry_tif or "DAY").upper()
-        if tif not in self.ENTRY_TIFS:
-            # Refused here, not sent. An order IBKR rejects for a bad TIF is
-            # a position that silently never opens.
-            raise AdapterError(
-                f"{tif!r} is not a time in force this adapter will place on an "
-                f"entry (accepts {', '.join(self.ENTRY_TIFS)})"
-            )
-        entry.tif = tif
+        # Time in force, and the GTD deadline that makes GTD mean anything.
+        self._stamp_entry_timing(entry, order)
         # The copier's own reference, which the broker hands back on its
         # statement. Set on the entry AND on both protective legs below, so
         # every execution belonging to this position is recognisable as
@@ -615,7 +615,23 @@ class IBKRAdapter(BrokerAdapter):
         # quarter of an hour in, so the TIF alone would have changed
         # nothing -- the pair has to travel together.
         if order.entry_timeout is not None:
-            self._entry_waits[slave_ticket] = float(order.entry_timeout)
+            # Resolved HERE, at placement, not float()-ed. A timeout written
+            # as "rth_open" is a different number of seconds every time it
+            # is asked, which is the whole reason it is written that way --
+            # 93600 is right for a Sunday 18:00 placement and wrong for any
+            # other. A plain number still passes through unchanged.
+            try:
+                self._entry_waits[slave_ticket] = seconds_until(order.entry_timeout)
+            except OrderTimingError as exc:
+                # Not fatal: the order IS placed. Falling back to the
+                # adapter's own clock cancels it eventually, where raising
+                # here would leave a live order with nothing watching it.
+                logger.error(
+                    "IBKRAdapter[%s] %s entry_timeout %r is unusable, falling "
+                    "back to %ss: %s",
+                    self.slave_id, order.symbol, order.entry_timeout,
+                    self.entry_timeout, exc,
+                )
         logger.info(
             "IBKRAdapter[%s] opened %s %s x%s -> ticket=%s", self.slave_id, action, order.symbol, order.size, slave_ticket
         )
@@ -1271,6 +1287,61 @@ class IBKRAdapter(BrokerAdapter):
         order.tif = self.bracket_tif
         order.outsideRth = outside_rth
         return order
+
+    def _stamp_entry_timing(self, entry, order: OrderRequest):
+        """Put the entry's time in force, and its deadline, on the order.
+
+        The ROUTE's TIF wins, falling back to this slave's default. It used
+        to be the slave's always, which is why an ETF entry could not be
+        made to survive the session it was placed in: every route on
+        ibkr-etf-1 got DAY, and a DAY order placed at 18:00 ET expires that
+        evening rather than resting into Monday's pre-market.
+
+        GTD is the one that needs more than a name. It was in ENTRY_TIFS
+        from the start and `goodTillDate` was never set, so a route asking
+        to expire at the open got an order with no deadline at all --
+        rejected outright by some TWS versions and treated as GTC by
+        others. The second is the dangerous one: the entry rests
+        indefinitely and can fill days later, off a signal nobody is acting
+        on any more, into a position no stop was sized for.
+
+        A method rather than inline in open(), so the decision can be
+        tested without a broker connection. Everything about it is a
+        refusal or a string.
+        """
+        tif = (order.tif or self.entry_tif or "DAY").upper()
+        if tif not in self.ENTRY_TIFS:
+            # Refused here, not sent. An order IBKR rejects for a bad TIF is
+            # a position that silently never opens.
+            raise AdapterError(
+                f"{tif!r} is not a time in force this adapter will place on an "
+                f"entry (accepts {', '.join(self.ENTRY_TIFS)})"
+            )
+        entry.tif = tif
+        if tif != "GTD":
+            return entry
+
+        spec = order.good_till if order.good_till is not None else self.entry_good_till
+        try:
+            deadline = resolve_good_till(spec)
+        except OrderTimingError as exc:
+            raise AdapterError(
+                f"GTD entry for {order.symbol} has no usable deadline "
+                f"({spec!r}): {exc}"
+            ) from exc
+        if not deadline:
+            raise AdapterError(
+                f"GTD entry for {order.symbol} names no deadline. Set "
+                f"good_till on the route -- a session boundary such as "
+                f"'rth_close', or a number of seconds -- or use GTC if the "
+                f"entry is genuinely meant to rest until cancelled"
+            )
+        entry.goodTillDate = deadline
+        logger.info(
+            "IBKRAdapter[%s] %s entry is GTD until %s (from %r)",
+            self.slave_id, order.symbol, deadline, spec,
+        )
+        return entry
 
     @staticmethod
     def _qualified_only(results):
