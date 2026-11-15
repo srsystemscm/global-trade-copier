@@ -21,7 +21,7 @@ import inspect
 import pytest
 from fastapi import HTTPException
 
-from app import api_routes
+from app import api_routes, trade_registry
 from app.api_routes import (SlaveUpdate, _mode_switch,
                             _refuse_switch_while_holding, held_position_count)
 
@@ -31,9 +31,19 @@ class _Slave:
         self.config = config
 
 
-class _Engine:
-    def __init__(self, positions):
-        self._positions = positions
+@pytest.fixture
+def holding(monkeypatch):
+    """Make the registry report N open rows for any slave.
+
+    Patched rather than written, because what is being tested is the
+    guard's decision, not the registry's SQL.
+    """
+    def _set(count):
+        monkeypatch.setattr(
+            trade_registry, "get_all_open_for_slave",
+            lambda slave_id: [object()] * count,
+        )
+    return _set
 
 
 # ----------------------------------------------- what counts as a switch --
@@ -77,35 +87,74 @@ def test_a_mode_that_is_not_a_mode_is_refused_rather_than_stored():
 
 # ------------------------------------------- the guard on open positions --
 
-def test_switching_is_refused_while_the_slave_holds_positions():
+def test_switching_is_refused_while_the_slave_holds_positions(holding):
+    holding(2)
     with pytest.raises(HTTPException) as got:
-        _refuse_switch_while_holding(
-            "ibkr-paper-1", _Engine({("a", 1, "MGC"): {}, ("a", 2, "MES"): {}}),
-            ("autonomous", "mirror"))
+        _refuse_switch_while_holding("ibkr-paper-1", ("autonomous", "mirror"))
     assert got.value.status_code == 409
     detail = got.value.detail
     assert "2 position(s)" in detail, "the count is the actionable part"
     assert "autonomous" in detail and "mirror" in detail
 
 
-def test_a_flat_slave_switches():
+def test_the_refusal_says_what_would_actually_happen(holding):
+    """The first version of this said the new engine would ADOPT the
+    positions under different stop rules. It does not: position_store is
+    written only by the autonomous engine and CopyEngine ignores it, so a
+    switch ABANDONS them -- the master's CLOSE finds no record and the
+    leg sits open at the broker untracked.
+
+    Milder wording for a worse outcome is the wrong way round, so the
+    message is pinned."""
+    holding(1)
+    with pytest.raises(HTTPException) as got:
+        _refuse_switch_while_holding("mt5-icm-1", ("mirror", "autonomous"))
+    detail = got.value.detail
+    assert "no record" in detail
+    assert "untracked" in detail
+    assert "adopt" not in detail, (
+        "back to claiming the new engine takes these over, which is the "
+        "reassuring version and the wrong one"
+    )
+
+
+def test_a_flat_slave_switches(holding):
+    holding(0)
     assert _refuse_switch_while_holding(
-        "ibkr-paper-1", _Engine({}), ("mirror", "autonomous")) is None
+        "ibkr-paper-1", ("mirror", "autonomous")) is None
 
 
-def test_a_slave_with_no_engine_switches():
-    """Disabled, or the hub has not started it. Nothing to protect."""
-    assert _refuse_switch_while_holding(
-        "ibkr-paper-1", None, ("mirror", "autonomous")) is None
+def test_the_count_comes_from_the_registry_not_an_engine():
+    """THE BUG THIS REPLACES, and it showed as a green light.
+
+    held_position_count read `engine._positions`. CopyEngine has no such
+    attribute and never writes position_store, so every MIRROR slave
+    counted 0 however much it held -- mt5-dwx-futures-1 reported
+    "switchable" while holding eight positions at the broker.
+
+    trade_registry is written by BOTH engines, so it is the only source
+    that answers for either."""
+    src = inspect.getsource(held_position_count)
+    assert "get_all_open_for_slave" in src
+    # The CODE, not the docstring -- which names `_positions` on purpose,
+    # to say what this used to read and why that was wrong.
+    body = src[src.index('"""', src.index('"""') + 3) + 3:]
+    assert "_positions" not in body, (
+        "back to reading an engine's in-memory dict, which is empty by "
+        "construction for every mirror slave"
+    )
+    # It takes a slave id now, not an engine: an engine cannot answer this.
+    params = list(inspect.signature(held_position_count).parameters)
+    assert params == ["slave_id"], params
 
 
-def test_the_ui_flag_and_the_api_refusal_read_the_same_count():
+def test_the_ui_flag_and_the_api_refusal_read_the_same_count(holding):
     """They disagreed once by construction -- the summary counted
     positions one way and the guard another. One function now."""
-    engine = _Engine({("a", 1, "MGC"): {}})
-    assert held_position_count(engine) == 1
-    assert held_position_count(_Engine({})) == 0
-    assert held_position_count(None) == 0
+    holding(3)
+    assert held_position_count("anything") == 3
+    holding(0)
+    assert held_position_count("anything") == 0
     src = inspect.getsource(api_routes._slave_summary)
     assert "held_position_count" in src, (
         "the summary counts positions its own way again, so the control can "

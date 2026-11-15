@@ -392,10 +392,10 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         # at the master's stop level, the other trails its own from ATR.
         # Reported rather than left for the UI to guess, so the control is
         # disabled for the same reason the API refuses.
-        "mode_editable": not held_position_count(engine),
+        "mode_editable": not held_position_count(slave.id),
         "mode_locked_reason": (
-            f"holding {held_position_count(engine)} position(s)"
-            if held_position_count(engine) else None
+            f"holding {held_position_count(slave.id)} position(s)"
+            if held_position_count(slave.id) else None
         ),
         "enabled": slave.enabled,
         "paused": engine.paused if engine is not None else slave.paused,
@@ -521,32 +521,51 @@ async def get_one_slave(slave_id: str):
     }
 
 
-def held_position_count(engine) -> int:
-    """How many positions this engine is managing. 0 when there is none."""
-    return len(getattr(engine, "_positions", {}) or {})
+def held_position_count(slave_id: str) -> int:
+    """Open rows the HUB holds for this slave. 0 when it holds none.
+
+    The registry, not an engine's in-memory dict. The first version of
+    this read `engine._positions` and was wrong in a way the UI displayed
+    as a green light: CopyEngine has no `_positions` at all and never
+    writes position_store, so every MIRROR slave counted 0 however much it
+    held. mt5-dwx-futures-1 reported "switchable" while holding eight
+    positions.
+
+    trade_registry is written by BOTH engines (copy_engine.py:452,
+    autonomous_copy_engine.py), so it is the one source that answers for
+    either -- and it is what the hub believes it holds, which is the thing
+    a switch puts at risk.
+    """
+    return len(trade_registry.get_all_open_for_slave(slave_id))
 
 
-def _refuse_switch_while_holding(slave_id: str, engine, switching: tuple) -> None:
+def _refuse_switch_while_holding(slave_id: str, switching: tuple) -> None:
     """A mode switch is only safe on a flat slave.
 
-    The two engines protect a position differently -- mirror aims at the
-    master's own stop level, autonomous trails its own from ATR -- and
-    position_store is keyed by SLAVE, not by engine. So the incoming engine
-    genuinely would adopt these on restore() and start managing them under
-    rules they were never opened under.
+    THE REASON WAS WRONG when this was written, and the correction makes
+    it worse rather than milder. It said the incoming engine would ADOPT
+    these positions and manage them under rules they were never opened
+    under. It does not adopt them: position_store is written only by the
+    autonomous engine, and CopyEngine ignores it entirely. So a switch
+    ABANDONS them.
 
-    Refusing is the only answer that does not silently change what is
-    protecting live money. Not a warning: there is nothing the operator
-    could do about it afterwards except notice.
+    Abandoned means the broker still holds the position and nothing in the
+    hub is tracking it. The master's CLOSE arrives, the new engine looks
+    for a position it has no record of, and the leg stays open -- the
+    shape of the untracked strays that already took hours to chase.
+
+    Refusing is the only answer. Not a warning: there is nothing the
+    operator could do about it afterwards except notice.
     """
-    held = held_position_count(engine)
+    held = held_position_count(slave_id)
     if not held:
         return
     raise HTTPException(409, (
         f"{slave_id} is holding {held} position(s). Switching from "
-        f"{switching[0]} to {switching[1]} starts a different engine, and it would "
-        f"take these over under different stop handling than they were opened "
-        f"with. Close them, or wait for them to close, then switch."
+        f"{switching[0]} to {switching[1]} starts a different engine, and the new "
+        f"one would have no record of them -- the master's CLOSE would not reach "
+        f"them and they would sit open at the broker untracked. Close them, or "
+        f"wait for them to close, then switch."
     ))
 
 
@@ -584,8 +603,7 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
     # whole rather than half-applied.
     switching = _mode_switch(slave, payload.config)
     if switching is not None:
-        _refuse_switch_while_holding(
-            slave_id, _find_engine(request, slave_id), switching)
+        _refuse_switch_while_holding(slave_id, switching)
 
     if payload.name is not None or payload.config is not None:
         slave = update_slave(slave_id, name=payload.name, config=payload.config)
