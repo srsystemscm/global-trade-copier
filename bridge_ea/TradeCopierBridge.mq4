@@ -41,7 +41,12 @@ input int    PollIntervalMs       = 500;    // how often to diff open orders
 input int    HeartbeatIntervalMs  = 5000;   // how often to send a heartbeat
 input double SlTpEpsilon          = 0.00001; // ignore SL/TP deltas smaller than this (float noise)
 input int    AtrPeriod            = 14;      // iATR() period used for the "atr" field
-input int    AtrTimeframe         = PERIOD_CURRENT; // iATR() timeframe used for the "atr" field
+input int    AtrTimeframe         = PERIOD_CURRENT; // fallback when the magic names no timeframe
+//--- A magic's LEADING DIGIT names the timeframe its strategy runs on:
+//--- 1 daily, 2 H4, 3 H1, 4 weekly. The hub applies this rule to the
+//--- SLAVE's ATR already; without it here, only half the translation
+//--- happens. See the comment above PublishSignal's atr line.
+input bool   AtrTimeframeFromMagic = true;   // leading digit of the magic picks the ATR timeframe
 
 Context zmqContext("bridge_ea_master");
 Socket  pubSocket(zmqContext, ZMQ_PUB);
@@ -213,10 +218,70 @@ void DiffAndPublish(OrderSnapshot &prev[], OrderSnapshot &curr[])
   }
 
 //+------------------------------------------------------------------+
+//| The ATR timeframe a magic names, by its LEADING DIGIT.             |
+//|                                                                    |
+//| 1 daily, 2 H4, 3 H1, 4 weekly -- Chris's structural magic scheme.  |
+//| 121003 is a daily system; 221003 would be H4.                      |
+//|                                                                    |
+//| Kept deliberately identical to the hub's own                       |
+//| bar_size_for_magic_prefix() in app/sizing.py. The two run on       |
+//| opposite sides of the wire and must agree: the master divides the  |
+//| stop by this ATR, the slave multiplies by its own. Disagree, and   |
+//| the error is silent -- sizing still reports the intended dollar    |
+//| risk while the position is a multiple of the intended size.        |
+//|                                                                    |
+//| A magic outside 1-4 falls back to AtrTimeframe, which is what      |
+//| every signal used before this existed.                             |
+//+------------------------------------------------------------------+
+int AtrTimeframeForMagic(int magic)
+  {
+   if(!AtrTimeframeFromMagic)
+      return(AtrTimeframe);
+
+   //--- The leading digit, however many digits the magic has. MathAbs
+   //--- first: a negative magic is not expected, but reading '-' as the
+   //--- leading character would silently fall back for the whole strategy.
+   string asText = IntegerToString(MathAbs(magic));
+   if(StringLen(asText) == 0)
+      return(AtrTimeframe);
+
+   string firstChar = StringSubstr(asText, 0, 1);
+   if(firstChar == "1") return(PERIOD_D1);
+   if(firstChar == "2") return(PERIOD_H4);
+   if(firstChar == "3") return(PERIOD_H1);
+   if(firstChar == "4") return(PERIOD_W1);
+
+   return(AtrTimeframe);
+  }
+
+//+------------------------------------------------------------------+
 void PublishSignal(string action, OrderSnapshot &o)
   {
    string direction = (o.type == OP_BUY) ? "BUY" : "SELL";
-   double atr = iATR(o.symbol, AtrTimeframe, AtrPeriod, 0);
+
+   //--- THE OTHER HALF OF THE MAGIC -> ATR RULE.
+   //---
+   //--- This was iATR(o.symbol, AtrTimeframe, ...) with AtrTimeframe at
+   //--- PERIOD_CURRENT -- the chart THIS EA happens to sit on. Every
+   //--- signal from every strategy therefore carried the same ATR, and
+   //--- the hub divides the stop distance by it to get the multiple it
+   //--- sends on. So an H4 strategy's stop, 1.5 H4-ATRs wide, arrived at
+   //--- the slave as 0.5 DAILY-ATRs, and the slave -- which does read the
+   //--- magic and measures its own ATR on H4 -- multiplied that 0.5 by
+   //--- its H4 figure. Stop three times too tight, position three times
+   //--- too large, dollar risk still reading correct.
+   //---
+   //--- Measured on 2026-11-15 with FxdMaeEntryTest _D and _H4 on XAUUSD:
+   //---   hub ATR     94.42 (D) vs 94.41 (H4)  -- identical, the bug
+   //---   slave ATR   81.60 (D) vs 42.34 (H4)  -- correctly different
+   //--- H4 opened 46 MGC where it should have opened about 15, and the
+   //--- H1 run was refused outright on margin at 223 contracts.
+   //---
+   //--- The rule is the hub's, matched exactly so the two halves cannot
+   //--- drift: leading digit 1 daily, 2 H4, 3 H1, 4 weekly, anything else
+   //--- falls back to AtrTimeframe as before.
+   int    atrTf = AtrTimeframeForMagic(o.magic);
+   double atr   = iATR(o.symbol, atrTf, AtrPeriod, 0);
 
    // What this order actually put at risk, and what it was risked against.
    //
