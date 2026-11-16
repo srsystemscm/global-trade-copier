@@ -26,7 +26,12 @@ param(
     [int]    $Port     = 8010,
     [string] $HubRoot,
     [string] $LogDir   = 'C:\GTC\logs',
-    [int]    $WaitSeconds = 120
+    [int]    $WaitSeconds = 120,
+    # Set automatically when this script relaunches itself elevated. It
+    # exists only to stop an elevation loop: if the elevated run ALSO
+    # cannot stop the process, something other than privilege is wrong
+    # and asking for UAC again would just hide it.
+    [switch] $NoElevate
 )
 
 $ErrorActionPreference = 'Stop'
@@ -62,12 +67,55 @@ if ($listening) {
                 Stop-Process -Id $procId -Force -ErrorAction Stop
             } catch {
                 # Almost always because the copier was started from an
-                # ELEVATED prompt and this one is not. Said plainly: the
-                # alternative is a confusing failure three steps later,
-                # when the new process cannot bind the port.
+                # ELEVATED prompt and this one is not.
+                #
+                # It used to stop here and tell you to re-run elevated,
+                # which sounds simple and is not: every hand-written
+                # elevation command has to quote this script's path, and
+                # Start-Process -ArgumentList in Windows PowerShell 5.1
+                # does NOT quote an element containing spaces. The real
+                # path has three of them, so the elevated shell received
+                # "-File C:\Users\...\Projects\Global" and died on a path
+                # that does not exist -- looking exactly like a restart
+                # that silently did nothing. It cost a three-hour outage
+                # with two IBKR slaves down, because the copier LOOKED up
+                # the whole time: the old process was still answering.
+                #
+                # So it elevates itself, and does its own quoting.
                 Write-Warning ("cannot stop pid {0}: {1}" -f $procId, $_.Exception.Message)
-                Write-Warning  'If it was started from an elevated prompt, run this script elevated too.'
-                exit 1
+
+                if ($NoElevate) {
+                    Write-Warning 'Already elevated and still refused -- this is not a privilege problem.'
+                    exit 1
+                }
+
+                $me = $PSCommandPath
+                if (-not $me) { $me = $MyInvocation.MyCommand.Path }
+                Write-Host 'The copier is running elevated. Asking for elevation (expect a UAC prompt)...'
+
+                # Each argument quoted individually. -File's path needs it
+                # because of the spaces; the rest are quoted for symmetry
+                # so that changing one later cannot silently reintroduce
+                # the same bug.
+                $quoted = @(
+                    '-NoProfile'
+                    '-ExecutionPolicy'
+                    'Bypass'
+                    '-NoExit'
+                    '-File'
+                    ('"{0}"' -f $me)
+                    '-Port'
+                    $Port
+                    '-NoElevate'
+                )
+                try {
+                    Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $quoted
+                    Write-Host 'Elevated window launched -- watch THAT window for the result.'
+                    exit 0
+                } catch {
+                    Write-Warning ("elevation was refused or cancelled: {0}" -f $_.Exception.Message)
+                    exit 1
+                }
             }
         }
     }
