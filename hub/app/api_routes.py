@@ -11,6 +11,7 @@ from app.adapters.base import AdapterError
 from app.config import settings
 from app.db import db_cursor, get_config_value, list_logs, set_config_value
 from app.engine_manager import start_engine_for_slave, stop_engine
+from app.contract_specs import get_contract_spec
 from app.sizing import resolve_margin_cap
 from app.slaves import (
     delete_slave,
@@ -456,6 +457,22 @@ def describe_mode(config: Dict[str, Any]) -> str:
     return "master's stops and lots"
 
 
+def _trades_dated_contracts(config: Dict[str, Any]) -> bool:
+    """Does any target on this slave have an expiry to roll out of?
+
+    get_contract_spec() carries listed futures only, so a stock or ETF
+    answers None -- which is exactly the question being asked. A slave
+    with no routes at all trades the master's own symbols, and those are
+    CFDs, which do not roll either.
+    """
+    for route in (config or {}).get("routes") or []:
+        target = route.get("target")
+        for name in (target if isinstance(target, list) else [target]):
+            if name and get_contract_spec(name) is not None:
+                return True
+    return False
+
+
 async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
     engine = _find_engine(request, slave.id)
     mode = slave.config.get("mode", "mirror")
@@ -517,6 +534,12 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         # showed no ceiling on the two slaves that had one, while showing
         # one on the slave whose engine never read it.
         "margin_cap_pct": resolve_margin_cap(slave.config),
+        # Whether anything this slave trades EXPIRES. Rolling is a futures
+        # idea: a share of UGL has no front month and no next one, so the
+        # contract-roll row on an ETF slave was offering to schedule two
+        # market orders for something that cannot happen. Chris: "ETFs do
+        # not need a contract roll either".
+        "rolls_contracts": _trades_dated_contracts(slave.config),
         # A line a reader can act on without opening the JSON, and the only
         # place the per-route case is represented at all.
         "sizing_summary": _sizing_summary(slave.config),

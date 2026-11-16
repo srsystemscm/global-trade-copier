@@ -403,7 +403,13 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
             )}
           </div>
         </div>
-        {!slave.sizing_per_route && open && (
+        {/* NO LONGER GATED ON sizing_per_route. This form holds the leg
+            cap, the combined-risk cap, opposing legs and the margin
+            ceiling -- none of which are sizing -- so hiding it on a
+            route-sized slave made four limits unreachable on
+            ibkr-etf-1. Chris, twice: "max lex and refusal % arent
+            editable again". The SIZING half hides itself below. */}
+        {open && (
           <button
             className="btn btn-small"
             onClick={(e) => { e.stopPropagation(); setEditing((v) => !v); }}
@@ -602,7 +608,13 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
 
       {/* Rolling is two market orders per position when it fires, and it
           fires on its own schedule. Running invisibly is the problem. */}
-      {(slave.contract_roll || slave.mode === "autonomous") && (
+      {/* Only where something EXPIRES. A share of UGL has no front
+          month, so this row offered to schedule two market orders for
+          an event that cannot occur. An existing contract_roll block
+          still shows, so a slave configured by hand is never hidden
+          from its own setting. */}
+      {(slave.contract_roll
+        || (slave.mode === "autonomous" && slave.rolls_contracts !== false)) && (
         <div className="slave-risk-row">
           <div>
             <span className="muted small">Contract roll</span>
@@ -1858,9 +1870,13 @@ function SlaveRiskForm({ slave, onDone }) {
       // so routes, mirror_map, host and ports have to travel back
       // untouched or they are deleted by omission.
       const config = await currentConfig(slave.id);
+      // A route-sized slave gets its LIMITS written and its sizing left
+      // alone. Writing a slave-level block is what the hidden button was
+      // protecting against: it saves cleanly and is never read.
+      const sizingIsEditable = !slave.sizing_per_route;
 
       if (form.mode === "mirror_lots") {
-        delete config.sizing;
+        if (sizingIsEditable) delete config.sizing;
       } else {
         const sizing = { ...(config.sizing || {}), mode: "pct_risk" };
         // Untouched. There is no field for it any more -- the master's own
@@ -1871,7 +1887,7 @@ function SlaveRiskForm({ slave, onDone }) {
         sizing.capital_base = form.capital_base;
         if (form.max_risk_pct === "" || form.max_risk_pct === null) delete sizing.max_risk_pct;
         else sizing.max_risk_pct = Number(form.max_risk_pct) / 100;
-        config.sizing = sizing;
+        if (sizingIsEditable) config.sizing = sizing;
       }
 
       const adj = String(form.balance_adjustment).trim();
@@ -1946,6 +1962,7 @@ function SlaveRiskForm({ slave, onDone }) {
           is a different axis -- HOW MUCH, not which engine -- and picking
           it deletes the sizing block. So the word "mirror" is gone from
           here, and the consequence is stated rather than implied. */}
+      {!slave.sizing_per_route && (
       <label>
         How much
         <select value={form.mode} onChange={(e) => setForm({ ...form, mode: e.target.value })}>
@@ -1953,7 +1970,8 @@ function SlaveRiskForm({ slave, onDone }) {
           <option value="mirror_lots">Copy the master&apos;s lot count as-is</option>
         </select>
       </label>
-      {form.mode === "mirror_lots" && (
+      )}
+      {!slave.sizing_per_route && form.mode === "mirror_lots" && (
         <p className="muted small">
           <strong>This is not the engine mode.</strong> It removes this slave&apos;s risk
           sizing: the master&apos;s lot count is sent to the broker unchanged, so a CFD lot
@@ -1962,7 +1980,16 @@ function SlaveRiskForm({ slave, onDone }) {
         </p>
       )}
 
-      {form.mode === "pct_risk" && (
+      {slave.sizing_per_route && (
+        <p className="muted small">
+          Sizing is set on each route on this slave, so there is none to edit here -- a
+          slave-level block would save cleanly and never be read. Use{" "}
+          <strong>Sizing on every route</strong> above for that. The limits below are not
+          sizing and apply either way.
+        </p>
+      )}
+
+      {!slave.sizing_per_route && form.mode === "pct_risk" && (
         <>
           <p className="muted small">
             The share the master staked on each signal, taken from what its order actually risked
