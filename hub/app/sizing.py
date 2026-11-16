@@ -367,6 +367,7 @@ def compute_size(
     account_equity: float,
     contract_spec: Optional[ContractSpec],
     risk_scale: float = 1.0,
+    round_band: Optional[float] = None,
 ) -> SizingResult:
     """Computes the slave order size (contracts for futures, shares for
     equities/ETFs).
@@ -472,6 +473,57 @@ def compute_size(
     if units <= 0:
         return SizingResult(size=0, skipped=True, reason=f"computed size {size} is not positive")
 
+    # NEAR A WHOLE CONTRACT, OR STEP DOWN TO A SMALLER ONE.
+    #
+    # Rounding is the whole problem, and its cost depends on WHERE the
+    # exact figure falls, not on how large it is. 1.61 GC floors to 1 and
+    # throws away 38% of the intended risk; 1.90 rounds to 2 at a cost of
+    # 5%. Count alone cannot tell those two apart, which is why the
+    # min_contracts threshold this replaces sent both to the micros.
+    #
+    # Chris's rule, in his own figures: "the GC exact was 1.61, for this
+    # I'd accept when >1.75, round up. when <1.25 round down. favoring
+    # the larger single contracts despite losing some risk (up and down)
+    # on the rounding."
+    #
+    # ROUNDING UP RAISES RISK ABOVE TARGET, deliberately -- 1.76 becomes
+    # 2, some 14% over. max_risk_pct is the backstop for anything
+    # genuinely oversized.
+    #
+    # NEVER ROUNDS UP TO ONE from below. At 0.9 the band would say "take
+    # 1", 11% over, while the micro takes 9 of its own at no cost at all.
+    # Below a whole contract the smaller instrument always fits better,
+    # so that case steps down like any other.
+    #
+    # Applied only where a smaller alternative exists: the caller passes
+    # None for the last candidate, or a signal landing mid-band on the
+    # micro would step down to nothing and fill nothing at all.
+    if round_band is not None:
+        band = float(round_band)
+        down = math.floor(units)
+        frac = units - down
+        whole = None
+        if down >= 1 and frac <= band:
+            whole = down
+        elif down >= 1 and frac >= 1.0 - band:
+            whole = down + 1
+        if whole is None:
+            cost = (1 - down / units) * 100 if down >= 1 else 100.0
+            return SizingResult(
+                size=0, skipped=True,
+                reason=(
+                    f"wants {units:g} of them, not within {band:g} of a whole "
+                    f"contract -- rounding down would cost {cost:.0f}% of the "
+                    f"intended risk, so a smaller contract is the better fit"
+                ),
+            )
+        final = whole * min_size
+        return _within_ceiling(
+            final, sizing_config=sizing_config, entry_price=entry_price,
+            stop_price=stop_price, account_balance=account_balance,
+            account_equity=account_equity, contract_spec=contract_spec,
+        )
+
     rounding = sizing_config.get("rounding", "nearest_min1")
     if rounding == "floor":
         whole = math.floor(units)
@@ -494,7 +546,30 @@ def compute_size(
         raise ValueError(f"unknown sizing rounding {rounding!r} (expected 'nearest_min1' or 'floor')")
 
     final = whole * min_size
+    return _within_ceiling(
+        final, sizing_config=sizing_config, entry_price=entry_price,
+        stop_price=stop_price, account_balance=account_balance,
+        account_equity=account_equity, contract_spec=contract_spec,
+    )
 
+
+def _within_ceiling(
+    final: float,
+    *,
+    sizing_config: Dict[str, Any],
+    entry_price: float,
+    stop_price: Optional[float],
+    account_balance: float,
+    account_equity: float,
+    contract_spec: Optional[ContractSpec],
+) -> SizingResult:
+    """The max_risk_pct gate, shared by every rounding path.
+
+    Extracted when round_band gained its own path to `final`. Leaving the
+    gate inline would have meant one rounding rule reaching the ceiling
+    check and another bypassing it -- the kind of split where the second
+    path quietly stops being guarded.
+    """
     # Ceiling check. The min-one-contract floor above can hand back more size
     # than the model asked for, and when volatility widens stops a single
     # contract alone can carry more risk than the account should take. This is
