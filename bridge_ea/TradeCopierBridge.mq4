@@ -24,6 +24,10 @@
 //|   1.03 2026-11-11 CLOSE publishes the exit price, not the entry    |
 //|   1.04 2026-11-14 publish what the order actually staked, and     |
 //|                   report this build on the heartbeat               |
+//|   1.06 2026-11-16 the ATR is measured on the last CLOSED bar,     |
+//|                   which is the bar the EA sized from. Shift 0 was  |
+//|                   the forming one, stretching every slave stop --  |
+//|                   7% on H1 -- and making a run unrepeatable.       |
 //|   1.05 2026-11-15 the ATR follows the MAGIC, not this EA's chart.  |
 //|                   Until now every signal carried iATR() on         |
 //|                   PERIOD_CURRENT -- one figure for every strategy  |
@@ -31,13 +35,13 @@
 //|                   in daily ATRs. See AtrTimeframeForMagic().       |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.05"
+#property version   "1.06"
 // MUST match #property version above. MQL has no way to read that from
 // code, so the two are kept in step by hand -- and they had already
 // drifted once: the property said 1.04 while this said 1.03, which would
 // have had every master reporting the wrong build through the very
 // handshake added to stop that happening.
-#define   BRIDGE_VERSION "1.05"
+#define   BRIDGE_VERSION "1.06"
 
 #include <Zmq/Zmq.mqh>
 
@@ -54,6 +58,25 @@ input int    AtrTimeframe         = PERIOD_CURRENT; // fallback when the magic n
 //--- SLAVE's ATR already; without it here, only half the translation
 //--- happens. See the comment above PublishSignal's atr line.
 input bool   AtrTimeframeFromMagic = true;   // leading digit of the magic picks the ATR timeframe
+//--- Which bar the ATR is measured on. 1 is the last CLOSED bar, which is
+//--- what the fxDreema EAs size from (ACTIVE_BAR_ENTRY_ID resolves to 1
+//--- under EXEC_MODE 1) and what the FxdMaeEntryTest scripts use.
+//---
+//--- IT WAS 0 -- the FORMING bar -- so the ATR published alongside a
+//--- signal was not the ATR the EA had sized that signal with. The hub
+//--- divides the stop distance by this figure to get the multiple it
+//--- sends on, so the two disagreeing stretches every slave's stop by
+//--- whatever the forming bar happens to differ by. Measured on
+//--- 2026-11-16, the MAE step should produce exactly 3.0 ATR on every
+//--- timeframe and produced 3.0172 / 3.1145 / 3.2200 on D1 / H4 / H1:
+//--- the shorter the bar, the larger the part of it still forming, and
+//--- H1 came out 7% wide.
+//---
+//--- Shift 1 also makes a run REPEATABLE. The forming bar changes tick
+//--- by tick, so two identical signals a minute apart published two
+//--- different ATRs and sized differently for no reason a reader could
+//--- see.
+input int    AtrShift             = 1;       // 1 = last closed bar, 0 = the forming one
 
 Context zmqContext("bridge_ea_master");
 Socket  pubSocket(zmqContext, ZMQ_PUB);
@@ -288,7 +311,7 @@ void PublishSignal(string action, OrderSnapshot &o)
    //--- drift: leading digit 1 daily, 2 H4, 3 H1, 4 weekly, anything else
    //--- falls back to AtrTimeframe as before.
    int    atrTf = AtrTimeframeForMagic(o.magic);
-   double atr   = iATR(o.symbol, atrTf, AtrPeriod, 0);
+   double atr   = iATR(o.symbol, atrTf, AtrPeriod, AtrShift);
 
    // What this order actually put at risk, and what it was risked against.
    //

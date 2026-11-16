@@ -400,11 +400,26 @@ def test_the_slave_can_supply_the_deadline_for_every_gtd_route():
 
 
 def test_the_route_beats_the_slave():
+    """WAS TIME-DEPENDENT, and failed at 11:50 ET on 2026-11-16.
+
+    It asserted rth_open lands BEFORE afterhours_close. That holds in the
+    evening, when both are the next day -- and inverts during the session,
+    when afterhours_close is tonight and rth_open is tomorrow morning. The
+    test was written at 23:00 and passed for twelve hours.
+
+    What it means to check is that the ROUTE's value is used rather than
+    the slave's, so it now pins that directly: two boundaries whose order
+    cannot swap, because they are the same boundary a day apart."""
     a = _adapter(good_till="afterhours_close")
     route_said = a._stamp_entry_timing(_Entry(), _order(tif="GTD", good_till="rth_open"))
     slave_said = a._stamp_entry_timing(_Entry(), _order(tif="GTD"))
-    assert route_said.goodTillDate != slave_said.goodTillDate
-    assert route_said.goodTillDate < slave_said.goodTillDate
+    assert route_said.goodTillDate != slave_said.goodTillDate, (
+        "the slave's deadline was used for a route that named its own"
+    )
+    # And the route's value really is rth_open, whatever the hour: 09:30
+    # Eastern is 13:30 or 14:30 UTC depending on daylight saving.
+    assert route_said.goodTillDate[9:14] in ("13:30", "14:30"), route_said.goodTillDate
+    assert slave_said.goodTillDate[9:14] in ("00:00", "01:00"), slave_said.goodTillDate
 
 
 def test_a_non_gtd_entry_is_left_without_a_deadline():
