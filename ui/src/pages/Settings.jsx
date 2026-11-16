@@ -1189,11 +1189,14 @@ function RouteSizingForm({ slave, onDone }) {
 
         const first = routes.length ? routes[0].sizing : {};
         setForm({
-          risk_pct: first.risk_pct != null ? +(first.risk_pct * 100).toFixed(4) : "",
+          // risk_pct is carried, not shown. See the note above the save:
+          // the master's measured fraction replaces it on every signal.
+          risk_pct: first.risk_pct,
           max_risk_pct:
             first.max_risk_pct != null ? +(first.max_risk_pct * 100).toFixed(4) : "",
           capital_base: first.capital_base || "balance",
           rounding: first.rounding || "nearest_min1",
+          round_band: first.round_band != null ? first.round_band : "",
         });
       } catch (e) {
         setErr(e.message);
@@ -1205,23 +1208,17 @@ function RouteSizingForm({ slave, onDone }) {
     setBusy(true);
     setErr(null);
     try {
-      const risk = String(form.risk_pct).trim();
-      if (risk === "" || Number.isNaN(Number(risk)) || Number(risk) <= 0) {
-        throw new Error("risk per trade must be a percentage above zero");
-      }
       const cap = String(form.max_risk_pct).trim();
       if (cap !== "" && (Number.isNaN(Number(cap)) || Number(cap) <= 0)) {
-        throw new Error("the cap must be a percentage above zero, or blank for none");
+        throw new Error("the ceiling must be a percentage above zero, or blank for none");
       }
-      if (cap !== "" && Number(cap) < Number(risk)) {
-        // Not refused -- a cap below the per-trade figure is a legitimate
-        // way to say "never size this up" -- but it is nearly always a
-        // slip, and on twenty routes at once it is worth a word.
-        if (!window.confirm(
-          `The cap (${cap}%) is below the per-trade risk (${risk}%). Every signal ` +
-          `would be refused outright. Apply anyway?`)) {
-          setBusy(false);
-          return;
+      const band = String(form.round_band).trim();
+      if (band !== "") {
+        const b = Number(band);
+        if (Number.isNaN(b) || b < 0 || b >= 0.5) {
+          // 0.5 would make every size "near a whole contract" from both
+          // sides at once, so the step-down could never fire.
+          throw new Error("the step-down band must be between 0 and 0.5");
         }
       }
 
@@ -1234,7 +1231,12 @@ function RouteSizingForm({ slave, onDone }) {
         if (!r.sizing) return r;
         touched += 1;
         const sizing = { ...r.sizing };
-        sizing.risk_pct = Number(risk) / 100;
+        // risk_pct is left exactly as found. The master's own figure
+        // replaces it on every signal, so there is no field for it --
+        // but a slave fed by a bridge too old to publish one still
+        // falls back to it, and dropping it would resize those silently.
+        if (band === "") delete sizing.round_band;
+        else sizing.round_band = Number(band);
         if (cap === "") delete sizing.max_risk_pct;
         else sizing.max_risk_pct = Number(cap) / 100;
         sizing.capital_base = form.capital_base;
@@ -1256,7 +1258,7 @@ function RouteSizingForm({ slave, onDone }) {
   if (!full || !form) return <p className="muted small">Loading...</p>;
 
   return (
-    <div className="slave-risk-form with-notes">
+    <div className="slave-risk-form">
       {err && <div className="banner banner-error">{err}</div>}
 
       {mixed && (
@@ -1266,66 +1268,75 @@ function RouteSizingForm({ slave, onDone }) {
         </div>
       )}
 
-      <label>
-        Risk per trade <span className="muted small">% of {form.capital_base}</span>
-        <input
-          type="number"
-          step="0.05"
-          min="0"
-          value={form.risk_pct}
-          onChange={(e) => setForm({ ...form, risk_pct: e.target.value })}
-        />
-      </label>
+      <p className="muted small">
+        Sizing lives on each route here rather than on the slave, so this is what a
+        slave-wide figure means: the same values written to all <strong>{count}</strong> of
+        them. The share each signal stakes comes from what the master&apos;s order actually
+        risked, not from a percentage set here; risk calibration above decides how much of it
+        this slave takes.
+      </p>
 
-      <label>
-        Refuse above <span className="muted small">% -- blank for no ceiling</span>
-        <input
-          type="number"
-          step="0.05"
-          min="0"
-          value={form.max_risk_pct}
-          onChange={(e) => setForm({ ...form, max_risk_pct: e.target.value })}
-        />
-      </label>
+      <div className="field-row">
+        <label>
+          Measured against
+          <select
+            value={form.capital_base}
+            onChange={(e) => setForm({ ...form, capital_base: e.target.value })}
+          >
+            <option value="balance">Balance</option>
+            <option value="equity">Equity</option>
+          </select>
+        </label>
+        <label>
+          Refuse above (%)
+          <input
+            type="number"
+            step="0.05"
+            min="0"
+            value={form.max_risk_pct}
+            placeholder="none"
+            onChange={(e) => setForm({ ...form, max_risk_pct: e.target.value })}
+          />
+        </label>
+      </div>
+      <p className="muted small">
+        The smallest tradeable size can already risk more than the target -- a leveraged ETF on
+        a wide stop does. Over the ceiling the leg is refused rather than sized down, so a
+        ceiling close to the target means that instrument simply will not trade.
+      </p>
 
-      <label>
-        Measured against
-        <select
-          value={form.capital_base}
-          onChange={(e) => setForm({ ...form, capital_base: e.target.value })}
-        >
-          <option value="balance">balance</option>
-          <option value="equity">equity</option>
-        </select>
-      </label>
-
-      <label>
-        Rounding
-        <select
-          value={form.rounding}
-          onChange={(e) => setForm({ ...form, rounding: e.target.value })}
-        >
-          <option value="nearest_min1">nearest, never below one</option>
-          <option value="floor">floor -- skip rather than round up</option>
-        </select>
-      </label>
-
-      <aside className="side-note">
-        <p>
-          Applies to all <strong>{count}</strong> routes on this slave. Sizing lives on each
-          route here, so this is what a slave-wide figure means -- there is no slave-level
-          block, and one would be saved and never read.
-        </p>
-        <p>
-          <strong>Refuse above</strong> is a ceiling, not a trim: a signal working out above it
-          is declined outright rather than cut down. On an ETF leg that is usually volatility
-          too wide for the smallest tradeable size.
-        </p>
-        <p>
-          <strong>Floor</strong> rounding skips a signal that does not reach one whole unit,
-          rather than rounding it up to one. On a leveraged ETF that is the safer of the two.
-        </p>
-      </aside>
+      <div className="field-row">
+        <label>
+          Rounding
+          <select
+            value={form.rounding}
+            onChange={(e) => setForm({ ...form, rounding: e.target.value })}
+          >
+            <option value="nearest_min1">Nearest, never below one</option>
+            <option value="floor">Floor -- skip rather than round up</option>
+          </select>
+        </label>
+        <label>
+          Step down outside (band)
+          <input
+            type="number"
+            step="0.05"
+            min="0"
+            max="0.49"
+            value={form.round_band}
+            placeholder="off"
+            onChange={(e) => setForm({ ...form, round_band: e.target.value })}
+          />
+        </label>
+      </div>
+      <p className="muted small">
+        <strong>Floor</strong> skips a signal that does not reach one whole unit rather than
+        rounding it up to one. <strong>Band</strong> only applies where a route lists more than
+        one contract size: within that distance of a whole contract it takes it -- down from
+        just above, up from just below -- and outside it steps down to the smaller contract,
+        where the same money divides finer. 0.25 sends 1.61 contracts to the micros and keeps
+        1.90 as two.
+      </p>
 
       <div className="slave-actions">
         <button className="btn btn-small" onClick={save} disabled={busy}>
