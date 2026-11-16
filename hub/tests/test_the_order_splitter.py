@@ -531,3 +531,49 @@ def test_a_regrown_leg_that_was_rejected_is_reported(caplog):
     assert "UNPROTECTED" in caplog.text, (
         "a rejected protective leg on a grown position was never reported"
     )
+
+
+# =================================================== what it reports ====
+
+class TestSplitSummary:
+    """The splitter changes WHAT ARRIVES AT THE BROKER for a signal --
+    three orders over ten seconds instead of one. A setting that does
+    that while appearing on no screen is how a surprise gets built into a
+    money-moving system."""
+
+    @staticmethod
+    def _summary(config):
+        from app.api_routes import _split_summary
+        return _split_summary(config)
+
+    def test_nothing_configured_says_nothing(self):
+        assert self._summary({"routes": [{"target": "MGC"}]}) is None
+        assert self._summary({}) is None
+
+    def test_a_preference_list_is_named_by_its_first_candidate(self):
+        """target may be a preference list -- ["GC", "MGC"] is ONE
+        position, first tradeable wins. Printing the list reads like two
+        routes."""
+        assert self._summary({"routes": [
+            {"symbol": "XAUUSD", "target": ["GC", "MGC"],
+             "split_slices": 3, "split_interval": 5},
+        ]}) == "GC: 3 over 5s"
+
+    def test_a_slave_wide_split_is_reported_once(self):
+        assert self._summary({
+            "entry_split_slices": 4, "entry_split_interval": 30,
+        }) == "entries split into 4 over 30s"
+
+    def test_a_route_matching_the_slave_default_is_not_repeated(self):
+        """Saying it twice makes a reader look for a difference."""
+        assert self._summary({
+            "entry_split_slices": 4, "entry_split_interval": 30,
+            "routes": [{"target": "MGC", "split_slices": 4,
+                        "split_interval": 30}],
+        }) == "entries split into 4 over 30s"
+
+    def test_a_route_that_opted_out_is_not_reported_as_splitting(self):
+        assert self._summary({
+            "entry_split_slices": 4, "entry_split_interval": 30,
+            "routes": [{"target": "UGL", "split_slices": 0}],
+        }) == "entries split into 4 over 30s"

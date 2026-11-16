@@ -250,7 +250,12 @@ def _split_summary(config: Dict[str, Any]) -> Optional[str]:
         )
         if not r_slices or (r_slices, r_interval) == (slices, interval):
             continue
-        target = entry.get("target") or (entry.get("targets") or ["?"])[0]
+        # `target` may be a PREFERENCE LIST -- ["GC", "MGC"] is one
+        # position, first tradeable wins -- so the first candidate is the
+        # name for it. Printing the list itself reads like two routes.
+        target = entry.get("target") or entry.get("targets") or "?"
+        if isinstance(target, list):
+            target = target[0] if target else "?"
         lines.append(f"{target}: {r_slices} over {r_interval:g}s")
     return "; ".join(lines) or None
 
