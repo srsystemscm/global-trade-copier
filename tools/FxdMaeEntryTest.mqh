@@ -56,7 +56,8 @@ input int    MAE_DELAY_MS        = 1500;
 //--- single run produces the whole OPEN -> MODIFY -> CLOSE sequence the
 //--- copier has to carry. 0 leaves the trade open.
 //---
-//--- NOW 0 BY DEFAULT, and the trades are yours to close. It was 3000,
+//--- NOW 300000 -- five minutes -- so a run cleans up after itself while
+//--- still giving a resting order time to do something. It was 3000,
 //--- which made the whole sequence fit in six seconds and was right while
 //--- the thing under test was the SIGNAL path. It is wrong for anything
 //--- that has to REST:
@@ -70,8 +71,13 @@ input int    MAE_DELAY_MS        = 1500;
 //---   33 MGC does not fill against a six-second close either, which is
 //---   the case the order splitter exists for
 //---
-//--- Set it back to 3000 when testing OPEN -> MODIFY -> CLOSE end to end.
-input int    CloseAfterMs        = 0;
+//--- Five minutes covers the entry chase in full: four steps at sixty
+//--- seconds, plus time to fill. Set it to 3000 to test the signal path
+//--- end to end, or to 0 to leave the position open for good.
+//---
+//--- The wait is interruptible and closes on the way out, so stopping the
+//--- script does not leave a position behind.
+input int    CloseAfterMs        = 300000;
 
 //--- fxDreema's POINT_FORMAT_RULES, which decide what a "pip" is
 input string POINT_FORMAT_RULES  = "0.001=0.01,0.00001=0.0001,0.000001=0.0001";
@@ -183,11 +189,39 @@ void OnStart()
 
    if(CloseAfterMs > 0)
      {
-      Sleep(CloseAfterMs);
+      //--- INTERRUPTIBLE, not one long Sleep(). At 3000ms a blind sleep
+      //--- was fine; at the minutes these tests now need, a script that
+      //--- cannot be stopped is one you have to kill the terminal to get
+      //--- out of -- and killing it mid-wait is exactly how a position
+      //--- gets left open with nothing watching it.
+      //---
+      //--- So it waits in one-second steps, and CLOSES ON THE WAY OUT if
+      //--- you remove the script. The whole point of a timed close is
+      //--- that nothing is left behind; stopping early should not undo
+      //--- that.
+      int waited = 0;
+      bool stopped = false;
+      while(waited < CloseAfterMs)
+        {
+         if(IsStopped())
+           {
+            stopped = true;
+            break;
+           }
+         int step = (CloseAfterMs - waited > 1000) ? 1000 : (CloseAfterMs - waited);
+         Sleep(step);
+         waited += step;
+        }
+      if(stopped)
+         Print("Script stopped after ", waited, "ms of ", CloseAfterMs,
+               " -- closing ticket ", ticket, " anyway rather than leaving it open");
+      else
+         Print("Held ticket ", ticket, " for ", waited, "ms; closing now");
       CloseTicket(ticket, symbol, digits);
      }
    else
-      Print("Leaving ticket ", ticket, " open (CloseAfterMs = 0)");
+      Print("Leaving ticket ", ticket, " open (CloseAfterMs = 0) -- ",
+            "this trade and every slave leg it opened are yours to close");
   }
 
 //+------------------------------------------------------------------+
