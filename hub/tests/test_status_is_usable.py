@@ -165,11 +165,26 @@ def test_absent_blocks_report_as_null_rather_than_empty():
 # sizing has no `mode`, so an autonomous Schwab slave described itself as
 # "mirrors the master's lots" -- wrong, and reassuring, which is worse.
 
-def test_a_slave_level_block_reads_as_a_percentage():
+def test_a_slave_level_block_says_what_actually_decides_the_size():
+    """REWORDED 2026-11-16, and the old text was the bug.
+
+    It read "1.00% of balance", and that percentage is not used:
+    apply_master_risk() replaces risk_pct with what the master's order
+    actually staked on every signal a modern bridge sends. The dashboard
+    said 1.00% while 2% arrived -- a figure on screen that nothing
+    honours. Chris: "the sizing display is stale".
+
+    risk_pct is still named, as the fallback it has become: a master too
+    old to publish its own risk sizes from it."""
     summary = api_routes._sizing_summary(
         {"sizing": {"mode": "pct_risk", "risk_pct": 0.01,
                     "capital_base": "balance", "max_risk_pct": 0.025}})
-    assert summary == "1.00% of balance, capped 2.50%"
+    assert summary == (
+        "the master's staked risk, against balance, capped 2.50% "
+        "(1.00% if the master cannot say)")
+    assert "1.00% of balance" not in summary, (
+        "the headline percentage is back, and it is not the one used"
+    )
 
 
 def test_no_sizing_says_what_actually_happens():
@@ -181,7 +196,9 @@ def test_route_level_sizing_is_counted_not_hidden():
     config = {"routes": [
         {"sizing": {"mode": "pct_risk", "risk_pct": 0.01, "capital_base": "balance"}}
     ] * 20}
-    assert api_routes._sizing_summary(config) == "20 routes, all 1.00% of balance"
+    assert api_routes._sizing_summary(config) == (
+        "20 routes, all the master's staked risk, against balance "
+        "(1.00% if the master cannot say)")
 
 
 def test_per_target_sizing_is_not_mistaken_for_no_sizing():
@@ -201,7 +218,8 @@ def test_mixed_routes_are_spelled_out():
         {"sizing": {"mode": "dollar_notional", "notional": 5000}},
     ]}
     assert api_routes._sizing_summary(config) == (
-        "3 routes: 2x 1.00% of balance, 1x $5000 notional")
+        "3 routes: 2x the master's staked risk, against balance "
+        "(1.00% if the master cannot say), 1x $5000 notional")
 
 
 def test_a_slave_whose_sizing_is_not_slave_level_says_so():

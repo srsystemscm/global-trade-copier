@@ -782,7 +782,15 @@ function describeHeadline(slave) {
   if (/mirrors the master's lots/.test(sizing)) {
     return "NO RISK SIZING -- sends the master's lot count unchanged";
   }
-  if (!/\d+\.\d+% of/.test(sizing)) return sizing;   // lots, or something new
+  // "staked risk" is the pct_risk case as the hub now words it. The old
+  // test was /\d+\.\d+% of/, matching "1.00% of balance" -- and that
+  // phrasing went away on 2026-11-16 precisely because the percentage in
+  // it is overridden by what the master staked. Left as it was, this
+  // would have fallen through and printed the summary instead of the
+  // calibration line, quietly undoing the row.
+  if (!/staked risk/.test(sizing) && !/\d+\.\d+% of/.test(sizing)) {
+    return sizing;   // lots, or something new
+  }
 
   // RISK SCALE LEADS, and no percentage appears here at all.
   //

@@ -169,9 +169,22 @@ def _describe_sizing(sizing: Optional[Dict[str, Any]]) -> str:
         pct = sizing.get("risk_pct")
         base = sizing.get("capital_base", "balance")
         ceiling = sizing.get("max_risk_pct")
-        text = f"{pct:.2%} of {base}" if isinstance(pct, (int, float)) else f"pct_risk of {base}"
+        # LED WITH risk_pct UNTIL 2026-11-16, and that figure is not used.
+        # apply_master_risk() replaces it with what the master's order
+        # actually staked on every signal a modern bridge sends, so the
+        # line read "1.00% of balance" while 2% arrived -- a number on
+        # screen that nothing honours. Chris: "the sizing display is
+        # stale".
+        #
+        # What actually decides the size is said instead, with risk_pct
+        # named as the fallback it has become: a master too old to
+        # publish its own risk still sizes from it, so it is not dead,
+        # just no longer the headline.
+        text = f"the master's staked risk, against {base}"
         if isinstance(ceiling, (int, float)):
             text += f", capped {ceiling:.2%}"
+        if isinstance(pct, (int, float)):
+            text += f" ({pct:.2%} if the master cannot say)"
         return text
     if mode == "dollar_notional":
         return f"${sizing.get('notional')} notional"
@@ -422,7 +435,18 @@ def describe_mode(config: Dict[str, Any]) -> str:
 
     if mode == "autonomous":
         stop = "own stops from ATR"
-        where = f"{len(routes)} routed instrument{'' if len(routes) == 1 else 's'}" if routes else "routed"
+        # "routed" WAS SAID EVEN WITH NO ROUTES, which is the opposite of
+        # true: routing_is_strict() is false without a `routes` key, so
+        # such a slave takes every signal on its own symbol through
+        # symbol_map. mt5-dwx-futures-1 read "own stops from ATR, routed"
+        # while routing nothing at all.
+        if routes:
+            where = (f"{len(routes)} routed instrument"
+                     f"{'' if len(routes) == 1 else 's'}")
+        elif (config or {}).get("symbol_map"):
+            where = "the master's symbols, mapped"
+        else:
+            where = "the master's own symbols"
         return f"{stop}, {where}"
 
     # Mirror. The stop is the master's either way; the size is the question.
