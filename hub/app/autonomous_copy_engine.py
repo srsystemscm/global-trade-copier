@@ -214,6 +214,11 @@ class AutonomousCopyEngine(SessionGateMixin):
         # or two masters' positions collide in here as well as in the tables.
         self._positions: Dict[Tuple[str, int, str], dict] = {}
         self._consume_task: Optional[asyncio.Task] = None
+        # When this engine last took a signal off its queue. A stalled
+        # loop is otherwise invisible from outside -- the only symptom
+        # is an absence, and an absence looks exactly like a quiet
+        # master. Surfaced on /status.
+        self.last_consumed_at: float = 0.0
         self._monitor_task: Optional[asyncio.Task] = None
         self._deferred_task: Optional[asyncio.Task] = None
         # Declared here and not only in start(), because stop() reads it.
@@ -493,8 +498,36 @@ class AutonomousCopyEngine(SessionGateMixin):
         return round((at - (signal.received_at or signal.ts)) * 1000)
 
     async def _run(self) -> None:
+        """Drain this slave's signal queue for the life of the engine.
+
+        THIS LOOP MUST NOT END. It caught only AdapterError, so anything
+        else escaped, finished the task, and was never written down:
+        asyncio reports an un-retrieved task exception when the task is
+        garbage collected, and self._consume_task holds a reference for
+        the life of the engine, so it never is. The result is a live
+        engine with a dead loop -- connected, reporting healthy, and
+        dropping every signal from then on.
+
+        That happened four times on 2026-11-16. Eight signals reached
+        mt5-icm-1 and never reached ibkr-paper-1, and nothing anywhere
+        said so. A dropped signal is indistinguishable from one that was
+        never sent, which is the worst failure mode this system has.
+
+        The background fill-capture task already catches Exception and
+        logs it. The consume loop is the place where swallowing is less
+        dangerous than crashing, and it was the one place that did not.
+
+        CancelledError is deliberately NOT caught: it inherits from
+        BaseException, so shutdown still stops this loop. An engine that
+        could not be stopped would be a worse bug than the one this
+        fixes.
+        """
         while True:
             signal = await self.queue.get()
+            # Recorded BEFORE handling, and on every signal including the
+            # paused and refused ones: the question this answers is "is
+            # this loop alive", not "did it trade".
+            self.last_consumed_at = time.time()
             if self.paused:
                 logger.debug("slave=%s paused, dropping %s ticket=%s", self.slave_id, signal.action, signal.ticket)
                 continue
@@ -510,6 +543,26 @@ class AutonomousCopyEngine(SessionGateMixin):
                 await self._emit(
                     "slave_error", signal=signal, action=signal.action, message=str(exc)
                 )
+            except Exception as exc:  # noqa: BLE001 - see the docstring
+                # Loud, with a stack, and the loop carries on. One signal
+                # the handler could not cope with must not take the slave
+                # out for the rest of the session.
+                logger.exception(
+                    "slave=%s UNEXPECTED failure handling %s ticket=%s: %s -- "
+                    "the signal is dropped and this slave keeps consuming",
+                    self.slave_id, signal.action, signal.ticket, exc,
+                )
+                try:
+                    await self._emit(
+                        "slave_error", signal=signal, action=signal.action,
+                        message=f"unexpected {type(exc).__name__}: {exc}",
+                    )
+                except Exception:  # noqa: BLE001
+                    # Even the report failing must not end the loop.
+                    logger.exception(
+                        "slave=%s could not report the failure above",
+                        self.slave_id,
+                    )
 
     async def _handle(self, signal: Signal) -> None:
         if signal.action == "MODIFY":

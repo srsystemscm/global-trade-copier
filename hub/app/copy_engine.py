@@ -58,6 +58,12 @@ class CopyEngine(SessionGateMixin):
         self.slave_id = slave_id
         self.adapter = adapter
         self.queue = queue
+        # When this loop last took a signal off the queue. 0.0 means it
+        # has taken none since start. A stopped loop is otherwise
+        # invisible from outside -- the only symptom is an absence, and
+        # an absence looks exactly like a quiet master. Surfaced on
+        # /status alongside the queue depth.
+        self.last_consumed_at: float = 0.0
         # Mirror mode needs little of this, but naming it slave_config means
         # PATCH /slaves/{id} live-updates mirror engines too: it refreshes
         # engine.slave_config wherever that attribute exists.
@@ -309,8 +315,28 @@ class CopyEngine(SessionGateMixin):
         await self.events.emit(payload)
 
     async def _run(self) -> None:
+        """Drain this slave's signal queue for the life of the engine.
+
+        THIS LOOP MUST NOT END. See AutonomousCopyEngine._run for the
+        whole account -- this is the same loop with the same hazard, and
+        it is fixed here because the mirror engine sits behind the same
+        adapters. An exception that is not an AdapterError escapes,
+        finishes the task, and is never written down: asyncio only
+        reports an un-retrieved task exception when the task is garbage
+        collected, and self._task holds a reference for the life
+        of the engine. The result is a live engine with a dead loop --
+        connected, reporting healthy, and silently dropping every signal
+        from then on.
+
+        CancelledError is deliberately not caught: it inherits from
+        BaseException, so shutdown still stops this loop.
+        """
         while True:
             signal = await self.queue.get()
+            # Recorded BEFORE handling, and for the paused and refused
+            # signals too: this answers "is the loop alive", not "did it
+            # trade".
+            self.last_consumed_at = time.time()
             if self.paused:
                 logger.debug("slave=%s paused, dropping %s ticket=%s", self.slave_id, signal.action, signal.ticket)
                 continue
@@ -326,6 +352,21 @@ class CopyEngine(SessionGateMixin):
                 await self._emit(
                     "slave_error", signal=signal, action=signal.action, message=str(exc)
                 )
+            except Exception as exc:  # noqa: BLE001 - see the docstring
+                logger.exception(
+                    "slave=%s UNEXPECTED failure handling %s ticket=%s: %s -- "
+                    "the signal is dropped and this slave keeps consuming",
+                    self.slave_id, signal.action, signal.ticket, exc,
+                )
+                try:
+                    await self._emit(
+                        "slave_error", signal=signal, action=signal.action,
+                        message=f"unexpected {type(exc).__name__}: {exc}",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "slave=%s could not report the failure above", self.slave_id
+                    )
 
     async def _handle(self, signal: Signal) -> None:
         if signal.action == "OPEN":

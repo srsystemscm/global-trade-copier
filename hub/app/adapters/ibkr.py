@@ -272,6 +272,34 @@ class IBKRAdapter(BrokerAdapter):
                 "to use the IBKR adapter (kept optional so non-IBKR deployments don't need it)"
             ) from exc
 
+    def _require_connected(self):
+        """The live IB client, or a refusal the engine already understands.
+
+        Every one of these guards used to be `assert self.ib is not None`.
+        disconnect() sets self.ib = None (and a dropped session calls it),
+        so any call already in flight on the consume path raised
+        AssertionError -- which is not an AdapterError. It escaped
+        AutonomousCopyEngine._run, whose only handler was
+        `except AdapterError`, and ended that slave's consume task for the
+        life of the process with nothing logged anywhere. The engine stayed
+        a live object with a dead loop: /slaves still said connected, the
+        adapter reconnected, and every later signal for that slave was
+        dropped. See hub/tests/test_the_consume_loop_survives.py.
+
+        AdapterConnectionError is the type the engine knows how to refuse,
+        report and retry. The same went for the bare asserts: `python -O`
+        strips assertions entirely, which would have turned the identical
+        disconnect into AttributeError on None -- equally not an
+        AdapterError, equally fatal to the loop.
+        """
+        ib = self.ib
+        if ib is None:
+            raise AdapterConnectionError(
+                f"IBKRAdapter[{self.slave_id}] is not connected "
+                "(the session dropped, or disconnect() ran while this call was in flight)"
+            )
+        return ib
+
     async def connect(self) -> None:
         ib_mod = self._require_ib()
         self.ib = ib_mod.IB()
@@ -349,7 +377,7 @@ class IBKRAdapter(BrokerAdapter):
         expiry" rather than "the next liquid expiry" would sit in one of
         those.
         """
-        assert self.ib is not None, "adapter not connected"
+        self._require_connected()
         ib_mod = self._require_ib()
         spec = get_contract_spec(symbol)
         if spec is None:
@@ -437,7 +465,7 @@ class IBKRAdapter(BrokerAdapter):
         IBKR account are separated by giving each its own slot -- same
         contract size, so they stay risk-equivalent.
         """
-        assert self.ib is not None, "adapter not connected"
+        self._require_connected()
 
         cached = self._contracts.get((symbol, month_slot))
         if cached is not None and not self._is_expired(cached):
@@ -516,7 +544,7 @@ class IBKRAdapter(BrokerAdapter):
 
     async def open(self, order: OrderRequest) -> OrderResult:
         ib_mod = self._require_ib()
-        assert self.ib is not None, "adapter not connected"
+        self._require_connected()
 
         # Checked before any network work: a request that cannot become a
         # valid order should fail here, not after qualifying a contract and
@@ -687,7 +715,7 @@ class IBKRAdapter(BrokerAdapter):
 
     async def modify(self, slave_ticket: int, sl: Optional[float], tp: Optional[float]) -> None:
         ib_mod = self._require_ib()
-        assert self.ib is not None, "adapter not connected"
+        self._require_connected()
         pos = self._positions.get(slave_ticket)
         if pos is None:
             raise AdapterRejectedError(f"no tracked IBKR position for slave_ticket={slave_ticket}")
@@ -720,7 +748,7 @@ class IBKRAdapter(BrokerAdapter):
 
     async def close(self, slave_ticket: int) -> Optional[float]:
         ib_mod = self._require_ib()
-        assert self.ib is not None, "adapter not connected"
+        self._require_connected()
         pos = self._positions.get(slave_ticket)
         if pos is None:
             raise AdapterRejectedError(f"no tracked IBKR position for slave_ticket={slave_ticket}")
@@ -1197,7 +1225,7 @@ class IBKRAdapter(BrokerAdapter):
         to be filtered or it arrives looking like a plausible number.
         """
         ib_mod = self._require_ib()
-        assert self.ib is not None, "adapter not connected"
+        self._require_connected()
         contract = await self._contract_for_request(
             order.symbol, order.month_slot, order.contract_id)
         action = "BUY" if order.direction == "BUY" else "SELL"
@@ -1226,7 +1254,7 @@ class IBKRAdapter(BrokerAdapter):
         return self.ib is not None and self.ib.isConnected()
 
     async def get_account_summary(self, account_type: str) -> AccountSummary:
-        assert self.ib is not None, "adapter not connected"
+        self._require_connected()
         # accountSummaryAsync(), NOT accountSummary(): the sync accessor falls
         # back to self._run() when its cache is cold, which raises
         # "RuntimeError: This event loop is already running" inside the hub's
@@ -1243,7 +1271,7 @@ class IBKRAdapter(BrokerAdapter):
         self, symbol: str, period: int, month_slot: int = 0,
         contract_id: Optional[int] = None, bar_size: Optional[str] = None
     ) -> List[Bar]:
-        assert self.ib is not None, "adapter not connected"
+        self._require_connected()
         contract = await self._contract_for_request(symbol, month_slot, contract_id)
         size = bar_size or "1 day"
         bars = await self.ib.reqHistoricalDataAsync(
@@ -1259,7 +1287,7 @@ class IBKRAdapter(BrokerAdapter):
     async def get_quote(
         self, symbol: str, month_slot: int = 0, contract_id: Optional[int] = None
     ) -> float:
-        assert self.ib is not None, "adapter not connected"
+        self._require_connected()
         contract = await self._contract_for_request(symbol, month_slot, contract_id)
 
         attempts = 1 + max(0, int(self.quote_retries))
@@ -1292,7 +1320,7 @@ class IBKRAdapter(BrokerAdapter):
 
     async def _sample_quote(self, contract, symbol: str) -> float:
         """One subscribe-wait-read cycle. NaN when nothing arrived."""
-        assert self.ib is not None
+        self._require_connected()
         ticker = self.ib.reqMktData(contract, "", False, False)
         # asyncio.sleep, NOT ib.sleep(): IB.sleep() is a *synchronous* helper
         # that returns a bool, so `await self.ib.sleep(1)` raised
@@ -1398,7 +1426,7 @@ class IBKRAdapter(BrokerAdapter):
         A single-account login gets pinned anyway, so the reads are explicit
         rather than relying on IBKR's default.
         """
-        assert self.ib is not None
+        self._require_connected()
         available = list(self.ib.managedAccounts())
 
         if not available:
@@ -1438,7 +1466,7 @@ class IBKRAdapter(BrokerAdapter):
         """
         if self.account:
             order.account = self.account
-        assert self.ib is not None
+        self._require_connected()
         return self.ib.placeOrder(contract, order)
 
     def _protective(self, order, outside_rth: bool = False):
@@ -1666,7 +1694,7 @@ class IBKRAdapter(BrokerAdapter):
     async def get_contract_volume(
         self, symbol: str, month_slot: int = 0, contract_id: Optional[int] = None
     ) -> Optional[float]:
-        assert self.ib is not None, "adapter not connected"
+        self._require_connected()
         contract = await self._contract_for_request(symbol, month_slot, contract_id)
         ticker = self.ib.reqMktData(contract, "", False, False)
         await asyncio.sleep(self.quote_timeout)
@@ -1677,7 +1705,7 @@ class IBKRAdapter(BrokerAdapter):
         return float(volume)
 
     async def get_open_positions(self, account_type: str) -> List[Position]:
-        assert self.ib is not None, "adapter not connected"
+        self._require_connected()
         results = []
         for pos in self.ib.positions(self.account):
             if pos.position == 0:

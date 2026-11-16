@@ -473,6 +473,48 @@ def _trades_dated_contracts(config: Dict[str, Any]) -> bool:
     return False
 
 
+# A loop that has stopped consuming looks, from every other field on
+# this page, exactly like a loop with nothing to do. These three numbers
+# are what tell them apart. STALL_WARN_S is only how long a queue may sit
+# untouched before the summary says so out loud -- the engine is not
+# restarted on the strength of it.
+STALL_WARN_S = 60.0
+
+
+def _consume_health(engine) -> Optional[Dict[str, Any]]:
+    """Whether this slave's consume loop is still draining its queue.
+
+    Four engines stopped consuming on 2026-11-16 and the only symptom was
+    an absence: signals that reached one slave and never reached another.
+    Every field the dashboard had -- connected, running, paused -- was
+    still true, because they describe the adapter and the object, not the
+    loop. `alive` is the task itself; `queue_depth` with an old
+    `last_consumed_at` is a stall in progress whatever the task says.
+    """
+    if engine is None:
+        return None
+    queue = getattr(engine, "queue", None)
+    task = getattr(engine, "_consume_task", None) or getattr(engine, "_task", None)
+    last = float(getattr(engine, "last_consumed_at", 0.0) or 0.0)
+    depth = queue.qsize() if queue is not None else None
+    idle = round(time.time() - last, 1) if last else None
+    # Backed up AND untouched. A depth on its own is normal -- signals
+    # arrive in bursts and are drained in milliseconds.
+    stalled = bool(
+        (task is not None and task.done())
+        or (depth and (idle is None or idle > STALL_WARN_S))
+    )
+    return {
+        "queue_depth": depth,
+        "last_consumed_at": round(last, 1) if last else None,
+        "seconds_since_consumed": idle,
+        # False here means the loop has ENDED: every signal from now on
+        # is dropped, and nothing else on this page would say so.
+        "alive": None if task is None else not task.done(),
+        "stalled": stalled,
+    }
+
+
 async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
     engine = _find_engine(request, slave.id)
     mode = slave.config.get("mode", "mirror")
@@ -550,6 +592,9 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         "sizing_per_route": bool(
             _per_target_sizing(slave.config)
             or (not slave.config.get("sizing") and slave.config.get("routes"))),
+        # Is this slave's loop still taking signals off its queue? See
+        # _consume_health: nothing else on this page can answer that.
+        "consume": _consume_health(engine),
         **_slave_summary_extras(slave),
     }
 
