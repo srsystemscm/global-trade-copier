@@ -195,6 +195,53 @@ def apply_master_risk(
     return out
 
 
+# Both keys mean "the ceiling on margin", and until 2026-11-16 each
+# engine read only its own.
+#
+#   netting.max_margin_pct   autonomous  -- refuses, and steps down the
+#                                           candidate chain
+#   margin.max_pct_of_free   mirror      -- trims the size to fit
+#
+# So mt5-dwx-futures-1 carried margin.max_pct_of_free 0.25, ran
+# AUTONOMOUS, and was not capped at all: a setting that saves cleanly
+# and is never read. Both IBKR slaves carried netting.max_margin_pct and
+# showed no ceiling on screen, because the card reads the other key.
+# Mode is switchable from that card in two clicks, so a slave could
+# change which cap applies without anyone touching the cap.
+#
+# One resolver now, read by all three sites. The two ENGINES keep their
+# own behaviour -- trimming and refusing are different answers to the
+# same question and changing either silently is not a rename -- but they
+# can no longer disagree about whether a ceiling exists.
+MARGIN_CAP_KEYS = ("max_margin_pct", "max_pct_of_free")
+
+
+def resolve_margin_cap(
+    slave_config: Optional[Dict[str, Any]],
+    route_netting: Optional[Dict[str, Any]] = None,
+) -> Optional[float]:
+    """The margin ceiling in force, as a fraction, or None for no cap.
+
+    Most specific first: a route's own netting block, then the slave's
+    netting, then the legacy `margin` block. Either key is accepted in
+    any of them, so existing configs keep working untouched and the UI
+    can write one canonical place.
+    """
+    sources = (
+        route_netting,
+        (slave_config or {}).get("netting"),
+        (slave_config or {}).get("margin"),
+    )
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for key in MARGIN_CAP_KEYS:
+            value = src.get(key)
+            if value is not None:
+                return float(value)
+    return None
+
+
 def resolve_risk_scale(
     slave_config: Dict[str, Any],
     route_scale: Optional[float] = None,

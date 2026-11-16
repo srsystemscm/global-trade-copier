@@ -511,9 +511,14 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
             {(slave.netting.max_aggregate_risk_pct * 100).toFixed(1)}% aggregate/symbol
           </span>
         )}
-        {slave.margin?.max_pct_of_free != null && (
-          <span className="badge">
-            margin ceiling {(slave.margin.max_pct_of_free * 100).toFixed(0)}% of free
+        {/* The RESOLVED ceiling. This read margin.max_pct_of_free, one of
+            the two keys that mean this -- so the two IBKR slaves, which
+            carry netting.max_margin_pct, showed no ceiling at all while
+            being capped at 40%, and the Darwinex slave showed 25% while
+            its engine read the other key and capped nothing. */}
+        {slave.margin_cap_pct != null && (
+          <span className="badge" title="Initial margin may not exceed this share of free margin">
+            margin ceiling {(slave.margin_cap_pct * 100).toFixed(0)}% of free
           </span>
         )}
       </div>
@@ -1827,6 +1832,15 @@ function SlaveRiskForm({ slave, onDone }) {
             (got.config.netting || {}).max_aggregate_risk_pct != null
               ? +((got.config.netting || {}).max_aggregate_risk_pct * 100).toFixed(4)
               : "",
+          // Either key, since both have meant this. Saving writes the
+          // canonical one and clears the legacy block, so a slave cannot
+          // keep two answers to one question.
+          max_margin_pct: (() => {
+            const n = got.config.netting || {};
+            const m = got.config.margin || {};
+            const v = n.max_margin_pct != null ? n.max_margin_pct : m.max_pct_of_free;
+            return v != null ? +(v * 100).toFixed(4) : "";
+          })(),
           balance_adjustment: got.config.balance_adjustment != null ? String(got.config.balance_adjustment) : "",
           min_risk_capital: got.config.min_risk_capital != null ? String(got.config.min_risk_capital) : "",
         });
@@ -1883,6 +1897,25 @@ function SlaveRiskForm({ slave, onDone }) {
         if (!Number.isInteger(n) || n < 1) throw new Error("max legs must be a whole number of 1 or more");
         netting.max_legs = n;
       }
+      const marg = String(form.max_margin_pct).trim();
+      if (marg === "") {
+        delete netting.max_margin_pct;
+      } else {
+        const n = Number(marg);
+        if (Number.isNaN(n) || n <= 0 || n > 100) {
+          throw new Error("the margin ceiling must be a percentage above 0 and at most 100");
+        }
+        netting.max_margin_pct = n / 100;
+      }
+      // The legacy key is cleared whatever happens. Two keys for one
+      // ceiling is how a slave came to show 25% while being uncapped.
+      if (config.margin && config.margin.max_pct_of_free != null) {
+        const rest = { ...config.margin };
+        delete rest.max_pct_of_free;
+        if (Object.keys(rest).length) config.margin = rest;
+        else delete config.margin;
+      }
+
       const agg = String(form.max_aggregate_risk_pct).trim();
       if (agg === "") delete netting.max_aggregate_risk_pct;
       else {
@@ -2032,6 +2065,34 @@ function SlaveRiskForm({ slave, onDone }) {
           />
         </label>
       </div>
+
+      {/* NO FIELD EXISTED for this, on either form, while both IBKR
+          slaves ran with a 40% ceiling set through the API. It is the
+          cap that refused a 17,408-share UGL leg at 80% of the account,
+          so it is not a setting anybody should have to reach for curl to
+          change. Written to netting.max_margin_pct, the canonical key. */}
+      <div className="field-row">
+        <label>
+          Margin ceiling (% of free)
+          <input
+            type="number"
+            step="5"
+            min="0"
+            max="100"
+            value={form.max_margin_pct}
+            placeholder="no limit"
+            onChange={(e) => setForm({ ...form, max_margin_pct: e.target.value })}
+          />
+        </label>
+        <span />
+      </div>
+      <p className="muted small">
+        Risk and margin are different limits and either can bind first. A tight stop buys a
+        large position for the same risk, so a leg can sit well inside its risk ceiling and
+        still need most of the account to hold -- 17,408 UGL shares risked 1% and wanted 80%
+        of the balance. An autonomous slave refuses the leg and tries the next instrument on
+        the route; a mirror slave trims the size to fit.
+      </p>
       <p className="muted small">
         Several strategies on one symbol are a single correlated bet. The leg cap counts
         same-side positions; the combined cap adds up what they risk together and refuses the

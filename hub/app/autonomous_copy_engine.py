@@ -21,6 +21,7 @@ from app.session_gate import SessionGateMixin
 from app.sizing import (
     resolve_balance_adjustment,
     apply_master_risk, capital_base_amount, compute_size, merge_sizing,
+    resolve_margin_cap,
     resolve_risk_scale,
     risk_figures,
     resolve_sizing_config,
@@ -944,8 +945,8 @@ class AutonomousCopyEngine(SessionGateMixin):
         would cost alone, and a cached total would be stale exactly while
         positions were moving.
         """
-        policy = route.netting or self.netting_policy
-        cap_pct = policy.get("max_margin_pct")
+        # Either key, wherever it is carried -- see resolve_margin_cap.
+        cap_pct = resolve_margin_cap(self.slave_config, route.netting)
         if cap_pct is None:
             return None
 

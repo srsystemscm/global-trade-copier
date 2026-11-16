@@ -11,6 +11,7 @@ from app.adapters.base import AdapterError
 from app.config import settings
 from app.db import db_cursor, get_config_value, list_logs, set_config_value
 from app.engine_manager import start_engine_for_slave, stop_engine
+from app.sizing import resolve_margin_cap
 from app.slaves import (
     delete_slave,
     get_slave,
@@ -511,6 +512,11 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         # refused, and margin.max_pct_of_free is why a size gets reduced.
         "netting": slave.config.get("netting") or None,
         "margin": slave.config.get("margin") or None,
+        # The ceiling ACTUALLY IN FORCE, from whichever key carries it.
+        # The card used to read margin.max_pct_of_free directly and so
+        # showed no ceiling on the two slaves that had one, while showing
+        # one on the slave whose engine never read it.
+        "margin_cap_pct": resolve_margin_cap(slave.config),
         # A line a reader can act on without opening the JSON, and the only
         # place the per-route case is represented at all.
         "sizing_summary": _sizing_summary(slave.config),

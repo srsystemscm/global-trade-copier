@@ -12,6 +12,7 @@ from app.models import Signal
 from app.notifier import Notifier
 from app.risk_controls import is_within_trading_hours
 from app.session_gate import SessionGateMixin
+from app.sizing import resolve_margin_cap
 
 logger = logging.getLogger(__name__)
 
@@ -156,9 +157,14 @@ class CopyEngine(SessionGateMixin):
         it costs a round trip, and a slave whose instruments are nowhere near
         its margin has no use for it.
         """
-        policy = self.slave_config.get("margin")
-        if policy is None:
+        # Either key, wherever it is carried. This read `margin` alone, so
+        # a mirror slave configured with netting.max_margin_pct -- the key
+        # the autonomous engine uses, and the one the UI writes -- was not
+        # capped at all.
+        cap_pct = resolve_margin_cap(self.slave_config)
+        if cap_pct is None:
             return plan.lots, None
+        policy = {"max_pct_of_free": cap_pct}
 
         preview_margin = getattr(self.adapter, "preview_margin", None)
         if preview_margin is None:
