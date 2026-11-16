@@ -882,7 +882,19 @@ class AutonomousCopyEngine(SessionGateMixin):
                         if has_smaller_alternative else None),
         )
         if sizing_result.skipped:
-            return None, sizing_result.reason
+            # THE MEASUREMENT, not just the verdict. Each candidate reads
+            # its OWN contract's bars -- GCZ6 and MGCZ6 are different
+            # instruments -- so a micro's ATR is not exactly a tenth of
+            # its parent's, and the step-down target is not exactly ten
+            # times. On 2026-11-16 "GC: wants 0.729226 of them" was
+            # followed by MGC taking 6 where 7.29 would floor to 7, and
+            # nothing in the log could say why. Now it can.
+            return None, (
+                f"{sizing_result.reason} "
+                f"[atr {slave_atr:.4f} on {bar_size or 'default'}, "
+                f"stop {abs(quote - slave_sl):.4f}]"
+                if slave_sl is not None else sizing_result.reason
+            )
 
         return {
             "symbol": target_symbol, "spec": spec, "atr": slave_atr,
@@ -1173,8 +1185,10 @@ class AutonomousCopyEngine(SessionGateMixin):
         if rejected:
             # "Why did it take MNG today" has to be answerable afterwards.
             logger.info(
-                "slave=%s chose %s over %s -- %s",
-                self.slave_id, chosen["symbol"],
+                "slave=%s chose %s (atr %.4f, stop %.4f, size %g) over %s -- %s",
+                self.slave_id, chosen["symbol"], chosen["atr"],
+                abs(chosen["quote"] - chosen["sl"]) if chosen.get("sl") is not None else 0.0,
+                chosen["sizing_result"].size,
                 ", ".join(c for c, _ in rejected),
                 "; ".join("%s: %s" % r for r in rejected),
             )

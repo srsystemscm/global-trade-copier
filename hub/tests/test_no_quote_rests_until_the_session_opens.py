@@ -83,8 +83,16 @@ def test_a_decision_is_not_marked():
     nothing'. Both say the same thing on every retry, so deferring them
     would hold a signal for hours to re-derive an answer already known."""
     src = _source()
-    assert "return None, sizing_result.reason" in src
+    # Asserted on the MEANING, not the literal line. This pinned
+    # `return None, sizing_result.reason` verbatim and broke when that
+    # reason gained the ATR and stop it was measured with -- a change
+    # that says nothing about whether the reason is transient.
+    assert "sizing_result.reason" in src
     assert "Unavailable(sizing_result.reason)" not in src
+    assert "Unavailable(f\"{sizing_result.reason}" not in src, (
+        "a sizing decision is marked transient, so it would be retried "
+        "for hours to re-derive an answer already known"
+    )
     # A target preflight could not resolve is not transient either.
     assert "return None, blocked" in src
     assert "Unavailable(blocked)" not in src
