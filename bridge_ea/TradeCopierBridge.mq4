@@ -22,15 +22,22 @@
 //|   1.01 2026-09-10 fixes from the first real terminal shakeout      |
 //|   1.02 2026-10-29 magic number carried through the signal          |
 //|   1.03 2026-11-11 CLOSE publishes the exit price, not the entry    |
+//|   1.04 2026-11-14 publish what the order actually staked, and     |
+//|                   report this build on the heartbeat               |
+//|   1.05 2026-11-15 the ATR follows the MAGIC, not this EA's chart.  |
+//|                   Until now every signal carried iATR() on         |
+//|                   PERIOD_CURRENT -- one figure for every strategy  |
+//|                   -- so an H4 stop arrived at the slave measured   |
+//|                   in daily ATRs. See AtrTimeframeForMagic().       |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.04"
+#property version   "1.05"
 // MUST match #property version above. MQL has no way to read that from
 // code, so the two are kept in step by hand -- and they had already
 // drifted once: the property said 1.04 while this said 1.03, which would
 // have had every master reporting the wrong build through the very
 // handshake added to stop that happening.
-#define   BRIDGE_VERSION "1.04"
+#define   BRIDGE_VERSION "1.05"
 
 #include <Zmq/Zmq.mqh>
 
