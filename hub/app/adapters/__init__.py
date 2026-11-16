@@ -85,6 +85,10 @@ def create_adapter(slave: SlaveConfig) -> BrokerAdapter:
             # deadline anywhere is refused at placement rather than sent to
             # IBKR as an order that never expires.
             good_till=slave.config.get("good_till"),
+            # "strict" (default) or "last_close". See IBKRAdapter._sample_quote:
+            # only a slave whose entries are resting limits should price off a
+            # stale figure.
+            quote_fallback=slave.config.get("quote_fallback", "strict"),
             account=slave.config.get("account"),
         )
 

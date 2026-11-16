@@ -149,6 +149,7 @@ class IBKRAdapter(BrokerAdapter):
         exit_chase_pct: float = 0.002,
         entry_timeout: float = 900.0,
         good_till: Optional[object] = None,
+        quote_fallback: str = "strict",
         account: Optional[str] = None,
     ) -> None:
         self.slave_id = slave_id
@@ -205,6 +206,12 @@ class IBKRAdapter(BrokerAdapter):
         # naming one. No default: GTD with nothing to expire at is refused
         # rather than quietly becoming GTC, which is what it did before.
         self.entry_good_till = good_till
+        # What to do when IBKR quotes -1 -- "no market on this line".
+        # "strict" refuses, which is right for a market order. "last_close"
+        # prices from the last trade or the session close, which is right
+        # for a resting limit in a session IBKR will not quote but will
+        # trade: see _sample_quote.
+        self.quote_fallback = (quote_fallback or "strict").lower()
         # Which of the login's accounts this slave trades. Empty means
         # "work it out at connect time" -- see _resolve_account().
         self.account = account or ""
@@ -1166,12 +1173,36 @@ class IBKRAdapter(BrokerAdapter):
         # all. So fall back to the last trade, then the session close,
         # before giving up. A -1 is left to fail below: that is IBKR
         # stating there is no market, and a stale close is no substitute.
-        if price != price:
+        #
+        # A -1 USED TO FALL STRAIGHT THROUGH TO THE REFUSAL, on the
+        # reasoning that IBKR is stating there is no market and a stale
+        # close is no substitute. That reasoning holds for a market order
+        # on a futures leg. It is wrong for the ETF legs, and Chris caught
+        # it: "UGL is trading EXO hours on schwab right now" -- at 22:38
+        # on a Sunday, inside the 24/5 overnight session. The hub's own
+        # log agrees, carrying marketPrice=39.2155 for the UGL position
+        # from IBKR's account feed at the very moment reqMktData returned
+        # -1. So the instrument is trading and IBKR holds a price for it;
+        # what is missing is a quote on THIS market-data line.
+        #
+        # Enabled per slave, and off by default, because the two cases
+        # really are different. These routes place a LIMIT that rests with
+        # outside_rth set, so a stale anchor costs a missed fill, never a
+        # bad one -- a BUY limit priced below a market that has risen
+        # simply does not fill. A market order priced off a stale close is
+        # a genuinely bad fill, which is why futures slaves keep the
+        # strict behaviour.
+        #
+        # Sizing is unaffected either way: the stop distance is ATR-based,
+        # so only the limit's anchor is stale, not the risk.
+        stale_ok = self.quote_fallback == "last_close"
+        if price != price or (price <= 0 and stale_ok):
+            why = "no marketPrice" if price != price else f"marketPrice={price:g}"
             for name, candidate in (("last", ticker.last), ("close", ticker.close)):
                 if candidate is not None and candidate == candidate and candidate > 0:
                     logger.info(
-                        "IBKRAdapter[%s] %s had no marketPrice; using %s=%s",
-                        self.slave_id, symbol, name, candidate,
+                        "IBKRAdapter[%s] %s had %s; using %s=%s",
+                        self.slave_id, symbol, why, name, candidate,
                     )
                     price = float(candidate)
                     break
