@@ -147,6 +147,9 @@ class IBKRAdapter(BrokerAdapter):
         fill_timeout: float = 10.0,
         exit_chase_steps: int = 4,
         exit_chase_pct: float = 0.002,
+        entry_chase_steps: int = 0,
+        entry_chase_interval: float = 300.0,
+        entry_chase_max_pct: float = 0.01,
         entry_timeout: float = 900.0,
         good_till: Optional[object] = None,
         quote_fallback: str = "strict",
@@ -196,6 +199,20 @@ class IBKRAdapter(BrokerAdapter):
         # the route's own limit_offset_pct where it has one.
         self.exit_chase_steps = exit_chase_steps
         self.exit_chase_pct = exit_chase_pct
+        # How a RESTING ENTRY follows the market. Off by default: every
+        # slave behaves exactly as it does today until this is set.
+        #
+        # The entry's problem is a stale anchor, not an over-aggressive
+        # price, so each step re-prices from a FRESH QUOTE rather than
+        # from its own last limit -- see await_entry_fill.
+        self.entry_chase_steps = entry_chase_steps
+        self.entry_chase_interval = entry_chase_interval
+        # How far the limit may drift from where it started, as a
+        # fraction. The stop is fixed in absolute terms, so filling worse
+        # than sizing assumed means risking more than was sized for --
+        # this is what bounds that, and it is why the entry chase has a
+        # ceiling where the exit chase has only a step count.
+        self.entry_chase_max_pct = entry_chase_max_pct
         # How long a LIMIT entry may rest before it is cancelled outright.
         # Not the same question as fill_timeout: a market order that hasn't
         # filled in ten seconds is a problem, while a limit resting in a thin
@@ -615,6 +632,13 @@ class IBKRAdapter(BrokerAdapter):
                     "UNPROTECTED on that side. %s",
                     self.slave_id, label, slave_ticket, status, why,
                 )
+        # Stashed for the entry chase, which later has to recompute
+        # "through the quote" against a FRESH quote and no longer has the
+        # route that chose the offset.
+        try:
+            trade.order._gtc_offset = float(order.limit_offset_pct or 0.0)
+        except Exception:  # pragma: no cover - ib_async orders accept it
+            pass
         self._entry_trades[slave_ticket] = trade
         # How long THIS entry may rest, remembered beside the trade because
         # _collect_fill is handed a ticket and no longer has the order. A
@@ -864,11 +888,123 @@ class IBKRAdapter(BrokerAdapter):
         # something wrong with it whatever the route says.
         if is_limit and slave_ticket in self._entry_waits:
             timeout = self._entry_waits[slave_ticket]
-        price, size = await self._await_fill(trade, "entry", timeout)
+        if is_limit and self.entry_chase_steps > 0:
+            price, size = await self._chase_entry(trade, timeout)
+        else:
+            price, size = await self._await_fill(trade, "entry", timeout)
         if price is not None:
             self._entry_trades.pop(slave_ticket, None)
             self._entry_waits.pop(slave_ticket, None)
         return price, size
+
+    async def _chase_entry(self, trade, timeout: float):
+        """Wait for a resting entry, re-pricing it toward the quote.
+
+        The wait is cut into slices of entry_chase_interval. After each
+        slice that did not fill, the broker is asked for a fresh quote and
+        the limit is moved to it -- the same `quote x (1 +/- offset)` the
+        order was first priced with, recomputed against a market that has
+        since opened.
+
+        WHY NOT STEP FROM THE PREVIOUS LIMIT, which is what the exit
+        chase does: an unfilled sell exit proves the market is below it,
+        so stepping down from its own price is sound. An unfilled entry
+        priced through a stale close proves only that the close was
+        stale. Stepping blindly from it would walk away from the market
+        as readily as toward it.
+
+        A slice with NO usable quote spends no step. Between 20:00 and
+        04:00 ET that is every slice, and burning the budget against a
+        shut line would leave nothing for the open.
+
+        The walk only ever moves toward the market, and never further
+        than entry_chase_max_pct from the original limit. Chasing an
+        entry upward raises the realised risk, because the stop was
+        already fixed when the position was sized.
+        """
+        original = float(trade.order.lmtPrice)
+        action = trade.order.action
+        symbol = getattr(trade.contract, "symbol", None)
+        offset = float(getattr(trade.order, "_gtc_offset", 0.0) or 0.0)
+        # ROUNDED TO A TICK HERE, once. The clamp below used to be applied
+        # AFTER rounding the wanted price, so a clamped order went out at
+        # the raw ceiling -- 39.9455 on a penny-increment stock, which is
+        # not a price IBKR accepts. Its own test caught it. Rounding the
+        # ceiling instead means both the wanted price and the clamp are
+        # on ticks, and the clamp can no longer undo the rounding.
+        worst = self._round_to_tick(
+            original * (1 + self.entry_chase_max_pct) if action == "BUY"
+            else original * (1 - self.entry_chase_max_pct),
+            symbol,
+        )
+
+        # A DEADLINE, not a decremented counter. The first version of this
+        # subtracted each slice from a remaining total, which never
+        # terminates when the interval is 0 -- `remaining -= 0.0`, forever,
+        # pinning a core. Its own test hung and caught it. A monotonic
+        # deadline is correct whatever the interval is, and the 0.05 floor
+        # below guarantees the loop always advances.
+        deadline = time.monotonic() + float(timeout)
+        steps_used = 0
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            if steps_used < self.entry_chase_steps:
+                slice_s = min(max(self.entry_chase_interval, 0.05), left)
+            else:
+                slice_s = left
+            price, size = await self._await_fill(trade, "entry", slice_s)
+            if price is not None:
+                return price, size
+            if steps_used >= self.entry_chase_steps:
+                break
+            if deadline - time.monotonic() <= 0:
+                break
+            if trade.orderStatus.status in (
+                    "Cancelled", "ApiCancelled", "Inactive", "Filled"):
+                break
+
+            try:
+                quote = await self.get_quote(symbol)
+            except AdapterError as exc:
+                logger.info(
+                    "IBKRAdapter[%s] entry %s still resting; no quote to "
+                    "re-price through yet (%s) -- the step is not spent",
+                    self.slave_id, trade.order.orderId, exc,
+                )
+                continue
+
+            through = (1 + offset) if action == "BUY" else (1 - offset)
+            want = self._round_to_tick(quote * through, symbol)
+            # Toward the market only, and never past the ceiling.
+            if action == "BUY":
+                want = min(want, worst)
+                moved = want > float(trade.order.lmtPrice)
+            else:
+                want = max(want, worst)
+                moved = want < float(trade.order.lmtPrice)
+            if not moved:
+                logger.info(
+                    "IBKRAdapter[%s] entry %s: the quote (%s) does not ask "
+                    "for a better price than %s, leaving it",
+                    self.slave_id, trade.order.orderId, quote,
+                    trade.order.lmtPrice,
+                )
+                continue
+
+            steps_used += 1
+            logger.warning(
+                "IBKRAdapter[%s] entry %s still resting at %s; re-pricing to "
+                "%s against a fresh quote of %s (chase %d of %d, ceiling %s)",
+                self.slave_id, trade.order.orderId, trade.order.lmtPrice,
+                want, quote, steps_used, self.entry_chase_steps,
+                self._round_to_tick(worst, symbol),
+            )
+            trade.order.lmtPrice = want
+            self._place(trade.contract, trade.order)
+
+        return None, None
 
     async def _settle_cancel(self, trade, label: str, timeout: float = 5.0):
         """Wait for a cancel REQUEST to resolve, and report what filled.

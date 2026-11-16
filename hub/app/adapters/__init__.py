@@ -89,6 +89,13 @@ def create_adapter(slave: SlaveConfig) -> BrokerAdapter:
             # only a slave whose entries are resting limits should price off a
             # stale figure.
             quote_fallback=slave.config.get("quote_fallback", "strict"),
+            # A resting entry follows the quote. 0 steps = off, which is
+            # how every slave behaves until it is configured.
+            entry_chase_steps=int(slave.config.get("entry_chase_steps", 0)),
+            entry_chase_interval=float(
+                slave.config.get("entry_chase_interval", 300.0)),
+            entry_chase_max_pct=float(
+                slave.config.get("entry_chase_max_pct", 0.01)),
             account=slave.config.get("account"),
         )
 
