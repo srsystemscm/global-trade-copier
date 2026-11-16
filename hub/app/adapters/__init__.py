@@ -96,6 +96,13 @@ def create_adapter(slave: SlaveConfig) -> BrokerAdapter:
                 slave.config.get("entry_chase_interval", 300.0)),
             entry_chase_max_pct=float(
                 slave.config.get("entry_chase_max_pct", 0.01)),
+            # An entry too large for one print goes out in slices. The
+            # slave-level default; a route may set its own, and 0 or 1
+            # slices is off -- which is how every slave behaves until it
+            # is configured.
+            entry_split_slices=int(slave.config.get("entry_split_slices", 0)),
+            entry_split_interval=float(
+                slave.config.get("entry_split_interval", 0.0)),
             account=slave.config.get("account"),
         )
 

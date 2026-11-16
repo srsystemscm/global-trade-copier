@@ -24,6 +24,7 @@ from app.adapters.base import (
 )
 from app.atr import Bar
 from app.contract_specs import get_contract_spec
+from app.order_split import resolve_split, split_sizes
 from app.order_timing import OrderTimingError, resolve_good_till, seconds_until
 
 logger = logging.getLogger(__name__)
@@ -150,6 +151,8 @@ class IBKRAdapter(BrokerAdapter):
         entry_chase_steps: int = 0,
         entry_chase_interval: float = 300.0,
         entry_chase_max_pct: float = 0.01,
+        entry_split_slices: int = 0,
+        entry_split_interval: float = 0.0,
         entry_timeout: float = 900.0,
         good_till: Optional[object] = None,
         quote_fallback: str = "strict",
@@ -213,6 +216,18 @@ class IBKRAdapter(BrokerAdapter):
         # this is what bounds that, and it is why the entry chase has a
         # ceiling where the exit chase has only a step count.
         self.entry_chase_max_pct = entry_chase_max_pct
+        # How an entry too large for one print is placed: N orders,
+        # entry_split_interval seconds apart, same instrument and
+        # direction, collapsing into ONE tracked position. Off by default,
+        # and a route may set its own.
+        #
+        # One position rather than N is the whole point. Chris: "one
+        # instrument easier to track and roll". N positions would mean N
+        # registry rows, N pairs of protective legs, N things the roll has
+        # to find, and a MODIFY arriving against whichever one the lookup
+        # happened to return.
+        self.entry_split_slices = entry_split_slices
+        self.entry_split_interval = entry_split_interval
         # How long a LIMIT entry may rest before it is cancelled outright.
         # Not the same question as fill_timeout: a market order that hasn't
         # filled in ten seconds is a problem, while a limit resting in a thin
@@ -241,6 +256,24 @@ class IBKRAdapter(BrokerAdapter):
         # await_entry_fill(). Popped on collection, so a long-resting order
         # holds one entry and nothing accumulates.
         self._entry_trades: Dict[int, object] = {}
+        # slave_ticket -> EVERY slice's Trade, the first one included.
+        #
+        # _entry_trades above keeps the FIRST slice, because its orderId is
+        # the slave_ticket and because the entry chase and the roll each
+        # want one Trade. This holds all of them, and it is what the three
+        # places that have to reason about "the entry" read: the fill is the
+        # sum across slices, the cancel has to reach every one, and a close
+        # has to settle every one. An unsplit entry is a list of one, so
+        # there is one code path rather than two.
+        self._entry_slices: Dict[int, List[object]] = {}
+        # slave_ticket -> the task placing the slices still to come.
+        # Cancelled when the position goes, so a CLOSE arriving mid-window
+        # cannot be followed by another slice landing against nothing.
+        self._split_tasks: Dict[int, asyncio.Task] = {}
+        # slave_ticket -> how long the schedule runs for, so await_entry_fill
+        # waits out the window instead of abandoning the entry halfway
+        # through placing it.
+        self._split_windows: Dict[int, float] = {}
         # slave_ticket -> how long this particular entry may rest
         self._entry_waits: Dict[int, float] = {}
         self._exit_trades: Dict[int, object] = {}
@@ -335,6 +368,13 @@ class IBKRAdapter(BrokerAdapter):
                 # builds a fresh IB() -- so never let this stop a reconnect.
                 logger.debug("IBKRAdapter[%s] disconnect of a dead session: %s", self.slave_id, exc)
             self.ib = None
+            # Any slice schedule still running belongs to the session that
+            # has just gone. Left alive it would wake up and place an order
+            # through a client that no longer exists -- and recovery
+            # reconciles against the broker, so a slice arriving after that
+            # is a position nothing has a row for.
+            for ticket in list(self._split_tasks):
+                self._stop_splitting(ticket)
             # Qualified contracts are keyed to the old session's conIds. They
             # survive a reconnect in practice, but re-qualifying is cheap and
             # a stale handle fails as a rejected order.
@@ -567,12 +607,20 @@ class IBKRAdapter(BrokerAdapter):
                 self.slave_id, order.symbol, order.sl, sl_price, order.tp, tp_price,
             )
 
+        # How this entry goes out: one order, or several over a window.
+        # Everything below is written in terms of `first` rather than
+        # order.size, because what is at the broker right now is the first
+        # slice -- and a stop sized to the intended total while only the
+        # first slice is working is a short position waiting for a touch.
+        sizes = self._slices_for(order)
+        first = sizes[0]
+
         if order.order_type == "limit":
             entry = ib_mod.LimitOrder(
-                action, order.size, self._round_to_tick(order.limit_price, order.symbol)
+                action, first, self._round_to_tick(order.limit_price, order.symbol)
             )
         else:
-            entry = ib_mod.MarketOrder(action, order.size)
+            entry = ib_mod.MarketOrder(action, first)
         entry.outsideRth = order.outside_rth
         # Time in force, and the GTD deadline that makes GTD mean anything.
         self._stamp_entry_timing(entry, order)
@@ -606,14 +654,14 @@ class IBKRAdapter(BrokerAdapter):
             oca_group = f"tc-{self.slave_id}-{slave_ticket}"
             if sl_price is not None:
                 sl_order = self._protective(
-                    ib_mod.StopOrder(closing_action, order.size, sl_price), order.outside_rth)
+                    ib_mod.StopOrder(closing_action, first, sl_price), order.outside_rth)
                 sl_order.ocaGroup = oca_group
                 sl_order.ocaType = 1  # cancel the sibling order(s) once one fills
                 _stamp(sl_order, order.order_ref)
                 sl_order_id = self._place(contract, sl_order).order.orderId
             if tp_price is not None:
                 tp_order = self._protective(
-                    ib_mod.LimitOrder(closing_action, order.size, tp_price), order.outside_rth)
+                    ib_mod.LimitOrder(closing_action, first, tp_price), order.outside_rth)
                 tp_order.ocaGroup = oca_group
                 tp_order.ocaType = 1
                 _stamp(tp_order, order.order_ref)
@@ -622,7 +670,20 @@ class IBKRAdapter(BrokerAdapter):
         self._positions[slave_ticket] = {
             "contract": contract,
             "direction": order.direction,
-            "size": order.size,
+            # What the broker holds or is working for this position RIGHT
+            # NOW, which for a split entry grows as the slices go out. The
+            # exit is sized from this and so are the protective legs, so it
+            # has to be the live figure rather than the intention.
+            "size": first,
+            # What it is meant to reach once every slice is placed. Kept
+            # only so the logs and the dashboard can say "9 of 35" instead
+            # of looking like a sizing error.
+            "intended_size": order.size,
+            # The LEVELS, not just the order ids. A split entry has to
+            # re-place its legs at a larger size as it grows, and it cannot
+            # ask the orders it just cancelled what price they were at.
+            "sl": sl_price,
+            "tp": tp_price,
             "sl_order_id": sl_order_id,
             "tp_order_id": tp_order_id,
             # Kept so the EXIT can mirror the entry. A position opened with a
@@ -642,24 +703,7 @@ class IBKRAdapter(BrokerAdapter):
         # the cancel arrives moments later. Reporting success regardless is
         # how a naked position gets recorded as a protected one. Seen live:
         # both legs rejected on Error 110 while the entry filled.
-        await asyncio.sleep(self.bracket_check_delay)
-        for label, order_id in (("stop", sl_order_id), ("target", tp_order_id)):
-            if order_id is None:
-                continue
-            # Named leg_trade, NOT trade: this loop used to shadow the
-            # entry's own Trade, and anything added below that reached for
-            # `trade` silently got the last bracket leg instead.
-            leg_trade = next((t for t in self.ib.trades() if t.order.orderId == order_id), None)
-            status = leg_trade.orderStatus.status if leg_trade is not None else "unknown"
-            if status in ("Cancelled", "Inactive", "ApiCancelled", "unknown"):
-                why = ""
-                if leg_trade is not None and leg_trade.log:
-                    why = leg_trade.log[-1].message or ""
-                logger.error(
-                    "IBKRAdapter[%s] %s leg for slave_ticket=%s was %s -- THE POSITION IS "
-                    "UNPROTECTED on that side. %s",
-                    self.slave_id, label, slave_ticket, status, why,
-                )
+        await self._check_legs_took(slave_ticket, sl_order_id, tp_order_id)
         # Stashed for the entry chase, which later has to recompute
         # "through the quote" against a FRESH quote and no longer has the
         # route that chose the offset.
@@ -668,6 +712,10 @@ class IBKRAdapter(BrokerAdapter):
         except Exception:  # pragma: no cover - ib_async orders accept it
             pass
         self._entry_trades[slave_ticket] = trade
+        # One code path for split and unsplit: an unsplit entry is a list
+        # of one, and the three places that reason about "the entry" --
+        # the fill, the cancel, the close -- all read this.
+        self._entry_slices[slave_ticket] = [trade]
         # How long THIS entry may rest, remembered beside the trade because
         # _collect_fill is handed a ticket and no longer has the order. A
         # GTC entry with the adapter's 900s clock is cancelled by us a
@@ -691,9 +739,23 @@ class IBKRAdapter(BrokerAdapter):
                     self.slave_id, order.symbol, order.entry_timeout,
                     self.entry_timeout, exc,
                 )
-        logger.info(
-            "IBKRAdapter[%s] opened %s %s x%s -> ticket=%s", self.slave_id, action, order.symbol, order.size, slave_ticket
-        )
+        if len(sizes) > 1:
+            interval = resolve_split(
+                order.split_slices, order.split_interval,
+                self.entry_split_slices, self.entry_split_interval,
+            )[1]
+            logger.info(
+                "IBKRAdapter[%s] opened %s %s x%s -> ticket=%s -- slice 1/%d of "
+                "an intended %s, the rest %gs apart (%s)",
+                self.slave_id, action, order.symbol, first, slave_ticket,
+                len(sizes), order.size, interval,
+                ", ".join(str(x) for x in sizes),
+            )
+            self._schedule_slices(slave_ticket, contract, order, sizes, interval)
+        else:
+            logger.info(
+                "IBKRAdapter[%s] opened %s %s x%s -> ticket=%s", self.slave_id, action, order.symbol, order.size, slave_ticket
+            )
         # No fill price here, deliberately. Waiting for one would hold up
         # every later signal for this slave -- the MODIFY and CLOSE of this
         # very ticket queue behind it -- and an ETF limit resting in a thin
@@ -705,6 +767,306 @@ class IBKRAdapter(BrokerAdapter):
             broker_order_id=None if broker_order_id is None else str(broker_order_id),
             broker_order_ref=order.order_ref,
         )
+
+    async def _check_legs_took(self, slave_ticket: int,
+                               sl_order_id: Optional[int],
+                               tp_order_id: Optional[int]) -> None:
+        """Did the protective legs survive being placed?
+
+        A rejected bracket leg leaves a filled position with no protection,
+        and IBKR rejects ASYNCHRONOUSLY -- placeOrder returns happily and
+        the cancel arrives moments later. Reporting success regardless is
+        how a naked position gets recorded as a protected one. Seen live:
+        both legs rejected on Error 110 while the entry filled.
+
+        Called after the opening brackets AND after the splitter regrows
+        them. A regrow is a cancel and a re-place, so it can fail in
+        exactly this way, on a position that was protected a moment
+        earlier -- and it happens with no signal in flight, so nothing
+        else would be looking.
+        """
+        await asyncio.sleep(self.bracket_check_delay)
+        for label, order_id in (("stop", sl_order_id), ("target", tp_order_id)):
+            if order_id is None:
+                continue
+            # Named leg_trade, NOT trade: this loop used to shadow the
+            # entry's own Trade in open(), and anything that reached for
+            # `trade` afterwards silently got the last bracket leg instead.
+            leg_trade = next((t for t in self.ib.trades() if t.order.orderId == order_id), None)
+            status = leg_trade.orderStatus.status if leg_trade is not None else "unknown"
+            if status in ("Cancelled", "Inactive", "ApiCancelled", "unknown"):
+                why = ""
+                if leg_trade is not None and leg_trade.log:
+                    why = leg_trade.log[-1].message or ""
+                logger.error(
+                    "IBKRAdapter[%s] %s leg for slave_ticket=%s was %s -- THE POSITION IS "
+                    "UNPROTECTED on that side. %s",
+                    self.slave_id, label, slave_ticket, status, why,
+                )
+
+    # ------------------------------------------------- the order splitter
+
+    # Read by the engine, which otherwise cannot tell a route asking for a
+    # split that will happen from one asking for a split that is silently
+    # dropped. MT4/MT5/Schwab carry the fields and ignore them.
+    supports_order_split = True
+
+    def _slices_for(self, order: OrderRequest) -> List[float]:
+        """The sizes this entry goes out in. One of them means no split."""
+        slices, interval = resolve_split(
+            order.split_slices, order.split_interval,
+            self.entry_split_slices, self.entry_split_interval,
+        )
+        if slices <= 1:
+            return [order.size]
+        sizes = split_sizes(order.size, slices)
+        if len(sizes) > 1 and self.entry_chase_steps > 0:
+            # Both re-price a resting entry and neither knows about the
+            # other: chasing slice one while slice four is still to be
+            # placed walks the limit away from the price the rest were
+            # planned at. Said out loud, because a setting that is live in
+            # the config and inert in the code is the worst kind.
+            logger.warning(
+                "IBKRAdapter[%s] %s: splitting into %d slices, so the entry "
+                "chase does NOT run for this order -- the two cannot both "
+                "move the same entry",
+                self.slave_id, order.symbol, len(sizes),
+            )
+        return sizes
+
+    @staticmethod
+    def _filled_across(slices):
+        """What every slice has filled between them, as (avg price, size).
+
+        Size-weighted, because the slices fill at different prices and the
+        position has one entry price. (None, 0.0) when nothing has filled.
+        """
+        total = 0.0
+        notional = 0.0
+        for trade in slices:
+            if trade is None:
+                continue
+            status = trade.orderStatus
+            filled = float(status.filled or 0.0)
+            price = float(status.avgFillPrice or 0.0)
+            if filled > 0 and price:
+                total += filled
+                notional += filled * price
+        if total <= 0:
+            return None, 0.0
+        return notional / total, total
+
+    @staticmethod
+    def _all_slices_done(slices) -> bool:
+        """True when no slice has anything left working at the broker."""
+        for trade in slices:
+            if trade is None:
+                continue
+            if float(trade.orderStatus.remaining or 0.0) > 0:
+                return False
+        return True
+
+    async def _settle_all(self, slices, label: str):
+        """Cancel every slice and report what exists afterwards.
+
+        One _settle_cancel per slice, because the fill that lands inside
+        the cancel round trip can land on any of them -- and the whole
+        reason _settle_cancel exists is that believing the cancel request
+        over the fills is how untracked volume accumulates.
+        """
+        live = [t for t in slices if t is not None]
+        for trade in live:
+            self._cancel_tracked_order(trade.order.orderId)
+        # CONCURRENTLY, not one after another. Each settle waits up to five
+        # seconds for its own order to go terminal, and these waits have
+        # nothing to do with each other -- run in sequence, abandoning a
+        # four-slice entry would hold the consume loop for twenty seconds,
+        # with every later signal for this slave queued behind it.
+        settled = await asyncio.gather(
+            *(self._settle_cancel(t, label) for t in live),
+            return_exceptions=True,
+        )
+        total = 0.0
+        notional = 0.0
+        for trade, outcome in zip(live, settled):
+            if isinstance(outcome, BaseException):
+                # One slice that would not settle must not hide the others.
+                # Believing the fills over the cancel request is the whole
+                # point of _settle_cancel, and an unanswered cancel is the
+                # case where that matters most.
+                logger.exception(
+                    'IBKRAdapter[%s] could not settle the cancel of %s order %s',
+                    self.slave_id, label, trade.order.orderId,
+                    exc_info=outcome,
+                )
+                continue
+            price, size = outcome
+            if price is not None and size:
+                total += float(size)
+                notional += float(size) * float(price)
+        if total <= 0:
+            return None, None
+        return notional / total, total
+
+    def _stop_splitting(self, slave_ticket: int) -> int:
+        """Call off the slices still to come. Returns 1 if any were.
+
+        Called from every path that ends the position -- close, abandon,
+        disconnect -- because a slice placed after the position is gone is
+        a naked order for an instrument nothing is tracking.
+        """
+        task = self._split_tasks.pop(slave_ticket, None)
+        self._split_windows.pop(slave_ticket, None)
+        if task is None or task.done():
+            return 0
+        task.cancel()
+        return 1
+
+    def _split_pending(self, slave_ticket: int) -> bool:
+        task = self._split_tasks.get(slave_ticket)
+        return task is not None and not task.done()
+
+    def _schedule_slices(self, slave_ticket: int, contract, order: OrderRequest,
+                         sizes: List[float], interval: float) -> None:
+        """Place the slices after the first, one interval apart.
+
+        IN THE BACKGROUND, deliberately. open() is called from the consume
+        loop, and holding it for the length of the window would queue every
+        later signal for this slave behind it -- the MODIFY and the CLOSE of
+        this very ticket included. The same reason fills are collected out
+        of band.
+
+        A HUB RESTART ENDS THE SCHEDULE. The position is restored at the
+        size the registry recorded, and the slices that had not gone out
+        do not go out later -- which is the right way round: a slice
+        arriving from a schedule the restart forgot would join a position
+        whose size nothing had re-measured. A restart mid-window therefore
+        leaves the position smaller than intended, and the log line from
+        each slice is what says how much went out.
+        """
+        remaining = list(sizes[1:])
+        placed = [sizes[0]]
+        self._split_windows[slave_ticket] = interval * len(remaining)
+
+        async def run() -> None:
+            try:
+                for n, size in enumerate(remaining, start=2):
+                    await asyncio.sleep(interval)
+                    if slave_ticket not in self._positions:
+                        # Closed, abandoned or stopped out while the
+                        # schedule ran. The slices still to come are not
+                        # wanted: there is nothing left for them to join.
+                        logger.info(
+                            "IBKRAdapter[%s] %s slave_ticket=%s is gone; "
+                            "dropping the remaining %d slice(s)",
+                            self.slave_id, order.symbol, slave_ticket,
+                            len(remaining) - n + 2,
+                        )
+                        return
+                    await self._place_slice(slave_ticket, contract, order, size,
+                                            n, len(sizes), placed)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The position exists and is tracked. Dying quietly here
+                # would leave it short of its intended size with nothing
+                # said -- the same silence the consume loop was fixed for.
+                logger.exception(
+                    "IBKRAdapter[%s] %s slave_ticket=%s: the slice schedule "
+                    "failed; the position holds %s of an intended %s and no "
+                    "further slices will be placed",
+                    self.slave_id, order.symbol, slave_ticket,
+                    sum(placed), order.size,
+                )
+            finally:
+                self._split_windows.pop(slave_ticket, None)
+
+        self._split_tasks[slave_ticket] = asyncio.create_task(
+            run(), name=f"split-{self.slave_id}-{slave_ticket}")
+
+    async def _place_slice(self, slave_ticket: int, contract, order: OrderRequest,
+                           size: float, n: int, of: int, placed) -> None:
+        """One later slice, joined onto the position the first one opened."""
+        ib_mod = self._require_ib()
+        self._require_connected()
+        if order.order_type == "limit":
+            # The SAME limit the first slice went out at, not a fresh one
+            # priced through a newer quote. The stop was fixed when the
+            # position was sized, so a slice filled higher than planned
+            # risks more than was sized for -- and the point of the window
+            # is to spread the fills in TIME, not to re-decide the price.
+            entry = ib_mod.LimitOrder(
+                order.direction, size,
+                self._round_to_tick(order.limit_price, order.symbol))
+        else:
+            entry = ib_mod.MarketOrder(order.direction, size)
+        entry.outsideRth = order.outside_rth
+        self._stamp_entry_timing(entry, order)
+        # The same order_ref as the first slice, on purpose: every slice is
+        # part of one position, and the statement should say so.
+        _stamp(entry, order.order_ref)
+        trade = self._place(contract, entry)
+        self._entry_slices.setdefault(slave_ticket, []).append(trade)
+        placed.append(size)
+
+        pos = self._positions.get(slave_ticket)
+        if pos is not None:
+            # What the broker is now holding or working for this position.
+            # close() sizes the exit from this and modify() sizes the legs
+            # from it, so it has to grow as the slices go out -- a close
+            # against the first slice alone would leave the rest held.
+            pos["size"] = round(float(pos["size"]) + float(size), 6)
+        logger.info(
+            "IBKRAdapter[%s] slice %d/%d: %s %s x%s joined slave_ticket=%s "
+            "(%s of %s placed)",
+            self.slave_id, n, of, order.direction, order.symbol, size,
+            slave_ticket, sum(placed), order.size,
+        )
+        await self._regrow_protective_legs(slave_ticket, order)
+
+    async def _regrow_protective_legs(self, slave_ticket: int,
+                                      order: OrderRequest) -> None:
+        """Re-place the stop and target to cover the larger position.
+
+        Cancel and re-place, which is what modify() does. Sized to what is
+        now working rather than to the intended total: a stop for 35 while
+        only 9 has been placed is a 26-lot short waiting for a touch, and
+        it would be a position the copier opened entirely by itself.
+        """
+        pos = self._positions.get(slave_ticket)
+        if pos is None or not order.broker_brackets:
+            return
+        if pos.get("sl") is None and pos.get("tp") is None:
+            return
+        ib_mod = self._require_ib()
+        self._require_connected()
+        self._cancel_tracked_order(pos.get("sl_order_id"))
+        self._cancel_tracked_order(pos.get("tp_order_id"))
+        closing_action = "SELL" if pos["direction"] == "BUY" else "BUY"
+        oca_group = f"tc-{self.slave_id}-{slave_ticket}-{int(time.time())}"
+        sl_order_id = tp_order_id = None
+        if pos.get("sl") is not None:
+            sl_order = self._protective(
+                ib_mod.StopOrder(closing_action, pos["size"], pos["sl"]),
+                pos.get("outside_rth", False))
+            sl_order.ocaGroup = oca_group
+            sl_order.ocaType = 1
+            _stamp(sl_order, order.order_ref)
+            sl_order_id = self._place(pos["contract"], sl_order).order.orderId
+        if pos.get("tp") is not None:
+            tp_order = self._protective(
+                ib_mod.LimitOrder(closing_action, pos["size"], pos["tp"]),
+                pos.get("outside_rth", False))
+            tp_order.ocaGroup = oca_group
+            tp_order.ocaType = 1
+            _stamp(tp_order, order.order_ref)
+            tp_order_id = self._place(pos["contract"], tp_order).order.orderId
+        pos["sl_order_id"] = sl_order_id
+        pos["tp_order_id"] = tp_order_id
+        # The same check the opening brackets get. A regrow that was
+        # rejected leaves a position that WAS protected and now is not,
+        # with no signal in flight and nothing else looking.
+        await self._check_legs_took(slave_ticket, sl_order_id, tp_order_id)
 
     def _cancel_tracked_order(self, order_id: Optional[int]) -> None:
         if order_id is None:
@@ -745,6 +1107,13 @@ class IBKRAdapter(BrokerAdapter):
 
         pos["sl_order_id"] = sl_order_id
         pos["tp_order_id"] = tp_order_id
+        # The LEVELS move too. A split entry re-places its legs as it grows
+        # and reads them from here, so leaving these at the opening stop
+        # would undo every trail the monitor had made.
+        pos["sl"] = None if sl is None else self._round_to_tick(
+            sl, pos.get("symbol") or pos["contract"].symbol)
+        pos["tp"] = None if tp is None else self._round_to_tick(
+            tp, pos.get("symbol") or pos["contract"].symbol)
 
     async def close(self, slave_ticket: int) -> Optional[float]:
         ib_mod = self._require_ib()
@@ -762,8 +1131,20 @@ class IBKRAdapter(BrokerAdapter):
         # opposite position -- seen live on UGL, BITX and ETHA.
         entry = self._entry_trades.get(slave_ticket)
         if entry is not None:
-            st = entry.orderStatus
-            filled = float(st.filled or 0.0) if (entry.fills and st.avgFillPrice) else 0.0
+            # No more slices. The master is out: a slice landing after this
+            # would be a position opened by the copier on its own, for a
+            # trade that has already finished.
+            if self._stop_splitting(slave_ticket):
+                logger.info(
+                    "IBKRAdapter[%s] %s: CLOSE arrived mid-window; the slices "
+                    "still to come are called off",
+                    self.slave_id, pos.get("symbol"),
+                )
+            # Across EVERY slice, not just the first. A split entry whose
+            # second and third slices filled while the first did not is a
+            # real position, and reading only the first would abandon it.
+            slices = self._entry_slices.get(slave_ticket) or [entry]
+            _, filled = self._filled_across(slices)
             if filled <= 0:
                 # The RETURN VALUE decides, not the reading above.
                 # abandon_unfilled_entry takes one more look and settles
@@ -812,13 +1193,13 @@ class IBKRAdapter(BrokerAdapter):
                     "filled part and cancelling the remainder",
                     self.slave_id, slave_ticket, filled, pos["size"],
                 )
-                self._cancel_tracked_order(entry.order.orderId)
                 # Same race as abandon_unfilled_entry: the remainder can
                 # fill inside the cancel round trip, and closing only the
                 # part known a moment ago leaves the rest held under a row
-                # about to be marked CLOSED.
-                settled_price, settled = await self._settle_cancel(
-                    entry, "entry remainder")
+                # about to be marked CLOSED. Every slice is cancelled and
+                # settled, because the late fill can land on any of them.
+                settled_price, settled = await self._settle_all(
+                    slices, "entry remainder")
                 if settled is not None and settled > filled:
                     logger.warning(
                         "IBKRAdapter[%s] entry %s filled a further %s inside the "
@@ -949,14 +1330,79 @@ class IBKRAdapter(BrokerAdapter):
         # something wrong with it whatever the route says.
         if is_limit and slave_ticket in self._entry_waits:
             timeout = self._entry_waits[slave_ticket]
-        if is_limit and self.entry_chase_steps > 0:
+
+        slices = self._entry_slices.get(slave_ticket) or [trade]
+        if len(slices) > 1 or self._split_pending(slave_ticket):
+            price, size = await self._await_split_fill(slave_ticket, timeout)
+        elif is_limit and self.entry_chase_steps > 0:
             price, size = await self._chase_entry(trade, timeout)
         else:
             price, size = await self._await_fill(trade, "entry", timeout)
         if price is not None:
             self._entry_trades.pop(slave_ticket, None)
+            self._entry_slices.pop(slave_ticket, None)
             self._entry_waits.pop(slave_ticket, None)
         return price, size
+
+    async def _await_split_fill(self, slave_ticket: int, per_slice_timeout: float):
+        """Wait for a SPLIT entry, reporting the fill across every slice.
+
+        The window has to be waited out, not just the fill clock. The
+        slices after the first have not been placed yet, and returning
+        (None, None) at the ordinary timeout tells the engine the entry
+        never filled -- which sends it down abandon_unfilled_entry while
+        the schedule is still running, cancelling a position halfway
+        through building it and leaving the rest of the schedule to place
+        orders against nothing.
+
+        So: wait until the schedule has finished AND every slice it placed
+        has stopped working, then report the size-weighted fill across all
+        of them. One position, one entry price, one number -- which is the
+        whole point of splitting into slices rather than into positions.
+
+        A timeout still reports what filled. A split entry where three of
+        four slices filled is a real position of three slices, and saying
+        so beats saying nothing.
+        """
+        # The window plus one fill clock: the last slice is placed at the
+        # end of the window and deserves the same wait as the first.
+        window = float(self._split_windows.get(slave_ticket, 0.0) or 0.0)
+        deadline = time.monotonic() + window + per_slice_timeout
+        while time.monotonic() < deadline:
+            if not self._split_pending(slave_ticket):
+                slices = self._entry_slices.get(slave_ticket) or []
+                if slices and self._all_slices_done(slices):
+                    price, size = self._filled_across(slices)
+                    if price is None:
+                        # Every slice is terminal and none of them filled.
+                        # Nothing more will arrive, so there is no reason
+                        # to hold the clock open.
+                        break
+                    logger.info(
+                        "IBKRAdapter[%s] split entry %s filled %s across %d "
+                        "slice(s) at %s",
+                        self.slave_id, slave_ticket, size, len(slices), price,
+                    )
+                    return price, size
+            await asyncio.sleep(0.1)
+
+        slices = self._entry_slices.get(slave_ticket) or []
+        price, size = self._filled_across(slices)
+        if price is not None:
+            logger.warning(
+                "IBKRAdapter[%s] split entry %s filled %s across %d slice(s) "
+                "within %.1fs, with some of it still working -- recording the "
+                "part that filled",
+                self.slave_id, slave_ticket, size, len(slices),
+                window + per_slice_timeout,
+            )
+            return price, size
+        logger.warning(
+            "IBKRAdapter[%s] split entry %s filled nothing across %d slice(s) "
+            "within %.1fs",
+            self.slave_id, slave_ticket, len(slices), window + per_slice_timeout,
+        )
+        return None, None
 
     async def _chase_entry(self, trade, timeout: float):
         """Wait for a resting entry, re-pricing it toward the quote.
@@ -1137,25 +1583,43 @@ class IBKRAdapter(BrokerAdapter):
         and carry GTC, so leaving them behind a genuinely cancelled entry
         would strand a stop and target able to execute later and open a
         position nobody asked for.
+
+        A SPLIT ENTRY is several orders and one position, so every slice
+        has to go -- and the schedule placing them has to be called off
+        first. Cancelling the slices that exist while the task that places
+        the next one is still running is how an order gets left at the
+        broker under a row the hub has just marked CANCELLED.
         """
+        # First, so nothing new is placed behind our back.
+        if self._stop_splitting(slave_ticket):
+            logger.info(
+                "IBKRAdapter[%s] entry %s is being abandoned; the slices still "
+                "to come are called off", self.slave_id, slave_ticket,
+            )
         trade = self._entry_trades.pop(slave_ticket, None)
+        slices = self._entry_slices.pop(slave_ticket, None)
+        if not slices:
+            slices = [trade] if trade is not None else []
         self._entry_waits.pop(slave_ticket, None)
         pos = self._positions.get(slave_ticket)
 
         # Last look before cancelling. The fill may have landed while this
         # was being scheduled, and cancelling then would leave a real
-        # position with no stop.
-        if trade is not None:
-            status = trade.orderStatus
-            if trade.fills and status.avgFillPrice:
+        # position with no stop. Across every slice: one filled slice is a
+        # position, whichever of them it was.
+        if slices:
+            price, size = self._filled_across(slices)
+            if price is not None:
                 logger.info(
-                    "IBKRAdapter[%s] entry %s filled just after its timeout; "
-                    "keeping the position", self.slave_id, slave_ticket,
+                    "IBKRAdapter[%s] entry %s filled just after its timeout "
+                    "(%s across %d slice(s)); keeping the position",
+                    self.slave_id, slave_ticket, size, len(slices),
                 )
-                return float(status.avgFillPrice), float(status.filled)
+                self._entry_trades[slave_ticket] = trade
+                self._entry_slices[slave_ticket] = slices
+                return price, size
 
-            self._cancel_tracked_order(trade.order.orderId)
-            price, size = await self._settle_cancel(trade, "entry")
+            price, size = await self._settle_all(slices, "entry")
             if price is not None:
                 # It filled anyway. Keep the position AND its protective
                 # legs -- they are correct for it, and they have not been
@@ -1167,6 +1631,13 @@ class IBKRAdapter(BrokerAdapter):
                     self.slave_id, slave_ticket, size, price,
                 )
                 self._entry_trades[slave_ticket] = trade
+                self._entry_slices[slave_ticket] = slices
+                if pos is not None:
+                    # Only part of the intended size is held now. The legs
+                    # were grown as the slices went out, so they cover more
+                    # than exists until this is corrected -- and close()
+                    # sizes the exit from it.
+                    pos["size"] = float(size)
                 return price, size
 
         if pos is not None:
@@ -1175,8 +1646,8 @@ class IBKRAdapter(BrokerAdapter):
             del self._positions[slave_ticket]
 
         logger.warning(
-            "IBKRAdapter[%s] cancelled unfilled entry %s and its protective legs",
-            self.slave_id, slave_ticket,
+            "IBKRAdapter[%s] cancelled unfilled entry %s (%d slice(s)) and its "
+            "protective legs", self.slave_id, slave_ticket, len(slices),
         )
         return None, None
 

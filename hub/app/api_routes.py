@@ -223,6 +223,38 @@ def _per_target_sizing(config: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in sizing.items() if isinstance(v, dict)}
 
 
+def _split_summary(config: Dict[str, Any]) -> Optional[str]:
+    """How this slave's entries reach the market, if not in one print.
+
+    None when nothing is configured, which is every slave until one is.
+    Reported because the splitter changes WHAT ARRIVES AT THE BROKER for a
+    signal -- four orders over two minutes instead of one -- and a setting
+    that does that while appearing on no screen is how a surprise gets
+    built into a money-moving system.
+    """
+    from app.order_split import resolve_split
+
+    slave_slices = config.get("entry_split_slices")
+    slave_interval = config.get("entry_split_interval")
+    lines = []
+    slices, interval = resolve_split(None, None, slave_slices, slave_interval)
+    if slices:
+        lines.append(f"entries split into {slices} over {interval:g}s")
+
+    # Per route, because a route's own setting wins and a slave-level line
+    # alone would describe something that is not happening.
+    for entry in config.get("routes") or []:
+        r_slices, r_interval = resolve_split(
+            entry.get("split_slices"), entry.get("split_interval"),
+            slave_slices, slave_interval,
+        )
+        if not r_slices or (r_slices, r_interval) == (slices, interval):
+            continue
+        target = entry.get("target") or (entry.get("targets") or ["?"])[0]
+        lines.append(f"{target}: {r_slices} over {r_interval:g}s")
+    return "; ".join(lines) or None
+
+
 def _sizing_summary(config: Dict[str, Any]) -> str:
     """How this slave sizes, in one line, in all three shapes it takes.
 
@@ -595,6 +627,9 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         # Is this slave's loop still taking signals off its queue? See
         # _consume_health: nothing else on this page can answer that.
         "consume": _consume_health(engine),
+        # Whether entries go out in one print or in slices over a window.
+        # None on every slave that has not configured it.
+        "split_summary": _split_summary(slave.config),
         **_slave_summary_extras(slave),
     }
 

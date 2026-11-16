@@ -117,6 +117,17 @@ class Route:
     # strategy may stack three legs where everything else on the slave
     # stacks none.
     netting: Optional[Dict[str, Any]] = None
+    # Place this route's entry as N orders over a window instead of one,
+    # collapsing into ONE tracked position -- one instrument, one row, one
+    # pair of protective legs, one thing to roll. For a size the book
+    # cannot absorb in a single print.
+    #
+    # None on either falls back to the slave's own entry_split_slices /
+    # entry_split_interval, then to off. Only the IBKR adapter acts on
+    # them; a route that asks for a split on an adapter that cannot do one
+    # is logged rather than quietly ignored.
+    split_slices: Optional[int] = None
+    split_interval: Optional[float] = None
 
 
 def _deadline(value: Any) -> Optional[Any]:
@@ -258,6 +269,10 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                     broker_brackets=bool(entry.get("broker_brackets", True)),
                     candidates=list(group),
                     netting=entry.get("netting"),
+                    split_slices=(None if entry.get("split_slices") is None
+                                  else int(entry["split_slices"])),
+                    split_interval=(None if entry.get("split_interval") is None
+                                    else float(entry["split_interval"])),
                 )
             )
     return matched

@@ -1337,7 +1337,23 @@ class AutonomousCopyEngine(SessionGateMixin):
             entry_timeout=route.entry_timeout,
             good_till=route.good_till,
             broker_brackets=route.broker_brackets,
+            # Place this entry in slices over a window instead of in one
+            # print. None on either falls back to the slave's own setting,
+            # then to off -- so nothing changes for a route that does not
+            # ask. One position comes out of it either way.
+            split_slices=route.split_slices,
+            split_interval=route.split_interval,
         )
+        if (route.split_slices or route.split_interval) and not getattr(
+                self.adapter, "supports_order_split", False):
+            # Said once, here, rather than left as a config key that looks
+            # live and does nothing. The fields travel on every
+            # OrderRequest and only the IBKR adapter acts on them.
+            logger.warning(
+                "slave=%s route %s asks to split its entry, but the %s adapter "
+                "places one order per entry -- the whole size goes out at once",
+                self.slave_id, target_symbol, type(self.adapter).__name__,
+            )
         requested_at = time.time()
         result = await self.adapter.open(order)
         filled_at = time.time()

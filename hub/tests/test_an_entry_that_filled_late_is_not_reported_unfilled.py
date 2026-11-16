@@ -68,6 +68,12 @@ def _adapter(abandon_result, closed):
                "contract": "MGCZ6"},
     }
     a._entry_trades = {1189: _Trade()}
+    # One slice, which is what an unsplit entry is. close() reads this
+    # rather than _entry_trades, so that a split entry whose second slice
+    # filled is not read as an entry that never filled.
+    a._entry_slices = {1189: [a._entry_trades[1189]]}
+    a._split_tasks = {}
+    a._split_windows = {}
     a._entry_waits = {}
     a._exit_trades = {}
 

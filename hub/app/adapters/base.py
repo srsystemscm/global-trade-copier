@@ -98,6 +98,17 @@ class OrderRequest:
     # An exact contract to trade, overriding month_slot. Set when rolling: the
     # destination is a specific contract, not "whatever slot N is right now".
     contract_id: Optional[int] = None
+    # Place this entry as N orders `split_interval` seconds apart instead
+    # of one, for a size the book cannot absorb in a single print. All of
+    # them are the SAME instrument and direction and collapse into one
+    # tracked position: one row, one pair of protective legs, one thing to
+    # roll.
+    #
+    # None on either means "use the adapter's own default", like tif and
+    # entry_timeout above. An adapter that cannot split ignores these, and
+    # the engine says so rather than letting it pass unnoticed.
+    split_slices: Optional[int] = None
+    split_interval: Optional[float] = None
 
 
 @dataclass
