@@ -55,7 +55,23 @@ input int    MAE_DELAY_MS        = 1500;
 //--- Hold the position this long after the MAE modify, then close it, so a
 //--- single run produces the whole OPEN -> MODIFY -> CLOSE sequence the
 //--- copier has to carry. 0 leaves the trade open.
-input int    CloseAfterMs        = 3000;
+//---
+//--- NOW 0 BY DEFAULT, and the trades are yours to close. It was 3000,
+//--- which made the whole sequence fit in six seconds and was right while
+//--- the thing under test was the SIGNAL path. It is wrong for anything
+//--- that has to REST:
+//---
+//---   an ETF limit outside regular hours cannot fill in six seconds, so
+//---   every run ended "cancelled unfilled entry" whatever the copier did
+//---
+//---   the entry chase re-prices on an interval -- the first step lands
+//---   long after a six-second close has already cancelled the order
+//---
+//---   33 MGC does not fill against a six-second close either, which is
+//---   the case the order splitter exists for
+//---
+//--- Set it back to 3000 when testing OPEN -> MODIFY -> CLOSE end to end.
+input int    CloseAfterMs        = 0;
 
 //--- fxDreema's POINT_FORMAT_RULES, which decide what a "pip" is
 input string POINT_FORMAT_RULES  = "0.001=0.01,0.00001=0.0001,0.000001=0.0001";
