@@ -104,14 +104,61 @@ def test_a_route_sized_slave_is_told_what_is_still_slave_level(source):
     quotes it. A string search cannot tell rendered text from a comment,
     so it has to look for what should be there instead of what should
     not."""
-    assert re.search(r"no sizing block to edit here", source), (
+    # Anchored on JSX MARKUP, which can only be rendered text. Plain
+    # prose matched the explanatory comment above the code instead --
+    # twice now, and this test's own docstring warns about exactly that.
+    # <em> cannot appear in a // comment and mean anything.
+    assert "Risk <em>sizing</em>" in source and "Risk <em>calibration</em>" in source, (
         "the paragraph for a route-sized slave no longer distinguishes "
-        "sizing, which really is per route, from risk scale, which is not"
+        "sizing, which really is per route, from risk calibration, which "
+        "is read off the slave either way"
     )
-    paragraph = source[source.index("no sizing block to edit here"):][:600]
-    assert "Risk <em>scale</em>" in paragraph, (
+    para = source[source.index("Risk <em>sizing</em>"):][:420]
+    assert "Risk <em>calibration</em>" in para, (
         "it says what cannot be edited without saying what still can"
     )
+
+
+def test_a_route_sized_slave_can_edit_its_cap(source):
+    """The stronger requirement, and the one actually asked for.
+
+    Saying "sizing is per route" was accurate and useless: ibkr-etf-1's
+    1.5% ceiling is real, lives on each of twenty routes, and was
+    editable NOWHERE -- the routes are listed read-only, and the card's
+    own Edit button is correctly hidden because a slave-level block would
+    be saved and never read. Chris: "I cant adjust the max cap. that
+    initial edit tab, top right, is gone on that slave."
+
+    So the editor writes every route at once, which is what a slave-wide
+    figure means on a slave that sizes per route."""
+    assert "function RouteSizingForm" in source
+    assert "<RouteSizingForm" in source, "written and never mounted again"
+    assert re.search(r'muted small">Sizing on every route<', source), (
+        "no row to reach the editor from"
+    )
+    # It must say how many routes it is about to rewrite. A bulk edit
+    # that does not state its blast radius is the kind that gets clicked.
+    assert "Save to all ${count} routes" in source
+
+
+def test_the_bulk_editor_re_reads_before_writing(source):
+    """Same lost-update hazard as every other form here, and worse: this
+    one rewrites twenty routes from a snapshot. It must not restore a
+    config changed since the form was opened."""
+    body = source[source.index("function RouteSizingForm"):]
+    body = body[:body.index("function MasterFilterForm")]
+    assert "await currentConfig(slave.id)" in body
+    assert "full.config" not in body, (
+        "it builds the patch from the snapshot it loaded on open"
+    )
+
+
+def test_the_bulk_editor_leaves_routes_that_size_by_inheritance_alone(source):
+    """A route with no sizing block is inheriting on purpose. Giving it
+    one would change how it sizes as a side effect of editing others."""
+    body = source[source.index("function RouteSizingForm"):]
+    body = body[:body.index("function MasterFilterForm")]
+    assert "if (!r.sizing) return r;" in body
 
 
 def test_the_headline_still_names_the_thing_the_field_sets(source):

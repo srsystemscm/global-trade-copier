@@ -370,6 +370,7 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
   const [editing, setEditing] = useState(false);
   const [editingScale, setEditingScale] = useState(false);
   const [editingBasis, setEditingBasis] = useState(false);
+  const [editingRoutes, setEditingRoutes] = useState(false);
   const [editingMagic, setEditingMagic] = useState(false);
   const [editingMasters, setEditingMasters] = useState(false);
   const [editingRoll, setEditingRoll] = useState(false);
@@ -517,13 +518,39 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
         )}
       </div>
 
+      {/* A ROUTE-SIZED SLAVE HAD NO WAY TO CHANGE ITS CAP AT ALL.
+          ibkr-etf-1 carries no slave-level sizing block, so the Edit
+          button above is correctly hidden -- a slave-level value would
+          save cleanly and never be read. But its ceiling is real and
+          lives on each of twenty routes, and nothing in this UI could
+          touch it: the routes are listed read-only further down.
+          Chris: "I cant adjust the max cap. that initial edit tab, top
+          right, is gone on that slave."
+          So the editor writes to every route at once, which is what a
+          slave-wide figure means here. */}
       {slave.sizing_per_route && (
-        <p className="muted small">
-          Risk <em>sizing</em> is set on each route individually, not on the slave as a whole, so
-          there is no sizing block to edit here -- a slave-level one would save cleanly and never
-          be read. Risk <em>scale</em> above is the exception: it is read off the slave whether or
-          not the routes size themselves.
-        </p>
+        <>
+          <p className="muted small">
+            Risk <em>sizing</em> is set on each route individually rather than on the slave, so a
+            slave-level block would save cleanly and never be read. Risk <em>calibration</em>{" "}
+            above is the exception -- that one is read off the slave either way.
+          </p>
+          <div className="slave-risk-row">
+            <div>
+              <span className="muted small">Sizing on every route</span>
+              <div className="slave-risk-sizing">{slave.sizing_summary}</div>
+            </div>
+            <button className="btn btn-small" onClick={() => setEditingRoutes((v) => !v)}>
+              {editingRoutes ? "Cancel" : "Edit"}
+            </button>
+          </div>
+          {editingRoutes && (
+            <RouteSizingForm
+              slave={slave}
+              onDone={() => { setEditingRoutes(false); onSaved && onSaved(); }}
+            />
+          )}
+        </>
       )}
 
       {editing && <SlaveRiskForm slave={slave} onDone={() => { setEditing(false); onSaved && onSaved(); }} />}
@@ -1119,6 +1146,190 @@ function RiskScaleForm({ slave, onDone }) {
       <div className="slave-actions">
         <button className="btn btn-small" onClick={save} disabled={busy}>
           {busy ? "Saving..." : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Sizing for EVERY route on a slave that sizes per route.
+ *
+ * Not a slave-level block -- those are ignored when routes size
+ * themselves, which is exactly why the card hides the ordinary Edit
+ * button here. This writes the same numbers into each route's own
+ * sizing, because "the cap on this slave" is what the twenty identical
+ * blocks on ibkr-etf-1 actually mean.
+ *
+ * Routes that carry NO sizing block are left alone: adding one would
+ * change a route that was deliberately inheriting, and the summary line
+ * says how many were skipped.
+ */
+function RouteSizingForm({ slave, onDone }) {
+  const [full, setFull] = useState(null);
+  const [form, setForm] = useState(null);
+  const [mixed, setMixed] = useState(false);
+  const [count, setCount] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const got = await api.getSlave(slave.id);
+        setFull(got);
+        const routes = (got.config.routes || []).filter((r) => r.sizing);
+        setCount(routes.length);
+
+        // Uniform or not is the whole question: one editor over twenty
+        // identical blocks is honest, over twenty different ones it is
+        // a bulk overwrite and has to say so.
+        const shapes = new Set(routes.map((r) => JSON.stringify(r.sizing)));
+        setMixed(shapes.size > 1);
+
+        const first = routes.length ? routes[0].sizing : {};
+        setForm({
+          risk_pct: first.risk_pct != null ? +(first.risk_pct * 100).toFixed(4) : "",
+          max_risk_pct:
+            first.max_risk_pct != null ? +(first.max_risk_pct * 100).toFixed(4) : "",
+          capital_base: first.capital_base || "balance",
+          rounding: first.rounding || "nearest_min1",
+        });
+      } catch (e) {
+        setErr(e.message);
+      }
+    })();
+  }, [slave.id]);
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const risk = String(form.risk_pct).trim();
+      if (risk === "" || Number.isNaN(Number(risk)) || Number(risk) <= 0) {
+        throw new Error("risk per trade must be a percentage above zero");
+      }
+      const cap = String(form.max_risk_pct).trim();
+      if (cap !== "" && (Number.isNaN(Number(cap)) || Number(cap) <= 0)) {
+        throw new Error("the cap must be a percentage above zero, or blank for none");
+      }
+      if (cap !== "" && Number(cap) < Number(risk)) {
+        // Not refused -- a cap below the per-trade figure is a legitimate
+        // way to say "never size this up" -- but it is nearly always a
+        // slip, and on twenty routes at once it is worth a word.
+        if (!window.confirm(
+          `The cap (${cap}%) is below the per-trade risk (${risk}%). Every signal ` +
+          `would be refused outright. Apply anyway?`)) {
+          setBusy(false);
+          return;
+        }
+      }
+
+      // Re-read at save time. These forms PATCH the whole config, and a
+      // snapshot taken when the form opened silently restores anything
+      // changed since -- the bug that wiped risk_scale twice.
+      const config = await currentConfig(slave.id);
+      let touched = 0;
+      config.routes = (config.routes || []).map((r) => {
+        if (!r.sizing) return r;
+        touched += 1;
+        const sizing = { ...r.sizing };
+        sizing.risk_pct = Number(risk) / 100;
+        if (cap === "") delete sizing.max_risk_pct;
+        else sizing.max_risk_pct = Number(cap) / 100;
+        sizing.capital_base = form.capital_base;
+        sizing.rounding = form.rounding;
+        return { ...r, sizing };
+      });
+      if (!touched) throw new Error("no route on this slave carries a sizing block");
+
+      await api.patchSlave(slave.id, { config });
+      onDone();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (err && !full) return <div className="banner banner-error">{err}</div>;
+  if (!full || !form) return <p className="muted small">Loading...</p>;
+
+  return (
+    <div className="slave-risk-form with-notes">
+      {err && <div className="banner banner-error">{err}</div>}
+
+      {mixed && (
+        <div className="banner banner-error">
+          These routes do not all size the same way today. Saving gives all {count} of
+          them the values below.
+        </div>
+      )}
+
+      <label>
+        Risk per trade <span className="muted small">% of {form.capital_base}</span>
+        <input
+          type="number"
+          step="0.05"
+          min="0"
+          value={form.risk_pct}
+          onChange={(e) => setForm({ ...form, risk_pct: e.target.value })}
+        />
+      </label>
+
+      <label>
+        Refuse above <span className="muted small">% -- blank for no ceiling</span>
+        <input
+          type="number"
+          step="0.05"
+          min="0"
+          value={form.max_risk_pct}
+          onChange={(e) => setForm({ ...form, max_risk_pct: e.target.value })}
+        />
+      </label>
+
+      <label>
+        Measured against
+        <select
+          value={form.capital_base}
+          onChange={(e) => setForm({ ...form, capital_base: e.target.value })}
+        >
+          <option value="balance">balance</option>
+          <option value="equity">equity</option>
+        </select>
+      </label>
+
+      <label>
+        Rounding
+        <select
+          value={form.rounding}
+          onChange={(e) => setForm({ ...form, rounding: e.target.value })}
+        >
+          <option value="nearest_min1">nearest, never below one</option>
+          <option value="floor">floor -- skip rather than round up</option>
+        </select>
+      </label>
+
+      <aside className="side-note">
+        <p>
+          Applies to all <strong>{count}</strong> routes on this slave. Sizing lives on each
+          route here, so this is what a slave-wide figure means -- there is no slave-level
+          block, and one would be saved and never read.
+        </p>
+        <p>
+          <strong>Refuse above</strong> is a ceiling, not a trim: a signal working out above it
+          is declined outright rather than cut down. On an ETF leg that is usually volatility
+          too wide for the smallest tradeable size.
+        </p>
+        <p>
+          <strong>Floor</strong> rounding skips a signal that does not reach one whole unit,
+          rather than rounding it up to one. On a leveraged ETF that is the safer of the two.
+        </p>
+      </aside>
+
+      <div className="slave-actions">
+        <button className="btn btn-small" onClick={save} disabled={busy}>
+          {busy ? "Saving..." : `Save to all ${count} routes`}
         </button>
       </div>
     </div>
