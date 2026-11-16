@@ -765,12 +765,45 @@ class IBKRAdapter(BrokerAdapter):
             st = entry.orderStatus
             filled = float(st.filled or 0.0) if (entry.fills and st.avgFillPrice) else 0.0
             if filled <= 0:
-                await self.abandon_unfilled_entry(slave_ticket)
-                raise EntryNeverFilled(
-                    f"entry {slave_ticket} for {pos.get('symbol')} never filled; "
-                    f"cancelled it and its protective legs instead of placing a "
-                    f"closing order against a position that does not exist"
+                # The RETURN VALUE decides, not the reading above.
+                # abandon_unfilled_entry takes one more look and settles
+                # the cancel, and it returns a price when the entry
+                # filled in that window -- keeping the position and its
+                # protective legs for exactly this case. Ignoring that
+                # and raising anyway is what happened to MGC 1189 on
+                # 2026-11-16: the adapter logged "filled inside the
+                # cancel round trip (2.0 @ 3846.0); keeping the
+                # position", then told the engine the entry never
+                # filled. The engine marked the row CANCELLED, dropped
+                # the position from memory and from position_store, and
+                # 2 MGC stayed at the broker with nothing managing them.
+                settled_price, settled_size = await self.abandon_unfilled_entry(slave_ticket)
+                if settled_price is None:
+                    raise EntryNeverFilled(
+                        f"entry {slave_ticket} for {pos.get('symbol')} never filled; "
+                        f"cancelled it and its protective legs instead of placing a "
+                        f"closing order against a position that does not exist"
+                    )
+                filled = float(settled_size or 0.0)
+                if filled <= 0:
+                    # A price with no size is not a position. Treated as
+                    # the cancel it is, rather than sent on to become a
+                    # zero-quantity closing order.
+                    raise EntryNeverFilled(
+                        f"entry {slave_ticket} for {pos.get('symbol')} never filled; "
+                        f"cancelled it and its protective legs instead of placing a "
+                        f"closing order against a position that does not exist"
+                    )
+                logger.warning(
+                    "IBKRAdapter[%s] entry %s filled %s inside the cancel round "
+                    "trip; closing that rather than reporting it as never filled",
+                    self.slave_id, slave_ticket, filled,
                 )
+                # The master is already out, so what is held has to go --
+                # all of it and only it. Sizing the close from the order's
+                # original size would sell the part that never filled, and
+                # on 1189 that was 35 against 2 actually held.
+                pos["size"] = filled
             if filled < pos["size"]:
                 # Partially filled: close what exists and stop the rest from
                 # filling after the master is already out.
