@@ -776,6 +776,7 @@ class AutonomousCopyEngine(SessionGateMixin):
         self, signal: Signal, route: Route, target_symbol: str,
         sl_mult: Optional[float], tp_mult: Optional[float],
         has_smaller_alternative: bool = False,
+        accounts: Optional[Dict[str, Any]] = None,
     ):
         """Price, measure and size one candidate contract.
 
@@ -785,6 +786,8 @@ class AutonomousCopyEngine(SessionGateMixin):
         a smaller contract's lower risk per unit is the entire point of
         offering it as an alternative.
         """
+        if accounts is None:
+            accounts = {}
         blocked = self.blocked_targets.get(target_symbol)
         if blocked:
             return None, blocked
@@ -851,7 +854,29 @@ class AutonomousCopyEngine(SessionGateMixin):
             # same XAUUSD is 100oz at one and 10oz at another, and a table
             # would be a second place to be wrong.
             spec = await self._broker_contract_spec(target_symbol)
-        real_account = await self.adapter.get_account_summary(account_type)
+        # ONE SNAPSHOT PER SIGNAL, shared by every candidate on the route.
+        #
+        # This fetched per candidate, and the two IBKR slaves share account
+        # DUR314653. On 2026-11-16 the ETF slave's fill landed BETWEEN the
+        # GC and MGC lookups and the fallback sized against a balance the
+        # first candidate never saw:
+        #
+        #   D   ETF filled 3,282 UGL a second before  -> MGC 16.5% short
+        #   H4  ETF filled 7,646 UGL two seconds before -> MGC 35.1% short
+        #   H1  ETF refused, nothing filled            -> MGC 1.0%, exact
+        #
+        # The shortfall tracked the size of the fill each time. A chain is
+        # one decision about one signal, so it has to be priced against one
+        # view of the account; candidates differ by instrument, not by when
+        # they happened to ask.
+        #
+        # Keyed by account_type because a chain may mix a futures contract
+        # with a brokerage one, and those are genuinely different accounts.
+        if account_type in accounts:
+            real_account = accounts[account_type]
+        else:
+            real_account = await self.adapter.get_account_summary(account_type)
+            accounts[account_type] = real_account
         account, reason = self._risk_account(real_account)
         if account is None:
             # The broker could not be asked what the account holds. That
@@ -1094,6 +1119,8 @@ class AutonomousCopyEngine(SessionGateMixin):
         await self._await_preflight()
 
         candidates = route.candidates or [route.target]
+        # One account snapshot for the whole chain -- see _size_candidate.
+        accounts: Dict[str, Any] = {}
         rejected = []
         refused = []
         chosen = None
@@ -1102,7 +1129,8 @@ class AutonomousCopyEngine(SessionGateMixin):
                 signal, route, candidate, sl_mult, tp_mult,
                 # Candidates run largest first by convention, so anything
                 # before the last has a smaller one to fall through to.
-                has_smaller_alternative=(candidate is not candidates[-1]))
+                has_smaller_alternative=(candidate is not candidates[-1]),
+                accounts=accounts)
             if sized is None:
                 rejected.append((candidate, reason))
                 continue
