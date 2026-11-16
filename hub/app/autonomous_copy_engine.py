@@ -12,7 +12,7 @@ from app.adapters.base import (
     AdapterError, BrokerAdapter, EntryNeverFilled, OrderRequest,
 )
 from app.atr import compute_atr
-from app.contract_specs import get_contract_spec
+from app.contract_specs import ContractSpec, get_contract_spec
 from app.events import EventBus
 from app.models import Signal
 from app.notifier import Notifier
@@ -165,6 +165,10 @@ class AutonomousCopyEngine(SessionGateMixin):
         self.defer_poll_seconds = defer.get("poll_seconds", 5)
         # keyed (master_account, master_ticket, target, month_slot)
         self._deferred: Dict[tuple, dict] = {}
+        # symbol -> ContractSpec, or False for "asked, cannot answer".
+        # An instrument's contract size does not change under a running
+        # hub, and the SYMBOLS round trip is on the signal path.
+        self._broker_specs: Dict[str, Any] = {}
         # background fill collectors; held so they aren't garbage collected
         # mid-flight and so stop() can cancel them
         self._fill_tasks: set = set()
@@ -692,9 +696,86 @@ class AutonomousCopyEngine(SessionGateMixin):
                 self.slave_id, self.preflight_wait_seconds,
             )
 
+    async def _broker_contract_spec(self, symbol: str):
+        """A ContractSpec built from what the BROKER says this symbol is.
+
+        For every symbol the static registry does not carry -- which is
+        every MT symbol there is. Without one, compute_size treats a lot
+        as a single unit of quote currency and oversizes by the contract
+        size: 100x on XAUUSD, and five figures on a forex pair.
+
+        Only tick_size and tick_value are used for risk. contract_size is
+        deliberately NOT multiplied in: MT's tick value is already per
+        one lot, so doing both would reintroduce the same error in the
+        other direction.
+
+        volume_min becomes min_size, so rounding happens in the broker's
+        own volume steps -- 0.01 lots, not 1.
+
+        Cached per symbol. The spec is a property of the instrument and
+        the SYMBOLS round trip is on the signal path, where an extra
+        request per candidate is paid on every signal.
+
+        Returns None when the adapter cannot answer, and the caller then
+        behaves exactly as it did before this existed. That is the safe
+        direction only because the alternative -- guessing a contract
+        size -- is how a plausible wrong number survives unnoticed.
+        """
+        cached = self._broker_specs.get(symbol)
+        if cached is not None:
+            return cached or None     # False means "asked, cannot answer"
+
+        ask = getattr(self.adapter, "get_symbol_spec", None)
+        if ask is None:
+            self._broker_specs[symbol] = False
+            return None
+        try:
+            broker = await ask(symbol)
+        except (AdapterError, NotImplementedError) as exc:
+            logger.warning(
+                "slave=%s %s: the broker could not describe this symbol (%s); "
+                "sizing falls back to one unit of quote currency per lot, "
+                "which is wrong for any contract larger than that",
+                self.slave_id, symbol, exc,
+            )
+            self._broker_specs[symbol] = False
+            return None
+
+        tick_size = float(getattr(broker, "tick_size", 0.0) or 0.0)
+        tick_value = float(getattr(broker, "tick_value", 0.0) or 0.0)
+        if tick_size <= 0 or tick_value <= 0:
+            # Refused rather than defaulted. A zero here would divide by
+            # zero or size infinitely; a made-up 1.0 is the bug this
+            # method exists to fix, wearing a different hat.
+            logger.warning(
+                "slave=%s %s: broker reports tick_size=%s tick_value=%s, "
+                "neither usable for sizing",
+                self.slave_id, symbol, tick_size, tick_value,
+            )
+            self._broker_specs[symbol] = False
+            return None
+
+        min_size = float(getattr(broker, "volume_min", 0.0) or 0.0) or 0.01
+        spec = ContractSpec(
+            symbol=symbol,
+            tick_size=tick_size,
+            tick_value=tick_value,
+            point_value=tick_value / tick_size,
+            min_size=min_size,
+        )
+        logger.info(
+            "slave=%s %s sized from the broker's own spec: tick %s = %s, "
+            "min volume %s (contract_size %s)",
+            self.slave_id, symbol, tick_size, tick_value, min_size,
+            getattr(broker, "contract_size", "?"),
+        )
+        self._broker_specs[symbol] = spec
+        return spec
+
     async def _size_candidate(
         self, signal: Signal, route: Route, target_symbol: str,
         sl_mult: Optional[float], tp_mult: Optional[float],
+        has_smaller_alternative: bool = False,
     ):
         """Price, measure and size one candidate contract.
 
@@ -748,7 +829,28 @@ class AutonomousCopyEngine(SessionGateMixin):
         slave_tp = quote + sign * tp_mult * slave_atr if tp_mult is not None else None
 
         spec = get_contract_spec(target_symbol)
+        # ACCOUNT TYPE IS DECIDED BY THE STATIC REGISTRY ALONE, before any
+        # broker spec is fetched below. The registry is what says "this is
+        # a listed future"; an MT symbol having a contract size does not
+        # make the slave's futures account the right one to size against.
         account_type = "futures" if spec else "brokerage"
+        if spec is None:
+            # THE 100x. Without a spec, compute_size falls back to
+            # `risk_per_unit = stop_distance` -- one unit risks one unit of
+            # quote currency, which is true for a share and wrong for every
+            # MT symbol there is. XAUUSD is 100oz a lot, so a stop 125 wide
+            # risks $12,554 per lot and was being read as $125. The D run
+            # on 2026-11-15 opened 13.00 lots against the master's 0.13:
+            # exactly 100x, exactly the contract size.
+            #
+            # The figures were already in the hub -- the bridge reports
+            # contract_size, tick_size and tick_value per symbol, and
+            # MT4Adapter.get_symbol_spec has returned them for a while.
+            # Nothing asked. Taken from the BROKER rather than a table
+            # because a CFD's contract size is the broker's choice: the
+            # same XAUUSD is 100oz at one and 10oz at another, and a table
+            # would be a second place to be wrong.
+            spec = await self._broker_contract_spec(target_symbol)
         real_account = await self.adapter.get_account_summary(account_type)
         account, reason = self._risk_account(real_account)
         if account is None:
@@ -773,6 +875,11 @@ class AutonomousCopyEngine(SessionGateMixin):
             account_equity=account.equity,
             contract_spec=spec,
             risk_scale=risk_scale,
+            # Only where a smaller contract is next in the list. On the
+            # LAST candidate this is None, or a size landing mid-band
+            # would step down to nothing and fill nothing at all.
+            round_band=(sizing_config.get("round_band")
+                        if has_smaller_alternative else None),
         )
         if sizing_result.skipped:
             return None, sizing_result.reason
@@ -980,7 +1087,10 @@ class AutonomousCopyEngine(SessionGateMixin):
         chosen = None
         for candidate in candidates:
             sized, reason = await self._size_candidate(
-                signal, route, candidate, sl_mult, tp_mult)
+                signal, route, candidate, sl_mult, tp_mult,
+                # Candidates run largest first by convention, so anything
+                # before the last has a smaller one to fall through to.
+                has_smaller_alternative=(candidate is not candidates[-1]))
             if sized is None:
                 rejected.append((candidate, reason))
                 continue

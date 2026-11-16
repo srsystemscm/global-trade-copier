@@ -123,7 +123,11 @@ def _engine(rejections, refused_flags=()):
     e.blocked_targets = {}
     e._rejections = list(rejections)
 
-    async def _size(signal, route, candidate, sl_mult, tp_mult):
+    # **kw, not the exact signature. _size_candidate gained
+    # has_smaller_alternative on 2026-11-15 and every stub mirroring its
+    # parameters broke at once -- six tests failing on a keyword, saying
+    # nothing about whether a shut market still defers.
+    async def _size(signal, route, candidate, sl_mult, tp_mult, **kw):
         return None, e._rejections.pop(0)
 
     async def _emit(*a, **k):
@@ -223,7 +227,7 @@ def test_a_mix_of_declined_and_unpriceable_keeps_the_old_behaviour():
     e._netting_check = _netting
     e._rejections = [Unavailable("no quote (session closed)"), None]
 
-    async def _size(signal, route, candidate, sl_mult, tp_mult):
+    async def _size(signal, route, candidate, sl_mult, tp_mult, **kw):
         nxt = e._rejections.pop(0)
         if nxt is None:
             return {"symbol": candidate, "account": object(),
