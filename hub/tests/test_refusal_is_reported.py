@@ -17,6 +17,17 @@ Two paths reached `chosen is None` and only one of them reported:
 The second is the common one, because it covers every ordinary reason a
 market cannot be traded right now: no quote, no history, a size that
 rounded to nothing.
+
+SPLIT AGAIN on 2026-11-15, because those reasons are not one thing:
+
+  could not be priced     -> open_deferred, held and retried
+                             (then deferred_open_abandoned, an ALERT)
+  declined on a rule      -> signal_refused / netting_refused
+
+A shut market passes; a size over the ceiling does not. Reporting both
+as refusals was accurate about the outcome and wrong about the cause,
+and it meant an ETF leg signalled on a Sunday evening was discarded six
+hours before the instrument it wanted could trade.
 """
 import asyncio
 
@@ -70,7 +81,19 @@ def _collect(engine, signal):
 
 def test_a_target_that_cannot_be_priced_is_reported():
     """The exact shape of the ETH case: the broker cannot quote, so no
-    leg is possible, and the hub must hear about it."""
+    leg is possible, and the hub must hear about it.
+
+    REWORKED 2026-11-15, and the requirement is unchanged -- a leg that
+    did not happen has to say so. What changed is the honest answer.
+    This asserted `signal_refused`, but a target that cannot be PRICED
+    is not refused: "the market is shut" is a circumstance that passes,
+    and the ETF legs have to rest from a Sunday evening into Monday's
+    extended session rather than being discarded six hours early.
+
+    So it is held, and the hub is told so by name, with the reason and
+    the retry interval. If it never fills, deferred_open_abandoned
+    follows as an ALERT -- louder than the NOTICE this used to produce.
+    """
     broker = FakeBroker()
 
     async def _no_quote(symbol, month_slot=0, **kw):
@@ -80,13 +103,20 @@ def test_a_target_that_cannot_be_priced_is_reported():
     broker.get_quote = _no_quote
     events = _collect(_engine(broker), _signal())
 
-    refusals = [e for e in events if e.get("type") == "signal_refused"]
-    assert refusals, "a leg that did not happen reported nothing"
-    assert "no quote" in refusals[0]["reason"]
-    assert refusals[0].get("slave_symbol") == "ETHUSDRR", (
-        "a refusal naming no instrument cannot be told from a refusal of "
-        "the whole signal"
+    held = [e for e in events if e.get("type") == "open_deferred"]
+    assert held, (
+        "a leg that did not happen reported nothing -- the ETH incident, "
+        "exactly: the hub shows a master order with nothing beside it"
     )
+    assert "no quote" in held[0]["reason"]
+    assert held[0].get("slave_symbol") == "ETHUSDRR", (
+        "an event naming no instrument cannot be told from one about the "
+        "whole signal"
+    )
+    # And it must NOT also claim to have been refused: the signal is
+    # still live, and two contradictory rows for one leg is worse than
+    # the silence this test was written about.
+    assert not [e for e in events if e.get("type") == "signal_refused"]
 
 
 def test_the_reason_travels_rather_than_staying_in_the_log():
@@ -101,9 +131,10 @@ def test_the_reason_travels_rather_than_staying_in_the_log():
     broker.get_price_history = _no_history
     events = _collect(_engine(broker), _signal())
 
-    refusals = [e for e in events if e.get("type") == "signal_refused"]
-    assert refusals, "a missing price history reported nothing"
-    assert "ETHUSDRR" in refusals[0]["reason"] or "history" in refusals[0]["reason"]
+    # Same rework as above: no bars YET is a wait, not a refusal.
+    held = [e for e in events if e.get("type") == "open_deferred"]
+    assert held, "a missing price history reported nothing"
+    assert "ETHUSDRR" in held[0]["reason"] or "history" in held[0]["reason"]
 
 
 def test_a_signal_that_copies_cleanly_emits_no_refusal():

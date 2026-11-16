@@ -70,6 +70,29 @@ class Refusal:
     overflowable: bool = False
 
 
+class Unavailable(str):
+    """A rejection reason meaning "could not", not "declined".
+
+    The difference decides whether a signal is retried or dropped, and
+    getting it the wrong way round is bad in both directions: dropping a
+    "could not" throws away a trade the master is still in, while
+    retrying a "declined" argues with a policy every thirty seconds until
+    the ceiling.
+
+    A str subclass ON PURPOSE. These reasons are joined into log lines
+    and events all over this module; subclassing means none of that has
+    to know this type exists, and a reason that loses its marker degrades
+    to today's behaviour rather than crashing.
+
+    Marked where the reason is PRODUCED rather than matched by text
+    later. The text here is ours, but it embeds the broker's wording, and
+    pinning behaviour to IBKR's phrasing for a closed market is exactly
+    the sort of thing that works until the day it does not.
+    """
+
+    __slots__ = ()
+
+
 class AutonomousCopyEngine(SessionGateMixin):
     """Autonomous-mode copy engine: one instance per slave.
 
@@ -698,9 +721,11 @@ class AutonomousCopyEngine(SessionGateMixin):
                 bar_size=bar_size)
             slave_atr = compute_atr(bars, atr_period)
         except ValueError as exc:
-            return None, f"no usable ATR ({exc})"
+            # Transient: not enough bars YET is a different thing
+            # from a symbol whose bars will never arrive.
+            return None, Unavailable(f"no usable ATR ({exc})")
         except AdapterError as exc:
-            return None, f"no price history ({exc})"
+            return None, Unavailable(f"no price history ({exc})")
 
         try:
             quote = await self.adapter.get_quote(
@@ -715,7 +740,7 @@ class AutonomousCopyEngine(SessionGateMixin):
                 "so this target cannot be sized",
                 self.slave_id, target_symbol, exc,
             )
-            return None, f"no quote ({exc})"
+            return None, Unavailable(f"no quote ({exc})")
 
         traded_direction = route.target_direction or signal.direction
         sign = 1 if traded_direction == "BUY" else -1
@@ -727,7 +752,9 @@ class AutonomousCopyEngine(SessionGateMixin):
         real_account = await self.adapter.get_account_summary(account_type)
         account, reason = self._risk_account(real_account)
         if account is None:
-            return None, reason
+            # The broker could not be asked what the account holds. That
+            # is a connection problem, not a decision about this trade.
+            return None, Unavailable(reason)
 
         sizing_config = merge_sizing(
             resolve_sizing_config(self.slave_config, target_symbol), route.sizing)
@@ -981,6 +1008,26 @@ class AutonomousCopyEngine(SessionGateMixin):
             break
 
         if chosen is None:
+            # COULD NOT, versus DECLINED. Every candidate failed; if none
+            # of them failed on policy and at least one simply could not
+            # be priced, this is a signal to hold rather than discard.
+            # Raised, not handled here, so it lands in the deferral the
+            # route loop already owns -- with its retry schedule, its disk
+            # persistence across restarts, and its rule that a master
+            # CLOSE drops whatever is still held.
+            #
+            # `not refused` is deliberately strict: if ANY candidate was
+            # turned away by a rule, this keeps the old behaviour rather
+            # than retrying a decision on the chance that a sibling
+            # instrument starts quoting.
+            unavailable = [r for _, r in rejected if isinstance(r, Unavailable)]
+            if unavailable and not refused:
+                raise AdapterError(
+                    "nothing tradeable among %s yet -- %s"
+                    % (", ".join(candidates),
+                       "; ".join("%s: %s" % r for r in rejected))
+                )
+
             logger.warning(
                 "slave=%s skipping OPEN ticket=%s: nothing tradeable among "
                 "%s -- %s",
