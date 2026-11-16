@@ -533,6 +533,20 @@ code {
   font-size: 0.85em;
 }
 
+/* A slave that has stopped consuming. Deliberately the loudest thing on
+   the card: the condition it reports is silent signal loss, and the four
+   stalls on 2026-11-16 went unnoticed because every indicator beside it
+   stayed green. */
+.slave-stalled {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--error);
+  border: 1px solid var(--error);
+  border-radius: 6px;
+  padding: 6px 8px;
+  line-height: 1.4;
+}
+
 /* --- per-slave sizing & risk ------------------------------------- */
 
 .slave-sizing {

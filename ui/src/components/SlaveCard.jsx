@@ -1,6 +1,17 @@
 export default function SlaveCard({ slave, onTogglePause, onRemove }) {
-  const statusBadge = slave.paused ? "paused" : slave.running ? "running" : "stopped";
-  const statusClass = slave.paused ? "badge-warn" : slave.running ? "badge-ok" : "badge-error";
+  // "running" describes the engine OBJECT, and a stalled engine is still
+  // an object. On 2026-11-16 four of them read running and connected
+  // while consuming nothing at all, and this card said so for 37
+  // minutes. `consume` is the only field that can tell the two apart, so
+  // it OVERRIDES the badge rather than sitting quietly beside it.
+  const consume = slave.consume;
+  const stalled = slave.running && consume?.stalled;
+  const statusBadge = stalled
+    ? "NOT CONSUMING"
+    : slave.paused ? "paused" : slave.running ? "running" : "stopped";
+  const statusClass = stalled
+    ? "badge-error"
+    : slave.paused ? "badge-warn" : slave.running ? "badge-ok" : "badge-error";
 
   const connBadge = slave.connected === true ? "connected" : slave.connected === false ? "disconnected" : "checking...";
   const connClass = slave.connected === true ? "badge-ok" : slave.connected === false ? "badge-error" : "badge-warn";
@@ -20,6 +31,16 @@ export default function SlaveCard({ slave, onTogglePause, onRemove }) {
       {slave.running && (
         <div style={{ marginBottom: 8 }}>
           <span className={`badge ${connClass}`}>{connBadge}</span>
+        </div>
+      )}
+
+      {/* Said in words, because the badge alone does not tell a reader
+          that signals are being lost rather than merely delayed. */}
+      {stalled && (
+        <div className="slave-stalled" style={{ marginBottom: 8 }}>
+          {consume.alive === false
+            ? "This slave's copy loop has stopped and will not restart on its own. Every signal is being dropped. Restart the hub."
+            : `${consume.queue_depth} signal(s) queued and nothing taken off the queue for ${consume.seconds_since_consumed ?? "?"}s.`}
         </div>
       )}
 
