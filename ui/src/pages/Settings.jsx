@@ -1392,8 +1392,13 @@ function RouteSizingForm({ slave, onDone }) {
             onChange={(e) => setForm({ ...form, max_risk_error: e.target.value })}
           />
         </label>
-        <label>
-          Step down outside (band)
+        {/* VISIBLY inert when the tolerance is set, not just described
+            as inert in a paragraph below. Two editable fields answering
+            one question is how a config comes to hold two answers -- the
+            margin ceiling did exactly that, and showed 25%% on a slave
+            that was uncapped. */}
+        <label className={form.max_risk_error !== "" ? "muted" : undefined}>
+          Step down outside (band){form.max_risk_error !== "" ? " -- ignored" : ""}
           <input
             type="number"
             step="0.05"
@@ -1401,6 +1406,10 @@ function RouteSizingForm({ slave, onDone }) {
             max="0.49"
             value={form.round_band}
             placeholder="off"
+            disabled={form.max_risk_error !== ""}
+            title={form.max_risk_error !== ""
+              ? "The risk tolerance decides while it is set. Clear it to use the band again."
+              : undefined}
             onChange={(e) => setForm({ ...form, round_band: e.target.value })}
           />
         </label>
