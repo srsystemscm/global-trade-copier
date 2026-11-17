@@ -1752,8 +1752,24 @@ class AutonomousCopyEngine(SessionGateMixin):
         key = (account, master_ticket, slave_symbol)
         self._positions.pop(key, None)
         position_store.delete(self.slave_id, account, master_ticket, slave_symbol)
-        trade_registry.record_entry_cancelled(
-            self.slave_id, account, master_ticket, slave_symbol)
+        if not trade_registry.record_entry_cancelled(
+                self.slave_id, account, master_ticket, slave_symbol):
+            # Already reported. _handle_close reaches this for an entry
+            # the master closed before it filled, and the background
+            # fill-capture task reaches it again when its own wait runs
+            # out -- on UGL 1193 those were 30 seconds apart, and the
+            # second one raised the alert and sent the notification a
+            # second time for one event.
+            #
+            # The cleanup above still runs: it is idempotent, and the
+            # first path through may have been the one that did not get
+            # as far as the position_store row.
+            logger.debug(
+                "slave=%s unfilled entry for master_ticket=%s was already "
+                "reported; not raising it twice",
+                self.slave_id, master_ticket,
+            )
+            return
 
         msg = (
             f"Slave {self.slave_id} never filled {slave_symbol} for "

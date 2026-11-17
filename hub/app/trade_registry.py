@@ -138,8 +138,16 @@ def record_entry_cancelled(
     master_account: str,
     master_ticket: int,
     slave_symbol: str,
-) -> None:
+) -> bool:
     """Close out a row whose entry never filled.
+
+    RETURNS whether this call is the one that moved it. Two paths reach
+    an unfilled entry for the same ticket -- the master's CLOSE, and the
+    background fill-capture task when its own wait runs out -- and on UGL
+    1193 those were 30 seconds apart. Both are right to ask; only the
+    first has something to report. Without this they each raised the
+    "the master IS in this trade and this leg is NOT" alert, and each
+    sent its own notification, for one event.
 
     CANCELLED rather than CLOSED, and deliberately not deleted: the signal
     did reach this slave and produced no position, which is exactly the kind
@@ -158,6 +166,10 @@ def record_entry_cancelled(
             """,
             (time.time(), slave_id, master_account, master_ticket, slave_symbol),
         )
+        # The WHERE clause carries status = 'OPEN', so a second call
+        # matches nothing. That is what makes this answer meaningful
+        # rather than a guess about who got here first.
+        return cur.rowcount > 0
 
 
 def record_fill(
