@@ -375,6 +375,7 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
   const [editingMasters, setEditingMasters] = useState(false);
   const [editingRoll, setEditingRoll] = useState(false);
   const [editingSplit, setEditingSplit] = useState(false);
+  const [editingChase, setEditingChase] = useState(false);
   const [showRoutes, setShowRoutes] = useState(false);
 
   function toggle() {
@@ -665,6 +666,30 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
         <OrderSplitForm
           slave={slave}
           onDone={() => { setEditingSplit(false); onSaved && onSaved(); }}
+        />
+      )}
+
+      {/* How a RESTING limit entry follows the market. Only means
+          anything where entries rest -- a market order fills or it does
+          not. */}
+      <div className="slave-risk-row">
+        <div>
+          <span className="muted small">Entry chase</span>
+          <div className="slave-risk-sizing">
+            {slave.entry_chase
+              ? `${slave.entry_chase.steps} re-price(s), ${slave.entry_chase.interval_s}s apart, ` +
+                `up to ${(slave.entry_chase.max_pct * 100).toFixed(2)}% from where it started`
+              : "off -- a resting entry is left at the price it went out at"}
+          </div>
+        </div>
+        <button className="btn btn-small" onClick={() => setEditingChase((v) => !v)}>
+          {editingChase ? "Cancel" : "Edit"}
+        </button>
+      </div>
+      {editingChase && (
+        <EntryChaseForm
+          slave={slave}
+          onDone={() => { setEditingChase(false); onSaved && onSaved(); }}
         />
       )}
 
@@ -2190,6 +2215,148 @@ function OrderSplitForm({ slave, onDone }) {
         This is the slave-wide default. A route may set its own{" "}
         <code>split_slices</code> / <code>split_interval</code>, which wins over this,
         and <code>split_slices: 0</code> on a route opts it out entirely.
+      </p>
+
+      <div className="form-actions">
+        <button className="btn btn-primary" onClick={save} disabled={busy}>
+          {busy ? "Saving..." : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * How a RESTING entry follows the market.
+ *
+ * Each step re-anchors to a FRESH quote -- it does not step by a fixed
+ * amount -- and only moves the order if that quote asks for a better
+ * price. A step is not spent when it does not.
+ */
+function EntryChaseForm({ slave, onDone }) {
+  const [form, setForm] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const got = await api.getSlave(slave.id);
+        setForm({
+          steps: got.config.entry_chase_steps ?? "",
+          interval: got.config.entry_chase_interval ?? "",
+          max_pct: got.config.entry_chase_max_pct != null
+            ? +(got.config.entry_chase_max_pct * 100).toFixed(4) : "",
+        });
+      } catch (e) {
+        setErr(e.message);
+      }
+    })();
+  }, [slave.id]);
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const steps = String(form.steps).trim();
+      const interval = String(form.interval).trim();
+      const pct = String(form.max_pct).trim();
+      const off = steps === "" || Number(steps) <= 0;
+
+      let n = 0;
+      let secs = null;
+      let ceiling = null;
+      if (!off) {
+        n = Number(steps);
+        if (!Number.isInteger(n) || n < 1) throw new Error("steps must be a whole number of 1 or more, or 0 for off");
+        if (interval === "" || Number.isNaN(Number(interval)) || Number(interval) <= 0) {
+          throw new Error("the interval must be more than 0 seconds");
+        }
+        secs = Number(interval);
+        if (pct === "" || Number.isNaN(Number(pct)) || Number(pct) <= 0) {
+          throw new Error("the ceiling must be a percentage above 0");
+        }
+        ceiling = Number(pct) / 100;
+      }
+
+      const config = await currentConfig(slave.id);
+      if (off) {
+        delete config.entry_chase_steps;
+        delete config.entry_chase_interval;
+        delete config.entry_chase_max_pct;
+      } else {
+        config.entry_chase_steps = n;
+        config.entry_chase_interval = secs;
+        config.entry_chase_max_pct = ceiling;
+      }
+
+      await api.patchSlave(slave.id, { config });
+      onDone();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (err && !form) return <div className="banner banner-error">{err}</div>;
+  if (!form) return <p className="muted small">Loading this slave&apos;s configuration...</p>;
+
+  const n = Number(form.steps);
+  const secs = Number(form.interval);
+  const span = n > 0 && secs > 0 ? n * secs : null;
+
+  return (
+    <div className="slave-risk-form">
+      {err && <div className="banner banner-error">{err}</div>}
+
+      <label>
+        Re-prices
+        <input type="number" min="0" step="1" value={form.steps} placeholder="off"
+               onChange={(e) => setForm({ ...form, steps: e.target.value })} />
+      </label>
+      <label>
+        Seconds apart
+        <input type="number" min="0" step="1" value={form.interval} placeholder="--"
+               onChange={(e) => setForm({ ...form, interval: e.target.value })} />
+      </label>
+      <label>
+        Ceiling (% from the first price)
+        <input type="number" min="0" step="0.25" value={form.max_pct} placeholder="--"
+               onChange={(e) => setForm({ ...form, max_pct: e.target.value })} />
+      </label>
+
+      {span != null ? (
+        <p className="muted small">
+          The order is re-priced up to <strong>{n} time(s)</strong>, the first after{" "}
+          <strong>{secs}s</strong> and the last by <strong>{span}s</strong>.{" "}
+          <strong>The trade has to outlive that.</strong> An interval longer than the
+          master holds its position means the chase never fires at all -- which is what
+          60s against 30-second trades was doing.
+        </p>
+      ) : (
+        <p className="muted small">
+          Off. A resting entry stays at the price it went out at until its own timeout
+          cancels it.
+        </p>
+      )}
+
+      <p className="muted small">
+        Each step re-anchors to a <strong>fresh quote</strong> rather than stepping by a
+        fixed amount, and only moves the order if that quote asks for a better price --
+        a step is not spent when it does not. So a frozen quote costs nothing and
+        achieves nothing, which is what <code>quote_fallback: last_close</code> gives you
+        once the broker stops quoting.
+      </p>
+      <p className="muted small">
+        The <strong>ceiling</strong> is measured from the price the order first went out
+        at, and that price is already <code>limit_offset_pct</code> through the quote. A
+        1% ceiling on a 1% offset leaves the chase one further percent of room.
+      </p>
+      <p className="muted small">
+        Not used on an entry that is being <strong>split</strong>: both move the same
+        resting order and neither knows about the other, so the splitter wins and says
+        so in the log.
       </p>
 
       <div className="form-actions">

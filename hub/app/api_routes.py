@@ -645,6 +645,17 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         # Whether entries go out in one print or in slices over a window.
         # None on every slave that has not configured it.
         "split_summary": _split_summary(slave.config),
+        # How a RESTING entry follows the market: steps, how far apart,
+        # and how far it may drift from where it started. Reported as the
+        # three together, because any one of them alone decides nothing
+        # -- an interval longer than the trade means it never fires at
+        # all, which is what ibkr-etf-1 was doing with 60s against 30s
+        # trades.
+        "entry_chase": (
+            {"steps": int(slave.config.get("entry_chase_steps") or 0),
+             "interval_s": float(slave.config.get("entry_chase_interval") or 300.0),
+             "max_pct": float(slave.config.get("entry_chase_max_pct") or 0.01)}
+            if slave.config.get("entry_chase_steps") else None),
         # Whether this slave's adapter can split an entry AT ALL. The
         # fields travel on every OrderRequest and only IBKR acts on them,
         # so offering the control on an MT slave would be a setting that
@@ -815,6 +826,54 @@ def _mode_switch(slave, config) -> Optional[tuple]:
     return None if after == before else (before, after)
 
 
+# What the adapter reads from its OWN attributes every time it is used,
+# rather than from the config. Each is safe to change between orders --
+# none of them describes the connection, and none is remembered inside an
+# order already placed.
+#
+# THE CONNECTION DETAILS ARE DELIBERATELY NOT HERE. host, port, client_id
+# and account are read once, to open a session; rewriting them on a live
+# adapter would leave it connected to one place and labelled another.
+# Those still need a restart, and the UI says so.
+_LIVE_ADAPTER_TUNABLES = {
+    "entry_chase_steps": ("entry_chase_steps", int, 0),
+    "entry_chase_interval": ("entry_chase_interval", float, 300.0),
+    "entry_chase_max_pct": ("entry_chase_max_pct", float, 0.01),
+    "entry_split_slices": ("entry_split_slices", int, 0),
+    "entry_split_interval": ("entry_split_interval", float, 0.0),
+    "quote_fallback": ("quote_fallback", str, "strict"),
+}
+
+
+def _refresh_adapter_tunables(adapter, config: Dict[str, Any]) -> None:
+    """Push the per-use settings onto a running adapter.
+
+    The adapter reads these in its constructor, which runs once at
+    startup. PATCH live-updates the engine, so a route's setting took
+    effect immediately while a slave-level one sat in the config doing
+    nothing until the next restart -- the card reading "entries split
+    into 3 over 5s" while 831 MET went out in a single order.
+
+    That is a setting which saves cleanly and does nothing, and this file
+    has had to go back and gate three of them. Refreshing the adapter is
+    cheaper than adding a fourth.
+    """
+    if adapter is None:
+        return
+    for key, (attr, cast, default) in _LIVE_ADAPTER_TUNABLES.items():
+        if not hasattr(adapter, attr):
+            continue
+        try:
+            setattr(adapter, attr, cast(config.get(key, default)))
+        except (TypeError, ValueError):
+            # A value that will not cast is a config error, not a reason
+            # to abandon the rest of the refresh or fail the save.
+            logger.warning(
+                "slave config %s=%r cannot be applied to the adapter",
+                key, config.get(key),
+            )
+
+
 @router.patch("/slaves/{slave_id}")
 async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
     slave = get_slave(slave_id)
@@ -844,6 +903,8 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
             engine.risk_config = slave.config.get("risk_management", {})
             if hasattr(engine, "roll_config"):
                 engine.roll_config = slave.config.get("contract_roll", {})
+            _refresh_adapter_tunables(getattr(engine, "adapter", None),
+                                      slave.config)
         if payload.config is not None:
             # Held by the bus, not the engine: the selection decides what
             # reaches this slave's queue in the first place. Updated even
