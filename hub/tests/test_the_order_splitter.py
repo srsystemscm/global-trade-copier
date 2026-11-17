@@ -631,3 +631,36 @@ def test_an_unsplit_open_still_reports_its_whole_size():
     a = _adapter()
     result = asyncio.run(a.open(_order()))
     assert result.lots == 35.0
+
+
+def test_abandoning_a_ticket_twice_does_not_warn_the_second_time(caplog):
+    """Two paths reach abandon_unfilled_entry for one ticket: close()
+    when the CLOSE arrives before the entry filled, and the background
+    fill-capture task when its own wait runs out. On UGL 1108 those were
+    29 seconds apart, and the second logged "cancelled unfilled entry
+    1108 (0 slice(s)) and its protective legs" at WARNING -- a warning
+    about something that did not happen, which is how warnings stop
+    being read."""
+    import logging
+
+    async def go():
+        a = _adapter()
+        result = await a.open(_order(split_slices=3, split_interval=0.01))
+        ticket = result.slave_ticket
+        await _finish_slices(a, ticket)
+        first = await a.abandon_unfilled_entry(ticket)
+        # Cleared, because caplog accumulates for the whole test and the
+        # FIRST abandon warns legitimately -- it really did cancel three
+        # slices. Only the second call is under test here.
+        caplog.clear()
+        second = await a.abandon_unfilled_entry(ticket)
+        return first, second
+
+    with caplog.at_level(logging.INFO):
+        first, second = asyncio.run(go())
+    assert first == (None, None)
+    assert second == (None, None), "a second abandon claimed to find something"
+    assert "cancelled unfilled entry" not in caplog.text, (
+        "the second abandon reported cancelling an entry and its "
+        f"protective legs: {caplog.text}"
+    )

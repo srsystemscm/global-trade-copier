@@ -1609,6 +1609,22 @@ class IBKRAdapter(BrokerAdapter):
         self._entry_waits.pop(slave_ticket, None)
         pos = self._positions.get(slave_ticket)
 
+        if not slices and pos is None:
+            # Already gone. TWO PATHS REACH THIS FOR ONE TICKET: close()
+            # when the CLOSE arrives before the entry filled, and the
+            # background fill-capture task when its own wait runs out --
+            # on UGL 1108 those were 29 seconds apart. Whichever is first
+            # takes the slices, the legs and the position with it.
+            #
+            # Falling through would log "cancelled unfilled entry and its
+            # protective legs" at WARNING for something that did not
+            # happen, which is how warnings stop being read.
+            logger.debug(
+                "IBKRAdapter[%s] entry %s was already abandoned; nothing left "
+                "to cancel", self.slave_id, slave_ticket,
+            )
+            return None, None
+
         # Last look before cancelling. The fill may have landed while this
         # was being scheduled, and cancelling then would leave a real
         # position with no stop. Across every slice: one filled slice is a
