@@ -251,6 +251,23 @@ def _entries(adapter):
     return [p for p in adapter.placed if p[1] == "BUY"]
 
 
+async def _finish_slices(adapter, slave_ticket):
+    """Wait for the slice schedule to finish, exactly.
+
+    AWAITING THE TASK, not sleeping for a guess. These tests first slept
+    for a multiple of the interval, which passed on its own and lost the
+    race under the full suite -- a flaky test of a money path is worse
+    than no test, because it trains you to re-run rather than look.
+    """
+    task = adapter._split_tasks.get(slave_ticket)
+    if task is None:
+        return
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=30)
+    except asyncio.CancelledError:
+        pass
+
+
 # ---------------------------------------------------- placement --------
 
 def test_an_unsplit_entry_is_one_order_for_the_whole_size():
@@ -277,7 +294,7 @@ def test_every_slice_lands_on_one_position():
     async def go():
         a = _adapter()
         result = await a.open(_order(split_slices=4, split_interval=0.01))
-        await asyncio.sleep(0.1)
+        await _finish_slices(a, result.slave_ticket)
         return a, result
 
     a, result = asyncio.run(go())
@@ -291,8 +308,8 @@ def test_every_slice_lands_on_one_position():
 def test_the_slices_add_up_to_the_size_that_was_sized():
     async def go():
         a = _adapter()
-        await a.open(_order(split_slices=4, split_interval=0.01))
-        await asyncio.sleep(0.1)
+        result = await a.open(_order(split_slices=4, split_interval=0.01))
+        await _finish_slices(a, result.slave_ticket)
         return a
 
     a = asyncio.run(go())
@@ -305,16 +322,28 @@ def test_the_position_size_grows_as_the_slices_go_out():
     held, with the master already out."""
     async def go():
         a = _adapter()
-        result = await a.open(_order(split_slices=4, split_interval=0.03))
+        result = await a.open(_order(split_slices=4, split_interval=0.01))
         first = a._positions[result.slave_ticket]["size"]
-        await asyncio.sleep(0.05)
-        middle = a._positions[result.slave_ticket]["size"]
-        await asyncio.sleep(0.12)
-        return first, middle, a._positions[result.slave_ticket]
+        # Every size the position passed through, recorded as each slice
+        # lands rather than sampled mid-flight -- a sample races the
+        # scheduler and tells you nothing when it loses.
+        seen = [first]
+        pos = a._positions[result.slave_ticket]
+        original = a._place_slice
 
-    first, middle, pos = asyncio.run(go())
+        async def watched(*args, **kw):
+            await original(*args, **kw)
+            seen.append(pos["size"])
+
+        a._place_slice = watched
+        await _finish_slices(a, result.slave_ticket)
+        return first, seen, pos
+
+    first, seen, pos = asyncio.run(go())
     assert first == 9.0
-    assert middle > first, "the position did not grow as slices were placed"
+    assert seen == [9.0, 18.0, 27.0, 35.0], (
+        f"the position grew through {seen}, not 9 -> 18 -> 27 -> 35"
+    )
     assert pos["size"] == 35.0
     assert pos["intended_size"] == 35.0
 
@@ -339,7 +368,7 @@ def test_the_legs_are_regrown_to_match_the_grown_position():
     async def go():
         a = _adapter()
         result = await a.open(_order(split_slices=4, split_interval=0.01))
-        await asyncio.sleep(0.1)
+        await _finish_slices(a, result.slave_ticket)
         return a, result
 
     a, result = asyncio.run(go())
@@ -355,9 +384,9 @@ def test_a_route_without_broker_brackets_gets_no_legs_at_any_size():
     extended hours. The regrow must not quietly introduce one."""
     async def go():
         a = _adapter()
-        await a.open(_order(split_slices=3, split_interval=0.01,
-                            broker_brackets=False))
-        await asyncio.sleep(0.08)
+        result = await a.open(_order(split_slices=3, split_interval=0.01,
+                                     broker_brackets=False))
+        await _finish_slices(a, result.slave_ticket)
         return a
 
     a = asyncio.run(go())
@@ -406,12 +435,17 @@ def test_a_close_mid_window_calls_off_the_remaining_slices():
         a = _adapter()
         result = await a.open(_order(split_slices=4, split_interval=0.05))
         ticket = result.slave_ticket
+        task = a._split_tasks.get(ticket)
         # One slice is working and unfilled, so close() takes the
         # never-filled path -- which must still stop the schedule.
         with pytest.raises(EntryNeverFilled):
             await a.close(ticket)
         placed_at_close = len(_entries(a))
-        await asyncio.sleep(0.2)
+        # The schedule is cancelled, so this returns as soon as it has
+        # actually stopped -- no sleep that has to be guessed long enough.
+        if task is not None:
+            with pytest.raises(asyncio.CancelledError):
+                await task
         return placed_at_close, len(_entries(a)), a._split_pending(ticket)
 
     at_close, after, pending = asyncio.run(go())
@@ -430,8 +464,8 @@ def test_abandoning_an_entry_cancels_every_slice():
         cancelled = []
         a._cancel_tracked_order = lambda oid: cancelled.append(oid)
         result = await a.open(_order(split_slices=3, split_interval=0.01))
-        await asyncio.sleep(0.06)
         ticket = result.slave_ticket
+        await _finish_slices(a, ticket)
         slice_ids = [t.order.orderId for t in a._entry_slices[ticket]]
         price, size = await a.abandon_unfilled_entry(ticket)
         return slice_ids, cancelled, price, size, a._positions
@@ -450,8 +484,8 @@ def test_abandoning_keeps_a_position_that_filled_on_any_slice():
     async def go():
         a = _adapter()
         result = await a.open(_order(split_slices=3, split_interval=0.01))
-        await asyncio.sleep(0.06)
         ticket = result.slave_ticket
+        await _finish_slices(a, ticket)
         a._entry_slices[ticket][2].fill(9, 3846.0)
         return await a.abandon_unfilled_entry(ticket), a, ticket
 
@@ -523,8 +557,8 @@ def test_a_regrown_leg_that_was_rejected_is_reported(caplog):
             "trades": staticmethod(
                 lambda: [_Rejected(oid) for oid in range(7000, 7040)])
         })()
-        await a.open(_order(split_slices=3, split_interval=0.01))
-        await asyncio.sleep(0.08)
+        result = await a.open(_order(split_slices=3, split_interval=0.01))
+        await _finish_slices(a, result.slave_ticket)
 
     with caplog.at_level(logging.ERROR):
         asyncio.run(go())
@@ -577,3 +611,23 @@ class TestSplitSummary:
             "entry_split_slices": 4, "entry_split_interval": 30,
             "routes": [{"target": "UGL", "split_slices": 0}],
         }) == "entries split into 4 over 30s"
+
+
+def test_open_reports_what_actually_went_on_not_the_intention():
+    """The engine logs result.lots as the position's size and the registry
+    row is opened from it. Left as the requested size, a split entry
+    logged "size=16.0" for a position with 6 at the broker -- which is
+    the line a reader checks the size against. Live on 2026-11-16."""
+    a = _adapter()
+    result = asyncio.run(a.open(_order(split_slices=3, split_interval=30.0)))
+    # 35 in three is 12/12/11, so 12 is what went on.
+    assert result.lots == 12.0, (
+        f"open() reported {result.lots} with 12.0 at the broker"
+    )
+    assert result.lots != 35.0, "open() reported the intention"
+
+
+def test_an_unsplit_open_still_reports_its_whole_size():
+    a = _adapter()
+    result = asyncio.run(a.open(_order()))
+    assert result.lots == 35.0

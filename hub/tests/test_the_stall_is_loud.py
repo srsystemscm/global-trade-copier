@@ -198,15 +198,20 @@ def test_the_watchdog_survives_its_own_failure():
     async def go():
         w, _events, _ = _watchdog([])
         calls = []
+        # Waited on, not slept past: a fixed sleep passed on its own and
+        # lost the race under the full suite, which is the worst kind of
+        # test -- it trains you to re-run instead of look.
+        third = asyncio.Event()
 
         async def failing():
             calls.append(1)
             if len(calls) < 3:
                 raise RuntimeError("a poll that went wrong")
+            third.set()
 
         w._check_all = failing
         task = asyncio.create_task(w._loop())
-        await asyncio.sleep(0.08)
+        await asyncio.wait_for(third.wait(), timeout=30)
         alive = not task.done()
         task.cancel()
         return alive, len(calls)

@@ -1421,10 +1421,22 @@ class AutonomousCopyEngine(SessionGateMixin):
         position_store.save(
             self.slave_id, signal.account, signal.ticket, target_symbol, self._positions[key]
         )
-        logger.info(
-            "slave=%s opened %s master_ticket=%s -> slave_ticket=%s size=%s sl=%s tp=%s",
-            self.slave_id, target_symbol, signal.ticket, result.slave_ticket, sizing_result.size, slave_sl, slave_tp,
-        )
+        placed = result.lots if result.lots is not None else sizing_result.size
+        if placed != sizing_result.size:
+            # A split entry: this much is at the broker and the rest is on
+            # a schedule. Said here because this is the line a reader
+            # checks the size against, and it used to report the intention.
+            logger.info(
+                "slave=%s opened %s master_ticket=%s -> slave_ticket=%s size=%s "
+                "of an intended %s, the rest in slices, sl=%s tp=%s",
+                self.slave_id, target_symbol, signal.ticket, result.slave_ticket,
+                placed, sizing_result.size, slave_sl, slave_tp,
+            )
+        else:
+            logger.info(
+                "slave=%s opened %s master_ticket=%s -> slave_ticket=%s size=%s sl=%s tp=%s",
+                self.slave_id, target_symbol, signal.ticket, result.slave_ticket, placed, slave_sl, slave_tp,
+            )
         if route.month_slot:
             logger.info("slave=%s   (magic=%s -> month_slot=%s)", self.slave_id, signal.magic, route.month_slot)
         await self._emit(

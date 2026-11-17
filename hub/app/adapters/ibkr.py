@@ -764,6 +764,12 @@ class IBKRAdapter(BrokerAdapter):
         return OrderResult(
             slave_ticket=slave_ticket, sl_order_id=sl_order_id,
             tp_order_id=tp_order_id,
+            # What actually went on, which for a split entry is the FIRST
+            # SLICE. Left as the requested size, the engine logged
+            # "size=16.0" for a position with 6 at the broker -- a line a
+            # reader would check the size against. The rest arrive from
+            # the schedule and are recorded by await_entry_fill.
+            lots=first,
             broker_order_id=None if broker_order_id is None else str(broker_order_id),
             broker_order_ref=order.order_ref,
         )
