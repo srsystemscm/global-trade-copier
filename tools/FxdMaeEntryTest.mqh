@@ -50,7 +50,28 @@ input bool   DoMaeModify         = true;
 //--- default). Modifying sooner than one poll means the EA never sees the
 //--- original stop and publishes a single OPEN already carrying the widened
 //--- one -- no MODIFY signal at all, which is the opposite of the point.
-input int    MAE_DELAY_MS        = 1500;
+//---
+//--- NOW 5000, measured. At 1500 it happened for real on 2026-11-17, to
+//--- three symbols at once:
+//---
+//---   USTEC 16:57   OPEN stop 318.1, MODIFY stop 636.1   copied
+//---   USTEC 18:16   OPEN stop 670.3, no MODIFY           REFUSED
+//---
+//--- The copier then sized to a staked risk of 3351 instead of 1908 and
+//--- its 2.50% ceiling refused the trade -- correctly, on a signal that
+//--- was not true. XTIUSD (0.94 -> 1.80) and XNGUSD (0.06 -> 0.13) went
+//--- the same way in the same run.
+//---
+//--- What changed was this script, not the bridge: sending a size as
+//--- SEVERAL orders puts up to five OrderSends in front of this sleep,
+//--- and the modify then lands on all of them at once. The margin that
+//--- three polls used to give was spent before the sleep began. H1 is
+//--- hit first because its stops are tightest, so the widening is the
+//--- largest share of the risk.
+//---
+//--- 5000 is ten polls. The real fix is for the bridge to publish on
+//--- first sighting rather than rely on the gap, which is EA work.
+input int    MAE_DELAY_MS        = 5000;
 
 //--- Hold the position this long after the MAE modify, then close it, so a
 //--- single run produces the whole OPEN -> MODIFY -> CLOSE sequence the

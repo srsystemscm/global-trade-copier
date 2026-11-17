@@ -50,6 +50,13 @@
 //|                                                                    |
 //| Versions:                                                          |
 //|   1.00 2026-11-11 initial build                                    |
+//|   1.05 2026-11-17 MAE_DELAY_MS 1500 -> 5000. Sending a size as      |
+//|                   several orders put five OrderSends in front of   |
+//|                   that sleep, so the bridge's first sighting of an  |
+//|                   order could land AFTER the MAE modify -- one OPEN |
+//|                   carrying the widened stop and no MODIFY at all.   |
+//|                   The copier then refused the trade on a staked     |
+//|                   risk that was never staked.                       |
 //|   1.04 2026-11-17 a size over the broker's per-order maximum is     |
 //|                   sent as SEVERAL orders instead of clamped down    |
 //|                   to it. ETHUSD caps at 10.00 lots and 2% wanted    |
@@ -79,7 +86,7 @@
 #property script_show_inputs
 #property version "1.02"
 
-#define MAE_SCRIPT_VERSION "1.04"
+#define MAE_SCRIPT_VERSION "1.05"
 #define MAE_BASE_TF        PERIOD_D1
 #define MAE_MAGIC_START    1001
 
