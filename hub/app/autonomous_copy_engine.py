@@ -1422,7 +1422,13 @@ class AutonomousCopyEngine(SessionGateMixin):
             self.slave_id, signal.account, signal.ticket, target_symbol, self._positions[key]
         )
         placed = result.lots if result.lots is not None else sizing_result.size
-        if placed != sizing_result.size:
+        # ON THE SLICE COUNT, not on whether two floats differ. This asked
+        # `placed != sizing_result.size`, and on 2026-11-16 an MT5 leg
+        # sized 0.8200000000000001 was opened at 0.82 -- a difference of
+        # one ULP -- so the engine announced "the rest in slices" on an
+        # adapter that places one order per entry and has no slices to
+        # send. The adapter is what knows, and it says so.
+        if (result.slices or 1) > 1:
             # A split entry: this much is at the broker and the rest is on
             # a schedule. Said here because this is the line a reader
             # checks the size against, and it used to report the intention.

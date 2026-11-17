@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional, Tuple
 
 from app.contract_specs import ContractSpec
@@ -564,7 +565,7 @@ def compute_size(
                     f"intended risk, so a smaller contract is the better fit"
                 ),
             )
-        final = whole * min_size
+        final = _snap(whole, min_size)
         return _within_ceiling(
             final, sizing_config=sizing_config, entry_price=entry_price,
             stop_price=stop_price, account_balance=account_balance,
@@ -592,12 +593,45 @@ def compute_size(
     else:
         raise ValueError(f"unknown sizing rounding {rounding!r} (expected 'nearest_min1' or 'floor')")
 
-    final = whole * min_size
+    final = _snap(whole, min_size)
     return _within_ceiling(
         final, sizing_config=sizing_config, entry_price=entry_price,
         stop_price=stop_price, account_balance=account_balance,
         account_equity=account_equity, contract_spec=contract_spec,
     )
+
+
+def _snap(units: float, step: float) -> float:
+    """`units` steps of `step`, without the noise the multiply adds.
+
+    82 * 0.01 is 0.8200000000000001 in IEEE754, and MT accounts trade in
+    hundredths of a lot, so most sizes this engine produces for them come
+    out carrying a tail. Measured live on 2026-11-16: an H1 XAUUSD signal
+    sized to 0.8200000000000001 lots.
+
+    That number is not cosmetic. It goes to the broker as a lot size, it
+    is compared against the risk ceiling, and it is read by a person in a
+    log line. It also made the engine report a split entry on an adapter
+    that cannot split, because the check for one was `placed !=
+    sizing_result.size` and a tail is a difference.
+
+    Rounded to the step's OWN precision: a step of 0.01 gives two
+    decimals, a step of 1 gives none. Decimal(str(step)) rather than
+    arithmetic on the float, because the question being asked is how the
+    step was WRITTEN, and 0.01 written as a float has seventeen digits.
+    """
+    try:
+        exponent = Decimal(str(step)).as_tuple().exponent
+        # A non-finite Decimal reports its exponent as a STRING -- 'F'
+        # for infinity, 'n' for NaN -- so this is not a tidiness guard.
+        # It is the difference between passing a nonsense step through
+        # and raising TypeError out of the sizing path.
+        decimals = max(0, -exponent) if isinstance(exponent, int) else None
+    except (InvalidOperation, ValueError):  # pragma: no cover - a bad step
+        decimals = None
+    if decimals is None:
+        return units * step
+    return round(units * step, decimals)
 
 
 def _within_ceiling(
