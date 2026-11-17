@@ -169,6 +169,7 @@ def record_fill(
     slave_price: Optional[float] = None,
     slave_lots: Optional[float] = None,
     filled_at: Optional[float] = None,
+    entry_slices: Optional[int] = None,
 ) -> None:
     """Write in an execution that arrived after the row was created.
 
@@ -183,12 +184,13 @@ def record_fill(
         cur.execute(
             """
             UPDATE slave_trades SET
-                slave_price = COALESCE(?, slave_price),
-                slave_lots  = COALESCE(?, slave_lots),
-                filled_at   = COALESCE(?, filled_at)
+                slave_price  = COALESCE(?, slave_price),
+                slave_lots   = COALESCE(?, slave_lots),
+                filled_at    = COALESCE(?, filled_at),
+                entry_slices = COALESCE(?, entry_slices)
             WHERE slave_id = ? AND master_account = ? AND master_ticket = ? AND slave_symbol = ?
             """,
-            (slave_price, slave_lots, filled_at,
+            (slave_price, slave_lots, filled_at, entry_slices,
              slave_id, master_account, master_ticket, slave_symbol),
         )
 
@@ -250,7 +252,7 @@ def list_trades_with_copies(limit: int = 200, since: Optional[float] = None) -> 
                 """
                 SELECT slave_id, slave_symbol, slave_ticket, status, opened_at, closed_at,
                        master_price, slave_price, slave_lots, requested_at, filled_at,
-                       master_close_price, slave_close_price
+                       master_close_price, slave_close_price, entry_slices
                 FROM slave_trades WHERE master_account = ? AND master_ticket = ?
                 """,
                 (trade["master_account"], trade["master_ticket"]),

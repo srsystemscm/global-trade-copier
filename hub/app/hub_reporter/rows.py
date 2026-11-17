@@ -160,6 +160,12 @@ def _leg(row: Any, facts: Any) -> Dict[str, Any]:
         "slave_direction": None,
         "size": row["slave_lots"],
         "size_unit": facts.size_unit(slave_id, row["slave_symbol"]),
+        # How many orders this ONE position's entry went out in. 1 or null
+        # for an ordinary entry; 3 for a split one. `size` is the whole
+        # position either way, which is the point -- without this the hub
+        # cannot tell a 33-lot print from 33 lots assembled over a window,
+        # and the slippage it computes means a different thing in each case.
+        "entry_slices": None if row["entry_slices"] is None else int(row["entry_slices"]),
         "master_price": row["master_price"],
         "requested_price": None,
         "fill_price": row["slave_price"],

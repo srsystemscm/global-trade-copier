@@ -207,6 +207,7 @@ def _adapter(**kw):
     a._entry_trades = {}
     a._entry_slices = {}
     a._split_tasks = {}
+    a._slices_placed = {}
     a._split_windows = {}
     a._entry_waits = {}
     a._exit_trades = {}
@@ -664,3 +665,53 @@ def test_abandoning_a_ticket_twice_does_not_warn_the_second_time(caplog):
         "the second abandon reported cancelling an entry and its "
         f"protective legs: {caplog.text}"
     )
+
+
+def test_the_slice_count_survives_the_fill_being_collected():
+    """entry_slices_placed is read by the engine when it records the
+    fill, which is AFTER await_entry_fill has popped _entry_slices. The
+    count has to outlive that, or the row cannot say how the entry
+    arrived -- and it pops on read, so nothing accumulates for the life
+    of the process."""
+    async def go():
+        a = _adapter()
+        result = await a.open(_order(split_slices=3, split_interval=0.01))
+        ticket = result.slave_ticket
+        await _finish_slices(a, ticket)
+        # What await_entry_fill does on success.
+        a._entry_trades.pop(ticket, None)
+        a._entry_slices.pop(ticket, None)
+        return a.entry_slices_placed(ticket), a.entry_slices_placed(ticket)
+
+    first, again = asyncio.run(go())
+    assert first == 3, f"the entry went out in 3 orders, reported {first}"
+    assert again is None, "the count was not dropped once it had been read"
+
+
+def test_the_count_is_what_actually_went_out_not_what_was_asked_for():
+    """A CLOSE arriving mid-window calls off the slices still to come, so
+    a route set to three can produce a position of one. The row has to
+    say what happened, not what was planned -- the planned number is on
+    the slave_open event as `legs`."""
+    async def go():
+        a = _adapter()
+        result = await a.open(_order(split_slices=3, split_interval=30.0))
+        ticket = result.slave_ticket
+        a._stop_splitting(ticket)
+        return result.slices, a.entry_slices_placed(ticket)
+
+    planned, actual = asyncio.run(go())
+    assert planned == 3, "the result does not carry the planned count"
+    assert actual == 1, f"only one slice went out; the row would say {actual}"
+
+
+def test_an_abandoned_entry_leaves_no_count_behind():
+    async def go():
+        a = _adapter()
+        result = await a.open(_order(split_slices=3, split_interval=0.01))
+        ticket = result.slave_ticket
+        await _finish_slices(a, ticket)
+        await a.abandon_unfilled_entry(ticket)
+        return a._slices_placed
+
+    assert asyncio.run(go()) == {}

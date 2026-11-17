@@ -146,6 +146,14 @@ class OrderResult:
     # Echoed back so the caller records exactly what reached the broker,
     # rather than rebuilding the string and hoping the two agree.
     broker_order_ref: Optional[str] = None
+    # How many broker orders this ONE position's entry is going out in:
+    # 1 normally, N when split over a window. None from an adapter that
+    # does not split, which the caller reads as 1.
+    #
+    # Reported rather than recomputed by the caller, because the adapter
+    # is what decided it -- a size too small to go round comes back as
+    # fewer, larger slices than the config asked for.
+    slices: Optional[int] = None
 
 
 @dataclass

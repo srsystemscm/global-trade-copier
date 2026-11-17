@@ -72,6 +72,12 @@ CREATE TABLE IF NOT EXISTS slave_trades (
     filled_at           REAL,   -- adapter came back with a ticket
     master_close_price  REAL,
     slave_close_price   REAL,
+    -- How many orders this ONE position's entry went out in. 1, or NULL on
+    -- a row written before the splitter existed. A split entry is one
+    -- position by design -- one row, one pair of protective legs, one
+    -- thing to roll -- which also made it invisible: nothing on any screen
+    -- said whether 33 MGC arrived in one print or three.
+    entry_slices        INTEGER,
     -- The BROKER's own id for the order, where it has one distinct from
     -- the handle this hub trades by.
     --
@@ -321,6 +327,7 @@ _ADDED_COLUMNS = {
         ("filled_at", "REAL"),
         ("master_close_price", "REAL"),
         ("slave_close_price", "REAL"),
+        ("entry_slices", "INTEGER"),
     ],
     "engine_positions": [
         ("atr_period", "INTEGER"),

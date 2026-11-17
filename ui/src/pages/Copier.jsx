@@ -184,6 +184,21 @@ function OrderRow({ order }) {
                   <span className={c.status === "OPEN" ? "badge badge-ok" : "badge"}>
                     {c.status?.toLowerCase()}
                   </span>
+                  {/* A SPLIT ENTRY. The leg is one position with one size
+                      by design -- one row, one pair of protective legs,
+                      one thing to roll -- which is exactly what made it
+                      invisible: nothing here said whether 33 MGC arrived
+                      in one print or three. The size column is the whole
+                      position either way, so this is the only thing that
+                      distinguishes them. */}
+                  {c.entry_slices > 1 && (
+                    <span
+                      className="copier-leg-slices"
+                      title={`This entry went out as ${c.entry_slices} orders over a window, filling into one position`}
+                    >
+                      {c.entry_slices}&times;
+                    </span>
+                  )}
                   {slip(order, c) !== null && (
                     <span
                       className={slip(order, c) > 0 ? "copier-slip pnl-negative" : "copier-slip pnl-positive"}

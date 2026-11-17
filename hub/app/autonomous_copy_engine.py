@@ -1445,7 +1445,18 @@ class AutonomousCopyEngine(SessionGateMixin):
             slave_symbol=target_symbol,
             slave_ticket=result.slave_ticket,
             # What actually went on, where the broker says so.
-            size=result.lots if result.lots is not None else sizing_result.size,
+            # THE POSITION's size, which `legs` below says how many
+            # broker orders it is being assembled from. Deliberately not
+            # result.lots: that is the FIRST SLICE of a split entry, and
+            # size paired with legs has to describe one thing -- "15
+            # contracts in 3 orders", not "5 contracts in 3 orders".
+            #
+            # What actually ended up on is the leg ROW, which record_fill
+            # corrects to the aggregate across slices and stamps with
+            # entry_slices. Three readers, three questions: the log says
+            # what went out now, this event says what was placed, the row
+            # says how it finished.
+            size=sizing_result.size,
             # The sizing engine's own sentence. It names the mode, the stop
             # distance, the capital it measured and the size that came out,
             # which is the whole of "why is this leg this big".
@@ -1459,9 +1470,16 @@ class AutonomousCopyEngine(SessionGateMixin):
             fill_price=result.price,
             sl=slave_sl,
             tp=slave_tp,
-            # One broker order per leg. A size that had to be split across
-            # several would be reported as the number it became.
-            legs=1,
+            # One broker order per leg -- or N, for an entry the splitter
+            # is spreading over a window. This field was written for that
+            # case before the splitter existed ("a size that had to be
+            # split across several would be reported as the number it
+            # became"), so it is filled in rather than added to.
+            #
+            # The PLANNED count. A CLOSE arriving mid-window calls off the
+            # slices still to come, and what actually went out is on the
+            # leg row as entry_slices.
+            legs=result.slices or 1,
             # The BROKER's own ids, not the client-side handle. IBKR's
             # slave_ticket is TWS's order number and appears in no
             # statement: joining on it matched 0 of 109 rows on
@@ -1778,6 +1796,16 @@ class AutonomousCopyEngine(SessionGateMixin):
                     self.slave_id, which, slave_ticket,
                 )
                 return
+            # HOW the entry arrived, which only the adapter knows and
+            # only this moment can record: one order or several over a
+            # window. A split entry is one position with one size by
+            # design, which is also what made it invisible -- nothing on
+            # any screen said whether 33 MGC came in one print or three.
+            slices = None
+            if which == "entry":
+                counter = getattr(self.adapter, "entry_slices_placed", None)
+                if counter is not None:
+                    slices = counter(slave_ticket)
             if price is None:
                 if which == "entry":
                     # Not just "no price captured": there is no position, and
@@ -1796,6 +1824,7 @@ class AutonomousCopyEngine(SessionGateMixin):
                 trade_registry.record_fill(
                     self.slave_id, account, master_ticket, slave_symbol,
                     slave_price=price, slave_lots=size, filled_at=time.time(),
+                    entry_slices=slices,
                 )
             else:
                 trade_registry.record_close(

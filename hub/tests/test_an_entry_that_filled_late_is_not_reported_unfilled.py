@@ -73,6 +73,7 @@ def _adapter(abandon_result, closed):
     # filled is not read as an entry that never filled.
     a._entry_slices = {1189: [a._entry_trades[1189]]}
     a._split_tasks = {}
+    a._slices_placed = {}
     a._split_windows = {}
     a._entry_waits = {}
     a._exit_trades = {}

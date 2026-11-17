@@ -199,6 +199,7 @@ the same key the copier's own Trade Registry uses.
   "slave_direction": "BUY",            // the TRADED side: an inverse ETF flips it
   "size": 4.0,
   "size_unit": "contracts",            // never converted; see Units and times
+  "entry_slices": 3,                   // orders this ONE entry went out in; 1 or null normally
   "master_price": 27852.3,
   "requested_price": 27831.125,
   "fill_price": 27831.125,
@@ -213,6 +214,20 @@ the same key the copier's own Trade Registry uses.
 
 `slave_account` is here as well as in `status.slaves[]` so a row can be
 joined to the hub's ledger without a second lookup.
+
+**`entry_slices`** is how many broker orders this one position's entry
+went out in. The order splitter places N orders for one instrument over a
+window and they fill into a single position: one leg row, one size, one
+pair of protective legs, one thing to roll. That is the point of it, and
+it is also what made it invisible -- `size` is the whole position whether
+it arrived in one print or three, so without this field the hub cannot
+tell them apart, and the slippage it computes means a different thing in
+each case.
+
+It is what ACTUALLY happened. A master CLOSE arriving mid-window calls
+off the slices still to come, so a route configured for three can produce
+a position of one. The number that was PLANNED is on the `slave_open`
+event as `legs`. `null` on a row written before the splitter existed.
 
 **Do not compute slippage for an autonomous leg.** `master_price` and
 `fill_price` are different instruments on different price scales — a gold CFD
@@ -309,6 +324,10 @@ and the next cycle tries again with back-off.
       "session_state": "connected",
       "blocked_targets": {},
       "preflight": {"targets": 12, "resolved": 12, "at": "2026-11-12T20:29:22Z"},
+      "consume": {"queue_depth": 0, "last_consumed_at": "2026-11-16T19:26:43Z",
+                  "seconds_since_consumed": 12.4, "alive": true, "stalled": false},
+      "order_split": {"slices": null, "interval_s": null,
+                      "by_target": {"GC": {"slices": 3, "interval_s": 5.0}}},
       "last_error": null,
       "last_error_at": null
     }
@@ -376,7 +395,7 @@ intended. `info` is for the stream and the counters.
 | type | class | `detail` |
 |---|---|---|
 | `signal_received` | info | `action`, `direction`, `lots`, `price`, `sl`, `tp`, `atr`, `targets` (how many slaves it fanned to) |
-| `slave_open` | info | `slave_symbol`, `slave_ticket`, `size`, `size_unit`, `sizing` (the human-readable explanation), `requested_price`, `fill_price`, `sl`, `tp`, `legs` (how many broker orders the size became), `latency_ms`, `signal_to_fill_ms` |
+| `slave_open` | info | `slave_symbol`, `slave_ticket`, `size`, `size_unit`, `sizing` (the human-readable explanation), `requested_price`, `fill_price`, `sl`, `tp`, `legs` (how many broker orders the size is being assembled from -- 1, or N for a split entry), `latency_ms`, `signal_to_fill_ms` |
 | `slave_modify` | info | `slave_ticket`, `sl`, `tp`, `legs_moved` |
 | `slave_close` | info | `slave_ticket`, `fill_price`, `size`, `latency_ms` |
 | `margin_reduced` | notice | `slave_symbol`, `asked`, `sent`, `margin_required`, `margin_free`, `ceiling_pct`, `risk_fraction_carried` |
@@ -612,6 +631,53 @@ and a dictionary of zeros reads as though something were configured.
 **`copier.version`** is `"5.1.0"`. The copier had no version string at all --
 this introduced one, numbered from the README's "Phase 5 hardening" as the
 state the reporter was added to.
+
+## `slaves[].consume` — whether the loop is still taking signals
+
+```jsonc
+"consume": {
+  "queue_depth": 0,
+  "last_consumed_at": "2026-11-16T19:26:43Z",
+  "seconds_since_consumed": 12.4,
+  "alive": true,                       // false = the loop has ENDED
+  "stalled": false
+}
+```
+
+`running` describes the engine object and `connected` describes the
+adapter. Neither says the engine is doing anything. On 2026-11-16 four
+`AutonomousCopyEngine`s stopped draining their queues — an exception that
+was not an `AdapterError` escaped the consume loop and ended the task —
+and every field above them stayed green for 37 minutes while eight
+signals reached one slave and never reached another. The only symptom was
+an absence, and an absence looks exactly like a quiet master.
+
+`alive: false` is terminal: the loop does not come back and the hub
+should treat the slave as not trading, whatever `running` and `connected`
+say. `stalled` is also true for a loop that is alive but has a queue it
+has not touched for a minute — a handler wedged on a broker call, where
+the task is fine and nothing is being consumed.
+
+`null` for a slave with no engine running.
+
+## `slaves[].order_split` — whether entries arrive in one print
+
+```jsonc
+"order_split": {
+  "slices": null,                      // the slave-wide default
+  "interval_s": null,
+  "by_target": {"GC": {"slices": 3, "interval_s": 5.0}}
+}
+```
+
+`null` when nothing is configured, which is most slaves. A route's own
+setting wins over the slave's, and `by_target` lists only the routes that
+differ from it — saying it twice makes a reader look for a difference
+that is not there. A target named by a preference list (`["GC", "MGC"]`
+is one position, first tradeable wins) appears under its first candidate.
+
+This is what was ASKED FOR. What any single entry actually did is
+`legs` on its `slave_open` event and `entry_slices` on its leg row.
 
 ## One snapshot field beyond the spec: `slaves[].magic_filter`
 
