@@ -712,3 +712,57 @@ def test_an_abandoned_entry_leaves_no_count_behind():
         return a._slices_placed
 
     assert asyncio.run(go()) == {}
+
+
+def test_the_last_slice_gets_a_full_fill_clock():
+    """The fill clock starts when the SCHEDULE ends, not when the wait
+    begins.
+
+    Live on GC 2474, 2026-11-17: a 3x5s split placed its last slice at
+    00:13:36 against a deadline of 00:13:45 -- nine seconds of ten,
+    because the window is the PLANNED spacing and every placement's
+    latency comes out of what is left. Only 1 of that slice's 4 had
+    filled, so the entry was recorded as 10 of 13 and the exit then
+    closed 13: the row disagreeing with itself about how big the
+    position had been.
+
+    Reproduced by making each placement SLOW, which is what the broker
+    does. The schedule then finishes well after `window` says it should,
+    and a clock measured from the start has already run out.
+    """
+    async def go():
+        a = _adapter()
+        a.fill_timeout = 0.4
+        a.entry_timeout = 0.4
+
+        # Each slice takes longer to place than the interval allows for,
+        # so the schedule overruns its own window -- exactly the latency
+        # that ate nine seconds of ten on 2474.
+        original = a._place_slice
+
+        async def slow(*args, **kw):
+            await asyncio.sleep(0.3)
+            await original(*args, **kw)
+
+        a._place_slice = slow
+
+        result = await a.open(_order(split_slices=3, split_interval=0.1))
+        ticket = result.slave_ticket
+
+        async def fill_once_placed():
+            await _finish_slices(a, ticket)
+            for t in a._entry_slices[ticket]:
+                t.orderStatus.filled = t.order.totalQuantity
+                t.orderStatus.avgFillPrice = 3877.0
+                t.orderStatus.remaining = 0.0
+                t.fills = [object()]
+
+        asyncio.create_task(fill_once_placed())
+        return await a.await_entry_fill(ticket)
+
+    price, size = asyncio.run(go())
+    assert size == 35.0, (
+        f"recorded {size} of 35.0 -- the last slice's fill clock had run "
+        "out before the slice was even placed"
+    )
+    assert price == 3877.0

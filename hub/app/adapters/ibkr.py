@@ -1463,10 +1463,26 @@ class IBKRAdapter(BrokerAdapter):
         four slices filled is a real position of three slices, and saying
         so beats saying nothing.
         """
-        # The window plus one fill clock: the last slice is placed at the
-        # end of the window and deserves the same wait as the first.
+        # THE FILL CLOCK STARTS WHEN THE SCHEDULE ENDS, not when this
+        # wait begins. Measured from here it was `window +
+        # per_slice_timeout`, which sounds like the last slice gets a
+        # full clock and does not: the window is the PLANNED spacing, and
+        # every placement's latency comes out of what is left.
+        #
+        # Live on GC 2474, 2026-11-17: slice 3 was placed at 00:13:36
+        # against a deadline of 00:13:45, so it had nine seconds of ten
+        # and only 1 of its 4 had filled. The entry was recorded as 10 of
+        # 13 -- and the exit then closed 13, so the row disagreed with
+        # itself about how big the position had been.
+        #
+        # Waiting longer is free here: entries are collected on a
+        # background task, never on the consume loop.
         window = float(self._split_windows.get(slave_ticket, 0.0) or 0.0)
-        deadline = time.monotonic() + window + per_slice_timeout
+        schedule_ends = time.monotonic() + window + per_slice_timeout
+        while self._split_pending(slave_ticket) and time.monotonic() < schedule_ends:
+            await asyncio.sleep(0.1)
+
+        deadline = time.monotonic() + per_slice_timeout
         while time.monotonic() < deadline:
             if not self._split_pending(slave_ticket):
                 slices = self._entry_slices.get(slave_ticket) or []
@@ -1488,12 +1504,20 @@ class IBKRAdapter(BrokerAdapter):
         slices = self._entry_slices.get(slave_ticket) or []
         price, size = self._filled_across(slices)
         if price is not None:
-            logger.warning(
-                "IBKRAdapter[%s] split entry %s filled %s across %d slice(s) "
-                "within %.1fs, with some of it still working -- recording the "
-                "part that filled",
-                self.slave_id, slave_ticket, size, len(slices),
-                window + per_slice_timeout,
+            working = sum(
+                float(t.orderStatus.remaining or 0.0)
+                for t in slices if t is not None)
+            # ERROR, not a warning, and it says the consequence. This is
+            # the row disagreeing with itself: the position is recorded
+            # at `size`, the rest fills moments later, and the exit then
+            # closes more than the entry ever admitted to. Live on GC
+            # 2474 -- entry recorded 10, exit closed 13.
+            logger.error(
+                "IBKRAdapter[%s] split entry %s recorded %s across %d slice(s) "
+                "with %s STILL WORKING -- if that fills, the position will be "
+                "larger than the row says it opened at, and its exit will "
+                "close more than its entry",
+                self.slave_id, slave_ticket, size, len(slices), working,
             )
             return price, size
         logger.warning(
