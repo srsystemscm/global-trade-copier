@@ -187,30 +187,27 @@ class _IbMod:
 
 
 def _adapter(**kw):
-    a = object.__new__(IBKRAdapter)
-    a.ib = object()
-    a.slave_id = "ibkr-paper-1"
-    a.account = "DUR314653"
-    a.entry_tif = "DAY"
-    a.bracket_tif = "GTC"
-    a.bracket_check_delay = 0.0
+    """A real IBKRAdapter with the broker replaced, not a hand-built one.
+
+    THROUGH THE REAL CONSTRUCTOR on purpose. __init__ only sets fields --
+    it opens nothing -- and building the object by hand meant that three
+    separate times a new piece of adapter state failed every test in this
+    file with an AttributeError that said nothing about the behaviour
+    under test. A harness that has to be updated whenever the thing it
+    tests grows a field is a harness that will be wrong at the worst
+    moment.
+    """
+    a = IBKRAdapter(
+        "ibkr-paper-1", "127.0.0.1", 7497, 1, account="DUR314653",
+        entry_chase_steps=kw.pop("entry_chase_steps", 0),
+        entry_split_slices=kw.pop("entry_split_slices", 0),
+        entry_split_interval=kw.pop("entry_split_interval", 0.0),
+    )
+    # Short clocks, so a test that waits for one finishes in a test run
+    # rather than in a trading session.
     a.fill_timeout = 0.2
     a.entry_timeout = 0.2
-    a.entry_chase_steps = kw.pop("entry_chase_steps", 0)
-    a.entry_chase_interval = 300.0
-    a.entry_chase_max_pct = 0.01
-    a.entry_split_slices = kw.pop("entry_split_slices", 0)
-    a.entry_split_interval = kw.pop("entry_split_interval", 0.0)
-    a.entry_good_till = None
-    a._contracts = {}
-    a._positions = {}
-    a._entry_trades = {}
-    a._entry_slices = {}
-    a._split_tasks = {}
-    a._slices_placed = {}
-    a._split_windows = {}
-    a._entry_waits = {}
-    a._exit_trades = {}
+    a.bracket_check_delay = 0.0
 
     a.placed = []
     a._next_id = [7000]

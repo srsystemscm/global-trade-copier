@@ -1818,10 +1818,14 @@ class AutonomousCopyEngine(SessionGateMixin):
             # design, which is also what made it invisible -- nothing on
             # any screen said whether 33 MGC came in one print or three.
             slices = None
+            slice_detail = None
             if which == "entry":
                 counter = getattr(self.adapter, "entry_slices_placed", None)
                 if counter is not None:
                     slices = counter(slave_ticket)
+                detail = getattr(self.adapter, "entry_slice_detail", None)
+                if detail is not None:
+                    slice_detail = detail(slave_ticket)
             if price is None:
                 if which == "entry":
                     # Not just "no price captured": there is no position, and
@@ -1842,6 +1846,13 @@ class AutonomousCopyEngine(SessionGateMixin):
                     slave_price=price, slave_lots=size, filled_at=time.time(),
                     entry_slices=slices,
                 )
+                # Only when there was more than one. A single slice is an
+                # ordinary entry and its "slice" is the position itself,
+                # already recorded above.
+                if slices and slices > 1:
+                    trade_registry.record_entry_slices(
+                        self.slave_id, account, master_ticket, slave_symbol,
+                        slave_ticket, slice_detail)
             else:
                 trade_registry.record_close(
                     self.slave_id, account, master_ticket, slave_symbol,

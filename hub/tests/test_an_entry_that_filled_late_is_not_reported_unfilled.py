@@ -57,11 +57,10 @@ class _Trade:
 
 
 def _adapter(abandon_result, closed):
-    a = object.__new__(IBKRAdapter)
+    # Through the real constructor, so new adapter state cannot break
+    # this by its absence -- see test_the_order_splitter._adapter.
+    a = IBKRAdapter("ibkr-paper-1", "127.0.0.1", 7497, 1, account="DUR314653")
     a.ib = object()  # past the connection guard; nothing here touches it
-    a.slave_id = "ibkr-paper-1"
-    a.account = "DUR314653"
-    a.entry_tif = "DAY"
     a._positions = {
         1189: {"symbol": "MGC", "direction": "BUY", "size": 35.0,
                "sl_order_id": 7002, "tp_order_id": 7003,

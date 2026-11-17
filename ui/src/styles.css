@@ -547,6 +547,29 @@ code {
   line-height: 1.4;
 }
 
+/* The individual fills behind a split entry. Set apart from the leg's
+   own figures, because the leg's price is the position's average and
+   these are the prices that average is made of. */
+.copier-leg-slicefills {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  font-size: 11px;
+  color: var(--muted, #8b93a7);
+  font-variant-numeric: tabular-nums;
+}
+
+.copier-leg-slicefills > span::before {
+  content: "";
+  display: inline-block;
+  width: 3px;
+  height: 3px;
+  margin-right: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  vertical-align: middle;
+}
+
 /* A split entry, on a copier leg. Quiet on purpose: it says how the
    position was assembled, which is information rather than a problem. */
 .copier-leg-slices {

@@ -282,6 +282,16 @@ class IBKRAdapter(BrokerAdapter):
         # records the fill is also the thing that wants to say how it
         # arrived.
         self._slices_placed: Dict[int, int] = {}
+        # slave_ticket -> what each slice was, one dict per order. The
+        # static facts (which slice, which order, how big, when) are
+        # written as the slices go out; what each one FILLED is read off
+        # its Trade when the entry's fill is collected, because that is
+        # the last moment the Trades are still in hand.
+        #
+        # Kept because the position's single average price cannot answer
+        # the question splitting exists to settle: did slice 3 fill worse
+        # than slice 1?
+        self._slice_detail: Dict[int, List[dict]] = {}
         # slave_ticket -> how long the schedule runs for, so await_entry_fill
         # waits out the window instead of abandoning the entry halfway
         # through placing it.
@@ -729,6 +739,12 @@ class IBKRAdapter(BrokerAdapter):
         # the fill, the cancel, the close -- all read this.
         self._entry_slices[slave_ticket] = [trade]
         self._slices_placed[slave_ticket] = 1
+        self._slice_detail[slave_ticket] = [{
+            "n": 1,
+            "broker_order_id": str(getattr(trade.order, "permId", "") or "") or None,
+            "size": float(first),
+            "placed_at": time.time(),
+        }]
         # How long THIS entry may rest, remembered beside the trade because
         # _collect_fill is handed a ticket and no longer has the order. A
         # GTC entry with the adapter's 900s clock is cancelled by us a
@@ -942,6 +958,41 @@ class IBKRAdapter(BrokerAdapter):
         task.cancel()
         return 1
 
+    def _stamp_slice_fills(self, slave_ticket: int) -> None:
+        """Read what each slice filled, while its Trade is still in hand.
+
+        Called from await_entry_fill just before the Trades are dropped.
+        After that the only record of a slice is this, so a slice that is
+        not stamped here is one nothing can ever report on.
+        """
+        detail = self._slice_detail.get(slave_ticket)
+        slices = self._entry_slices.get(slave_ticket)
+        if not detail or not slices:
+            return
+        for row, trade in zip(detail, slices):
+            if trade is None:
+                continue
+            status = trade.orderStatus
+            filled = float(status.filled or 0.0)
+            price = float(status.avgFillPrice or 0.0)
+            row["filled"] = filled
+            # A price with no fill is not a price. Left null so "placed 11
+            # and filled nothing" reads as that rather than as a fill at 0.
+            row["fill_price"] = price if (filled > 0 and price) else None
+            # The broker's own id is assigned a moment after placing, so
+            # it is often still unknown when the slice went out.
+            if not row.get("broker_order_id"):
+                row["broker_order_id"] = str(
+                    getattr(trade.order, "permId", "") or "") or None
+
+    def entry_slice_detail(self, slave_ticket: int):
+        """What each slice of this entry was and what it filled.
+
+        Popped, like the count beside it: the engine reads it once, when
+        it records the fill.
+        """
+        return self._slice_detail.pop(slave_ticket, None)
+
     def entry_slices_placed(self, slave_ticket: int):
         """How many orders this position's entry actually went out in.
 
@@ -1046,6 +1097,12 @@ class IBKRAdapter(BrokerAdapter):
         self._entry_slices.setdefault(slave_ticket, []).append(trade)
         self._slices_placed[slave_ticket] = self._slices_placed.get(
             slave_ticket, 1) + 1
+        self._slice_detail.setdefault(slave_ticket, []).append({
+            "n": n,
+            "broker_order_id": str(getattr(trade.order, "permId", "") or "") or None,
+            "size": float(size),
+            "placed_at": time.time(),
+        })
         placed.append(size)
 
         pos = self._positions.get(slave_ticket)
@@ -1378,6 +1435,9 @@ class IBKRAdapter(BrokerAdapter):
         else:
             price, size = await self._await_fill(trade, "entry", timeout)
         if price is not None:
+            # LAST LOOK, before the Trades are dropped: what each slice
+            # filled lives nowhere else once they are gone.
+            self._stamp_slice_fills(slave_ticket)
             self._entry_trades.pop(slave_ticket, None)
             self._entry_slices.pop(slave_ticket, None)
             self._entry_waits.pop(slave_ticket, None)
@@ -1701,8 +1761,10 @@ class IBKRAdapter(BrokerAdapter):
             del self._positions[slave_ticket]
 
         # Nothing will record a fill for this entry, so nothing will
-        # read the slice count. Dropped here rather than left behind.
+        # read the slice count or its detail. Dropped here rather than
+        # left behind.
         self._slices_placed.pop(slave_ticket, None)
+        self._slice_detail.pop(slave_ticket, None)
         logger.warning(
             "IBKRAdapter[%s] cancelled unfilled entry %s (%d slice(s)) and its "
             "protective legs", self.slave_id, slave_ticket, len(slices),

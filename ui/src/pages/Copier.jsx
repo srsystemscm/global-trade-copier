@@ -199,6 +199,22 @@ function OrderRow({ order }) {
                       {c.entry_slices}&times;
                     </span>
                   )}
+                  {/* What each order filled. The leg's own price is the
+                      position's average, which is the number splitting
+                      was meant to improve -- so it cannot be the number
+                      that says whether it worked. These can: a later
+                      slice filling worse is impact the split did not
+                      avoid. */}
+                  {c.slices?.length > 1 && (
+                    <span className="copier-leg-slicefills">
+                      {c.slices.map((s) => (
+                        <span key={s.n} title={`Slice ${s.n} of ${c.slices.length}`}>
+                          {qty(s.filled ?? s.size)}
+                          {s.fill_price ? ` @ ${px(s.fill_price)}` : " unfilled"}
+                        </span>
+                      ))}
+                    </span>
+                  )}
                   {slip(order, c) !== null && (
                     <span
                       className={slip(order, c) > 0 ? "copier-slip pnl-negative" : "copier-slip pnl-positive"}

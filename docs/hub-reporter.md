@@ -229,6 +229,30 @@ off the slices still to come, so a route configured for three can produce
 a position of one. The number that was PLANNED is on the `slave_open`
 event as `legs`. `null` on a row written before the splitter existed.
 
+**`slices`** is what each of those orders was and what it filled, in the
+order they went out, and is present only where there was more than one:
+
+```jsonc
+"slices": [
+  {"n": 1, "size": 11.0, "filled": 11.0, "fill_price": 3876.5, "placed_at": 1794880000.0},
+  {"n": 2, "size": 11.0, "filled": 11.0, "fill_price": 3876.5, "placed_at": 1794880005.0},
+  {"n": 3, "size": 11.0, "filled": 11.0, "fill_price": 3876.6, "placed_at": 1794880010.0}
+]
+```
+
+`size` and `fill_price` on the leg itself are the POSITION's -- one
+number, which is what the splitter exists to produce. These are the only
+thing that can say whether splitting did its job: the reason to spread a
+33-lot entry is impact, and the position's single average is the figure
+the spreading was meant to improve, so it cannot be the figure that
+judges it. Slice 1 against slice 3 can. A slice that filled nothing keeps
+its row with `fill_price: null` -- "placed 11, filled none" is a
+measurement too, and it is how a window cut short reads afterwards.
+
+These rows are a measurement and nothing else. The position, its size,
+its protective legs and its exit all come off the leg; nothing should
+ever assemble a position out of `slices`.
+
 **Do not compute slippage for an autonomous leg.** `master_price` and
 `fill_price` are different instruments on different price scales — a gold CFD
 against a GC future — so their difference is a contract basis, not slippage.

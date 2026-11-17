@@ -172,6 +172,74 @@ def record_entry_cancelled(
         return cur.rowcount > 0
 
 
+def record_entry_slices(
+    slave_id: str,
+    master_account: str,
+    master_ticket: int,
+    slave_symbol: str,
+    slave_ticket: Optional[int],
+    slices: Optional[List[Dict[str, Any]]],
+) -> None:
+    """What each order of a split entry was, and what it filled.
+
+    The position is one row in slave_trades and that is what everything
+    trades from. These rows are a MEASUREMENT and nothing else: the
+    reason to split a 33-lot entry is market impact, and the position's
+    single average price is the number the splitting was meant to
+    improve, so it cannot be the thing that judges it. Comparing slice 1
+    against slice 3 can.
+
+    Upserted on the slice number, so a re-report corrects rather than
+    duplicates. A slice that filled nothing still gets a row -- "placed
+    11, filled none" is a measurement too, and it is how a window that
+    was cut short reads afterwards.
+    """
+    if not slices:
+        return
+    with db_cursor() as cur:
+        for row in slices:
+            cur.execute(
+                """
+                INSERT INTO slave_trade_slices (
+                    slave_id, master_account, master_ticket, slave_symbol,
+                    slave_ticket, n, broker_order_id, size, filled,
+                    fill_price, placed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (slave_id, master_account, master_ticket,
+                             slave_symbol, n)
+                DO UPDATE SET
+                    slave_ticket    = excluded.slave_ticket,
+                    broker_order_id = COALESCE(excluded.broker_order_id,
+                                               broker_order_id),
+                    size            = excluded.size,
+                    filled          = excluded.filled,
+                    fill_price      = excluded.fill_price,
+                    placed_at       = COALESCE(excluded.placed_at, placed_at)
+                """,
+                (slave_id, master_account, master_ticket, slave_symbol,
+                 slave_ticket, int(row.get("n") or 0),
+                 row.get("broker_order_id"), row.get("size"),
+                 row.get("filled"), row.get("fill_price"),
+                 row.get("placed_at")),
+            )
+
+
+def entry_slices_for(slave_id: str, master_account: str, master_ticket: int,
+                     slave_symbol: str) -> List[Dict[str, Any]]:
+    """One entry's slices, in the order they went out."""
+    with db_cursor() as cur:
+        return [dict(r) for r in cur.execute(
+            """
+            SELECT n, broker_order_id, size, filled, fill_price, placed_at
+            FROM slave_trade_slices
+            WHERE slave_id = ? AND master_account = ? AND master_ticket = ?
+              AND slave_symbol = ?
+            ORDER BY n
+            """,
+            (slave_id, master_account, master_ticket, slave_symbol),
+        ).fetchall()]
+
+
 def record_fill(
     slave_id: str,
     master_account: str,
@@ -269,5 +337,24 @@ def list_trades_with_copies(limit: int = 200, since: Optional[float] = None) -> 
                 """,
                 (trade["master_account"], trade["master_ticket"]),
             ).fetchall()
-            results.append({**dict(trade), "slave_copies": [dict(c) for c in copies]})
+            copied = []
+            for c in copies:
+                leg = dict(c)
+                # Only for an entry that was actually split. One slice is
+                # an ordinary entry, and a one-element list under every
+                # leg on the page reads as though something were going on.
+                if (leg.get("entry_slices") or 0) > 1:
+                    leg["slices"] = [dict(r) for r in cur.execute(
+                        """
+                        SELECT n, size, filled, fill_price, placed_at
+                        FROM slave_trade_slices
+                        WHERE slave_id = ? AND master_account = ?
+                          AND master_ticket = ? AND slave_symbol = ?
+                        ORDER BY n
+                        """,
+                        (leg["slave_id"], trade["master_account"],
+                         trade["master_ticket"], leg["slave_symbol"]),
+                    ).fetchall()]
+                copied.append(leg)
+            results.append({**dict(trade), "slave_copies": copied})
         return results
