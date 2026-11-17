@@ -50,6 +50,11 @@
 //|                                                                    |
 //| Versions:                                                          |
 //|   1.00 2026-11-11 initial build                                    |
+//|   1.04 2026-11-17 a size over the broker's per-order maximum is     |
+//|                   sent as SEVERAL orders instead of clamped down    |
+//|                   to it. ETHUSD caps at 10.00 lots and 2% wanted    |
+//|                   more, so every H1 and H4 run was testing          |
+//|                   "whatever 10 lots is" rather than 2%.             |
 //|   1.03 2026-11-16 RISK_A 1.0 -> 2.0, because 2% of balance is what  |
 //|                   the strategies actually send: "most EA are going  |
 //|                   to send a 2% risk of balance on signal". A test   |
@@ -74,7 +79,7 @@
 #property script_show_inputs
 #property version "1.02"
 
-#define MAE_SCRIPT_VERSION "1.03"
+#define MAE_SCRIPT_VERSION "1.04"
 #define MAE_BASE_TF        PERIOD_D1
 #define MAE_MAGIC_START    1001
 

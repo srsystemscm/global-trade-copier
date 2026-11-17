@@ -149,12 +149,14 @@ void OnStart()
    lots = AlignLots(symbol, lots);
 
    //--- market order, stops derived from the fill price --------------------
-   int    type  = GoLong ? OP_BUY : OP_SELL;
-   double price = GoLong ? MarketInfo(symbol, MODE_ASK) : MarketInfo(symbol, MODE_BID);
-   price = NormalizeDouble(price, digits);
+   int type = GoLong ? OP_BUY : OP_SELL;
 
-   double sl = AlignStopLoss(symbol, type, price, 0.0, slPips);
-   double tp = (tpPips > 0.0) ? AlignTakeProfit(symbol, type, price, tpPips) : 0.0;
+   //--- NOT the levels anything is sent with. Each order below prices its
+   //--- own stop from its own quote, because each is a separate trade at
+   //--- a separate price. This is here only so the line further down can
+   //--- say whether there will be a take-profit at all -- a pre-trade
+   //--- `sl` and `tp` sitting here would read as the levels in force.
+   bool hasTp = (tpPips > 0.0);
 
    int magic = MagicStart + (int)StringToInteger(Group);
 
@@ -169,42 +171,101 @@ void OnStart()
    //--- a stop got widened to the broker minimum underneath it.
    Print("  risk mode ", ACCT_RISK_MODE, " (", RiskDescription(), ") -> ",
          DoubleToStr(lots, 2), " lots");
-   if(tp <= 0.0)
+   if(!hasTp)
       Print("  take-profit: none (TP_ADJUST = ", DoubleToStr(TP_ADJUST, 2), ")");
 
-   int ticket = OrderSend(symbol, type, lots, price,
-                          (int)(SPREAD_SLIPPAGE * PipValue(symbol)),
-                          sl, tp, MyComment, magic, 0, GoLong ? clrBlue : clrRed);
-   if(ticket < 0)
+   //--- ONE ORDER, OR SEVERAL. A size over the broker's per-order
+   //--- maximum used to be clamped down to it, which quietly staked less
+   //--- than ACCT_RISK_MODE asked for. Sent as separate orders instead,
+   //--- which is the default route in the template this imitates.
+   double chunks[];
+   int pieces = SplitLots(symbol, lots, chunks);
+   if(pieces <= 0)
      {
-      Print("ERROR: OrderSend failed: ", GetLastError());
+      Print("ERROR: ", DoubleToStr(lots, 2), " lots could not be split into orders.");
       return;
      }
+   if(pieces > 1)
+      Print("  ", DoubleToStr(lots, 2), " lots is over this broker's per-order maximum of ",
+            DoubleToStr(MarketInfo(symbol, MODE_MAXLOT), 2),
+            " -- sending it as ", pieces, " orders");
 
-   if(!OrderSelect(ticket, SELECT_BY_TICKET))
+   int    tickets[];
+   double ops[];
+   double oldSls[];
+   ArrayResize(tickets, pieces);
+   ArrayResize(ops, pieces);
+   ArrayResize(oldSls, pieces);
+   int placed = 0;
+
+   for(int pi = 0; pi < pieces; pi++)
      {
-      Print("ERROR: opened ticket ", ticket, " but could not select it.");
-      return;
+      //--- Re-read per order. Each piece is its own trade at its own
+      //--- price, and deriving all of them from one pre-trade quote
+      //--- would put stops where no fill happened.
+      double pxI = GoLong ? MarketInfo(symbol, MODE_ASK) : MarketInfo(symbol, MODE_BID);
+      pxI = NormalizeDouble(pxI, digits);
+      double slI = AlignStopLoss(symbol, type, pxI, 0.0, slPips);
+      double tpI = (tpPips > 0.0) ? AlignTakeProfit(symbol, type, pxI, tpPips) : 0.0;
+
+      int t = OrderSend(symbol, type, chunks[pi], pxI,
+                        (int)(SPREAD_SLIPPAGE * PipValue(symbol)),
+                        slI, tpI, MyComment, magic, 0, GoLong ? clrBlue : clrRed);
+      if(t < 0)
+        {
+         //--- Not a return. Whatever opened still has to be modified and
+         //--- closed, and bailing out here is how a piece gets left live
+         //--- with nothing watching it.
+         Print("ERROR: OrderSend ", pi + 1, " of ", pieces, " for ",
+               DoubleToStr(chunks[pi], 2), " lots failed: ", GetLastError());
+         continue;
+        }
+      if(!OrderSelect(t, SELECT_BY_TICKET))
+        {
+         Print("ERROR: opened ticket ", t, " but could not select it.");
+         continue;
+        }
+
+      tickets[placed] = t;
+      ops[placed]     = OrderOpenPrice();
+      oldSls[placed]  = OrderStopLoss();
+      Print("OPEN  ", (pieces > 1 ? "(" + IntegerToString(placed + 1) + " of " +
+            IntegerToString(pieces) + ") " : ""),
+            "ticket=", t, " ", DoubleToStr(OrderLots(), 2), " lots @ ",
+            DoubleToStr(ops[placed], digits), "  sl=", DoubleToStr(oldSls[placed], digits),
+            "  tp=", DoubleToStr(OrderTakeProfit(), digits), "  magic=", magic);
+      placed++;
      }
 
-   double op    = OrderOpenPrice();
-   double oldSl = OrderStopLoss();
-   Print("OPEN  ticket=", ticket, " ", DoubleToStr(OrderLots(), 2), " lots @ ",
-         DoubleToStr(op, digits), "  sl=", DoubleToStr(oldSl, digits),
-         "  tp=", DoubleToStr(OrderTakeProfit(), digits), "  magic=", magic);
+   if(placed <= 0)
+     {
+      Print("ERROR: nothing opened.");
+      return;
+     }
+   if(placed < pieces)
+      Print("  NOTE: only ", placed, " of ", pieces, " orders opened -- the test is ",
+            "running on less than the size it sized for.");
 
    //--- Deliberately no early returns from here on: whatever happens to the
    //--- MAE step, the position still has to be closed, or a skipped modify
    //--- would silently leave a live trade behind.
    if(!DoMaeModify)
       Print("MAE modify skipped (DoMaeModify = false)");
-   else if(oldSl <= 0.0)
-      Print("MAE modify skipped: the order has no stop to widen.");
    else
      {
-      //--- Let the master bridge EA observe the original stop first.
+      //--- Let the master bridge EA observe the original stop first. Once,
+      //--- not once per order: the delay is for the bridge to see the
+      //--- opening stop, and it has seen all of them by now.
       Sleep(MAE_DELAY_MS);
-      DoMaeStep(ticket, op, oldSl, type, symbol, digits);
+      for(int mi = 0; mi < placed; mi++)
+        {
+         if(oldSls[mi] <= 0.0)
+           {
+            Print("MAE modify skipped for ticket ", tickets[mi], ": no stop to widen.");
+            continue;
+           }
+         DoMaeStep(tickets[mi], ops[mi], oldSls[mi], type, symbol, digits);
+        }
      }
 
    if(CloseAfterMs > 0)
@@ -234,14 +295,18 @@ void OnStart()
         }
       if(stopped)
          Print("Script stopped after ", waited, "ms of ", CloseAfterMs,
-               " -- closing ticket ", ticket, " anyway rather than leaving it open");
+               " -- closing ", placed, " ticket(s) anyway rather than leaving them open");
       else
-         Print("Held ticket ", ticket, " for ", waited, "ms; closing now");
-      CloseTicket(ticket, symbol, digits);
+         Print("Held ", placed, " ticket(s) for ", waited, "ms; closing now");
+      //--- EVERY piece, and no early exit. One close failing must not
+      //--- leave the others open: that is the state this whole branch
+      //--- exists to prevent.
+      for(int ci = 0; ci < placed; ci++)
+         CloseTicket(tickets[ci], symbol, digits);
      }
    else
-      Print("Leaving ticket ", ticket, " open (CloseAfterMs = 0) -- ",
-            "this trade and every slave leg it opened are yours to close");
+      Print("Leaving ", placed, " ticket(s) open (CloseAfterMs = 0) -- ",
+            "these trades and every slave leg they opened are yours to close");
   }
 
 //+------------------------------------------------------------------+
@@ -395,12 +460,60 @@ double AlignLots(string symbol, double lots)
             "MORE risk than ACCT_RISK_MODE asked for.");
       aligned = minL;
      }
-   if(aligned > maxL)
-     {
-      Print("  NOTE: lot size capped at the broker maximum of ", DoubleToStr(maxL, 2));
-      aligned = maxL;
-     }
+   //--- NO LONGER CAPPED HERE. A size over the broker's per-order
+   //--- maximum is sent as SEVERAL ORDERS instead -- see SplitLots() --
+   //--- because that is what the EA this mirrors does, and a clamp
+   //--- silently stakes less than the risk asked for. On ETHUSD the
+   //--- maximum is 10.00 lots and 2% of balance wanted more, so every H1
+   //--- and H4 run was testing "whatever 10 lots is" rather than 2%.
    return aligned;
+  }
+
+//+------------------------------------------------------------------+
+//| One size, as the orders it has to be sent in.                     |
+//|                                                                   |
+//| Returns how many, with each chunk in `chunks`. One entry for any   |
+//| size the broker will take in a single order, which is the ordinary |
+//| case and the one that must stay unchanged.                         |
+//|                                                                    |
+//| THE PIECES ARE SEPARATE POSITIONS, each with its own ticket, and   |
+//| the bridge publishes one signal per ticket. That is deliberate:    |
+//| additional lots via separate orders is the default route in the    |
+//| template this imitates. It is NOT the copier's order splitter,     |
+//| which is the opposite idea -- N orders collapsing into ONE         |
+//| position on the slave.                                             |
+//+------------------------------------------------------------------+
+int SplitLots(string symbol, double lots, double &chunks[])
+  {
+   double step = MarketInfo(symbol, MODE_LOTSTEP);
+   double minL = MarketInfo(symbol, MODE_MINLOT);
+   double maxL = MarketInfo(symbol, MODE_MAXLOT);
+   if(step <= 0.0)
+      step = 0.01;
+   //--- A broker that does not report a maximum is not a broker with no
+   //--- maximum, but guessing one would be worse than sending what was
+   //--- asked for and letting the server refuse it.
+   if(maxL <= 0.0)
+      maxL = lots;
+
+   ArrayResize(chunks, 0);
+   double left = NormalizeDouble(lots, 2);
+   int guard = 0;
+   while(left > 0.0000001 && guard < 1000)
+     {
+      guard++;
+      double take = (left > maxL) ? maxL : left;
+      take = MathRound(take / step) * step;
+      if(take < minL)
+         take = minL;
+      if(take > left)
+         take = left;                      // the last piece
+      int n = ArraySize(chunks);
+      ArrayResize(chunks, n + 1);
+      chunks[n] = NormalizeDouble(take, 2);
+      left = NormalizeDouble(left - take, 2);
+     }
+   return ArraySize(chunks);
   }
 
 //+------------------------------------------------------------------+
