@@ -154,6 +154,7 @@ class IBKRAdapter(BrokerAdapter):
         entry_split_slices: int = 0,
         entry_split_interval: float = 0.0,
         exit_remainder_timeout: float = 120.0,
+        entry_remainder_timeout: float = 120.0,
         entry_timeout: float = 900.0,
         good_till: Optional[object] = None,
         quote_fallback: str = "strict",
@@ -234,6 +235,12 @@ class IBKRAdapter(BrokerAdapter):
         # on a background task, not on the consume loop. See
         # _complete_exit_fill for what it is bounding.
         self.exit_remainder_timeout = exit_remainder_timeout
+        # The same for an ENTRY that filled in pieces. Separate from the
+        # exit's because the two differ in what an unfinished order
+        # MEANS: an exit left part-filled is a position still held under
+        # a row that says closed, and an entry left part-filled is just
+        # a smaller position, which close() already sizes correctly.
+        self.entry_remainder_timeout = entry_remainder_timeout
         # How long a LIMIT entry may rest before it is cancelled outright.
         # Not the same question as fill_timeout: a market order that hasn't
         # filled in ten seconds is a problem, while a limit resting in a thin
@@ -1432,8 +1439,12 @@ class IBKRAdapter(BrokerAdapter):
             price, size = await self._await_split_fill(slave_ticket, timeout)
         elif is_limit and self.entry_chase_steps > 0:
             price, size = await self._chase_entry(trade, timeout)
+            if price is not None:
+                price, size = await self._complete_entry_fill(trade, price, size)
         else:
             price, size = await self._await_fill(trade, "entry", timeout)
+            if price is not None:
+                price, size = await self._complete_entry_fill(trade, price, size)
         if price is not None:
             # LAST LOOK, before the Trades are dropped: what each slice
             # filled lives nowhere else once they are gone.
@@ -1879,6 +1890,84 @@ class IBKRAdapter(BrokerAdapter):
                 self.slave_id, trade.order.orderId, filled, want,
                 self.exit_remainder_timeout, status.status, want - filled,
             )
+        return price, size
+
+    async def _complete_entry_fill(self, trade, price, size):
+        """Wait out the rest of an entry that filled in pieces.
+
+        _await_fill returns what filled when its clock runs out, and for
+        an entry that is deliberately safe: close() must never sell more
+        than exists. But the figure is also what RECORDS the position,
+        and the rest usually lands moments later.
+
+        Live on 2026-11-17: MET 2953 was an order for 831, the fill
+        clock expired with 810, and the exit then closed 831. The row
+        said the position opened at 810 and closed at 831 -- disagreeing
+        with itself about how big it had been.
+
+        Waiting is free: entries are collected on a background task,
+        never on the consume loop. IBKR's avgFillPrice is the average
+        across every fill of the order, so the correct weighted price is
+        read back off it once it completes.
+
+        AN ENTRY THAT GENUINELY DOES NOT FILL IS NOT AN EMERGENCY, which
+        is where this differs from the exit. A partially filled entry is
+        simply a smaller position, and close() sizes from what actually
+        filled. So the unfinished cases are warnings about the RECORD,
+        not alarms about the broker.
+        """
+        want = float(getattr(trade.order, "totalQuantity", 0.0) or 0.0)
+        if not want or size is None or float(size) >= want:
+            return price, size
+
+        deadline = time.monotonic() + max(0.0, float(self.entry_remainder_timeout))
+        while time.monotonic() < deadline:
+            status = trade.orderStatus
+            filled = float(status.filled or 0.0)
+            remaining = float(status.remaining or 0.0)
+            if filled >= want or remaining <= 0:
+                if filled > 0 and status.avgFillPrice:
+                    logger.info(
+                        "IBKRAdapter[%s] entry order %s completed: %s at %s "
+                        "(it had reported %s when the fill clock ran out)",
+                        self.slave_id, trade.order.orderId, filled,
+                        status.avgFillPrice, size,
+                    )
+                    return float(status.avgFillPrice), filled
+                break
+            if status.status in ("Cancelled", "ApiCancelled", "Inactive"):
+                # Terminal. The position is what filled, and that is a
+                # perfectly ordinary outcome -- the row and close() both
+                # want this number rather than the one the order asked
+                # for.
+                if filled > 0 and status.avgFillPrice:
+                    logger.info(
+                        "IBKRAdapter[%s] entry order %s is %s having filled %s "
+                        "of %s -- the position is %s",
+                        self.slave_id, trade.order.orderId, status.status,
+                        filled, want, filled,
+                    )
+                    return float(status.avgFillPrice), filled
+                return price, size
+            await asyncio.sleep(0.2)
+
+        status = trade.orderStatus
+        filled = float(status.filled or 0.0)
+        if filled > size and status.avgFillPrice:
+            logger.warning(
+                "IBKRAdapter[%s] entry order %s had filled %s of %s after "
+                "%.0fs and is still working; recording that much",
+                self.slave_id, trade.order.orderId, filled, want,
+                self.entry_remainder_timeout,
+            )
+            return float(status.avgFillPrice), filled
+        logger.warning(
+            "IBKRAdapter[%s] entry order %s has filled %s of %s after %.0fs "
+            "(status=%s) and is still working -- if the rest fills, the "
+            "position will be larger than the row says it opened at",
+            self.slave_id, trade.order.orderId, filled, want,
+            self.entry_remainder_timeout, status.status,
+        )
         return price, size
 
     async def await_exit_fill(self, slave_ticket: int):
