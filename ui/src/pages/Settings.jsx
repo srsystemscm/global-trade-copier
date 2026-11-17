@@ -676,14 +676,165 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
           </button>
         </div>
       )}
-      {showRoutes && <RouteTable routes={slave.routes} />}
+      {showRoutes && (
+        <RouteTable
+          routes={slave.routes}
+          slave={slave}
+          onSaved={() => onSaved && onSaved()}
+        />
+      )}
       </>
       )}
     </div>
   );
 }
 
-function RouteTable({ routes }) {
+/**
+ * One route's own order splitter, edited in place.
+ *
+ * The first per-route editing on this page, so it carries the check
+ * that per-route editing needs: NOTHING IDENTIFIES A ROUTE but its
+ * position in the array. The row's index is the config's index, and a
+ * config that changed shape between the read and the write would be
+ * written to by position -- putting a split on whichever route had
+ * moved into that slot. So the write re-reads, confirms the route at
+ * that index is still the same one, and refuses rather than guessing.
+ */
+function RouteSplitCell({ slave, route, index, onSaved }) {
+  const [editing, setEditing] = useState(false);
+  const [slices, setSlices] = useState("");
+  const [interval, setInterval] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  function open() {
+    setSlices(route.split_slices != null ? String(route.split_slices) : "");
+    setInterval(route.split_interval != null ? String(route.split_interval) : "");
+    setErr(null);
+    setEditing(true);
+  }
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const n = String(slices).trim();
+      const secs = String(interval).trim();
+
+      // Three states, not two. Blank is "no opinion, use the slave's";
+      // 0 is "opt out of the slave's"; a pair is this route's own. They
+      // are different answers and the config has to keep them apart.
+      const optOut = n === "0";
+      const off = !optOut && n === "" && secs === "";
+      if (!optOut && !off) {
+        if (!Number.isInteger(Number(n)) || Number(n) < 2) {
+          throw new Error("slices must be 2 or more -- 1 is not a split, 0 opts out");
+        }
+        if (Number.isNaN(Number(secs)) || Number(secs) <= 0) {
+          throw new Error("the delay must be more than 0 seconds");
+        }
+      }
+
+      const config = await currentConfig(slave.id);
+      const r = (config.routes || [])[index];
+      const same =
+        r &&
+        r.symbol === route.symbol &&
+        String(r.magic ?? "") === String(route.magic ?? "") &&
+        (Array.isArray(r.target) ? r.target : [r.target]).join("/") ===
+          route.target.join("/");
+      if (!same) {
+        throw new Error(
+          "this slave's routes changed while this row was open -- close it and try again",
+        );
+      }
+
+      if (optOut) {
+        r.split_slices = 0;
+        delete r.split_interval;
+      } else if (off) {
+        delete r.split_slices;
+        delete r.split_interval;
+      } else {
+        r.split_slices = Number(n);
+        r.split_interval = Number(secs);
+      }
+
+      await api.patchSlave(slave.id, { config });
+      setEditing(false);
+      onSaved && onSaved();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (slave?.supports_order_split === false) {
+    return (
+      <span className="muted" title="This broker places one order per entry">
+        n/a
+      </span>
+    );
+  }
+
+  if (!editing) {
+    return (
+      <span className="route-split">
+        {route.split_slices > 1 && route.split_interval > 0 ? (
+          <span
+            title={`One entry goes out as ${route.split_slices} orders ${route.split_interval}s apart -- a ${(route.split_slices - 1) * route.split_interval}s window -- filling into one position`}
+          >
+            {route.split_slices}&times; / {route.split_interval}s
+          </span>
+        ) : route.split_slices === 0 ? (
+          <span className="muted" title="This route opts out of the slave-wide split">
+            opted out
+          </span>
+        ) : (
+          <span className="muted">--</span>
+        )}
+        <button className="btn btn-tiny" onClick={open} title="Edit this route's split">
+          edit
+        </button>
+      </span>
+    );
+  }
+
+  return (
+    <span className="route-split route-split-editing">
+      <input
+        type="number"
+        min="0"
+        step="1"
+        value={slices}
+        placeholder="--"
+        title="Orders to split one entry into. Blank uses the slave's setting, 0 opts out of it."
+        onChange={(e) => setSlices(e.target.value)}
+      />
+      <span className="muted">&times; /</span>
+      <input
+        type="number"
+        min="0"
+        step="1"
+        value={interval}
+        placeholder="--"
+        title="Seconds between them"
+        onChange={(e) => setInterval(e.target.value)}
+      />
+      <span className="muted">s</span>
+      <button className="btn btn-tiny" onClick={save} disabled={busy}>
+        {busy ? "..." : "save"}
+      </button>
+      <button className="btn btn-tiny" onClick={() => setEditing(false)} disabled={busy}>
+        cancel
+      </button>
+      {err && <div className="route-split-err">{err}</div>}
+    </span>
+  );
+}
+
+function RouteTable({ routes, slave, onSaved }) {
   return (
     <div className="table-wrap">
       <table className="positions-table route-table">
@@ -755,19 +906,12 @@ function RouteTable({ routes }) {
                   clearing the slave-level setting left a split running
                   that no screen would own up to. */}
               <td>
-                {r.split_slices > 1 && r.split_interval > 0 ? (
-                  <span
-                    title={`One entry goes out as ${r.split_slices} orders ${r.split_interval}s apart -- a ${(r.split_slices - 1) * r.split_interval}s window -- filling into one position`}
-                  >
-                    {r.split_slices}&times; / {r.split_interval}s
-                  </span>
-                ) : r.split_slices === 0 ? (
-                  <span className="muted" title="This route opts out of the slave-wide split">
-                    opted out
-                  </span>
-                ) : (
-                  <span className="muted">--</span>
-                )}
+                <RouteSplitCell
+                  slave={slave}
+                  route={r}
+                  index={i}
+                  onSaved={onSaved}
+                />
               </td>
               <td>{r.sizing}</td>
             </tr>
@@ -775,8 +919,13 @@ function RouteTable({ routes }) {
         </tbody>
       </table>
       <p className="muted small">
-        Read-only for now. These decide what a signal becomes -- which contract month, who holds
-        the stop, whether it may work outside regular hours.
+        These decide what a signal becomes -- which contract month, who holds the stop, whether
+        it may work outside regular hours. Only the split is editable here so far.
+      </p>
+      <p className="muted small">
+        A route&apos;s <strong>split</strong> wins over the slave-wide one. Blank means it has no
+        opinion and takes the slave&apos;s; <strong>0</strong> opts out of the slave&apos;s
+        entirely. Those are different answers, so the column shows them differently.
       </p>
     </div>
   );

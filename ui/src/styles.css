@@ -547,6 +547,35 @@ code {
   line-height: 1.4;
 }
 
+/* Editing one route's split in place, in the route table. Kept tight so
+   a cell that gains two inputs does not reflow the whole row. */
+.route-split {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.route-split-editing input {
+  width: 48px;
+  padding: 2px 4px;
+  font-size: 12px;
+}
+
+.btn-tiny {
+  font-size: 11px;
+  padding: 1px 6px;
+  line-height: 1.5;
+}
+
+/* The row is narrow, so a failed save says why underneath it rather
+   than being clipped on the end. */
+.route-split-err {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: var(--error);
+}
+
 /* The individual fills behind a split entry. Set apart from the leg's
    own figures, because the leg's price is the position's average and
    these are the prices that average is made of. */
