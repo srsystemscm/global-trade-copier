@@ -696,6 +696,7 @@ function RouteTable({ routes }) {
             <th>Order</th>
             <th>Month</th>
             <th>Stop held by</th>
+            <th>Split</th>
             <th>Sizing</th>
           </tr>
         </thead>
@@ -746,6 +747,26 @@ function RouteTable({ routes }) {
                   </span>
                 ) : (
                   "broker"
+                )}
+              </td>
+              {/* This route's own splitter, which wins over the
+                  slave's. It was invisible: the gold route carried
+                  "3 over 5s" while the slave card said nothing, so
+                  clearing the slave-level setting left a split running
+                  that no screen would own up to. */}
+              <td>
+                {r.split_slices > 1 && r.split_interval > 0 ? (
+                  <span
+                    title={`One entry goes out as ${r.split_slices} orders ${r.split_interval}s apart -- a ${(r.split_slices - 1) * r.split_interval}s window -- filling into one position`}
+                  >
+                    {r.split_slices}&times; / {r.split_interval}s
+                  </span>
+                ) : r.split_slices === 0 ? (
+                  <span className="muted" title="This route opts out of the slave-wide split">
+                    opted out
+                  </span>
+                ) : (
+                  <span className="muted">--</span>
                 )}
               </td>
               <td>{r.sizing}</td>

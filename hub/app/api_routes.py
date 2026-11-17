@@ -351,6 +351,16 @@ def _route_rows(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             "broker_brackets": route.get("broker_brackets"),
             "month_slot": route.get("month_slot"),
             "sizing": _describe_route_sizing(route.get("sizing")),
+            # This route's OWN order splitter, which WINS over the
+            # slave-level one. Shown because it was not: the gold route
+            # carried "3 over 5s" while the slave card said nothing, so
+            # clearing the slave-level setting left a split running that
+            # no screen would own up to.
+            #
+            # 0 is not absent. It is a route opting OUT of a slave-wide
+            # split, which is a decision and reads as one.
+            "split_slices": route.get("split_slices"),
+            "split_interval": route.get("split_interval"),
             "atr_period": route.get("atr_period"),
             "risk_management": route.get("risk_management") or None,
         })
