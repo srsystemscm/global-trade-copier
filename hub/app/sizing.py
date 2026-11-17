@@ -416,6 +416,7 @@ def compute_size(
     contract_spec: Optional[ContractSpec],
     risk_scale: float = 1.0,
     round_band: Optional[float] = None,
+    max_risk_error: Optional[float] = None,
 ) -> SizingResult:
     """Computes the slave order size (contracts for futures, shares for
     equities/ETFs).
@@ -546,6 +547,60 @@ def compute_size(
     # Applied only where a smaller alternative exists: the caller passes
     # None for the last candidate, or a signal landing mid-band on the
     # micro would step down to nothing and fill nothing at all.
+    # HOW WRONG THE RISK WOULD BE, which is the question round_band was
+    # reaching for and could not ask.
+    #
+    # A band is a fraction of a contract, and a fraction of a contract is
+    # not a cost: the same 0.65 is +20.7% of the intended risk at 1
+    # contract and +5.2% at 6. Measured over 18 live decisions on
+    # 2026-11-16, no band width exists that takes the 3-contract signals
+    # and refuses the 1-contract ones -- it would have to be at least
+    # 0.419 and under 0.290 at the same time. The band was not too wide
+    # or too narrow. It was measuring the wrong thing.
+    #
+    # So: round to NEAREST, and step down to the smaller contract only
+    # when that rounding is wrong by more than the tolerance. One number
+    # with one meaning, and it reads as what it is -- "I will accept
+    # being 15% off to trade the full-size contract".
+    #
+    # Any tolerance in [12.2%, 19.5%) reproduces the behaviour Chris
+    # asked for on that day's signals; 0.15 sits in the middle.
+    #
+    # NEVER ROUNDS UP TO ONE from below, same as the band. Below a whole
+    # contract the smaller instrument always fits better -- and the
+    # arithmetic agrees, since 0.65 -> 1 is +53%, past any sane
+    # tolerance. Stated anyway rather than left to the numbers.
+    #
+    # Applied only where a smaller alternative exists: the caller passes
+    # None for the last candidate, or a signal the tolerance rejects on
+    # the micro would step down to nothing and fill nothing at all.
+    if max_risk_error is not None:
+        tol = float(max_risk_error)
+        down = math.floor(units)
+        nearest = down if (units - down) < 0.5 else down + 1
+        error = abs(nearest - units) / units if units else 1.0
+        # `down`, not `nearest`: at 0.9 the nearest whole contract IS 1
+        # and the rounding is only 11% off, so testing the rounded figure
+        # would let a generous tolerance talk a sub-contract signal into
+        # a full one. Below a whole contract the smaller instrument
+        # always fits better, whatever the arithmetic says.
+        if down < 1 or error > tol:
+            return SizingResult(
+                size=0, skipped=True,
+                reason=(
+                    f"wants {units:g} of them; the nearest whole contract is "
+                    f"{nearest:g}, which is {error * 100:.0f}% off the intended "
+                    f"risk and over the {tol * 100:g}% allowed -- so a smaller "
+                    f"contract is the better fit"
+                ),
+            )
+        final = _snap(nearest, min_size)
+        return _within_ceiling(
+            final, sizing_config=sizing_config, entry_price=entry_price,
+            stop_price=stop_price, account_balance=account_balance,
+            account_equity=account_equity, contract_spec=contract_spec,
+        )
+
     if round_band is not None:
         band = float(round_band)
         down = math.floor(units)

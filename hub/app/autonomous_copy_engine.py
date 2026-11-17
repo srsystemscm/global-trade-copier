@@ -959,6 +959,11 @@ class AutonomousCopyEngine(SessionGateMixin):
             # would step down to nothing and fill nothing at all.
             round_band=(sizing_config.get("round_band")
                         if has_smaller_alternative else None),
+            # Wins over round_band where both are set, and the resolver
+            # below says so rather than letting a stale band sit in a
+            # config looking like it decides something.
+            max_risk_error=(sizing_config.get("max_risk_error")
+                            if has_smaller_alternative else None),
         )
         if sizing_result.skipped:
             # THE MEASUREMENT, not just the verdict. Each candidate reads
