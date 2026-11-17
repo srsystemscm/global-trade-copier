@@ -71,13 +71,33 @@ input int    MAE_DELAY_MS        = 1500;
 //---   33 MGC does not fill against a six-second close either, which is
 //---   the case the order splitter exists for
 //---
-//--- Five minutes covers the entry chase in full: four steps at sixty
-//--- seconds, plus time to fill. Set it to 3000 to test the signal path
-//--- end to end, or to 0 to leave the position open for good.
+//--- NOW 30000 -- thirty seconds -- which is what the ORDER SPLITTER
+//--- needs, without tying a terminal up for five minutes to get it.
+//---
+//--- HOW LONG A RUN HAS TO LAST. A 3x5s split is a ten-second window,
+//--- and the hub's own latency is paid before it starts: on 2026-11-16
+//--- the XAUUSD signal arrived at 19:19:37 and the gold slice was not
+//--- placed until 19:19:41, because ibkr-etf-1 placed its own order
+//--- ahead of it. A run closed around ten seconds in got slice 2 and
+//--- lost slice 3. Thirty seconds clears the whole schedule with margin.
+//---
+//--- SHORTENING THE SPLIT INTERVAL DOES NOT HELP. Once the CLOSE is in
+//--- the hub's queue, the consume loop reaches it in the same second
+//--- whatever the interval is. The trade has to OUTLIVE the latency plus
+//--- the window; there is no interval short enough to get round that.
+//---
+//--- Which also means CLOSING BY HAND cuts the split short. Stopping the
+//--- script closes on the way out, so an early stop ends the schedule
+//--- too -- the runs that came out at 5 of 15 and 2 of 3 were closed
+//--- manually a few seconds in, not held for this long.
+//---
+//--- Thirty seconds does not cover the entry chase, which is four steps
+//--- at sixty: set this to 300000 for that. 3000 tests the signal path
+//--- end to end. 0 leaves the position open for good.
 //---
 //--- The wait is interruptible and closes on the way out, so stopping the
 //--- script does not leave a position behind.
-input int    CloseAfterMs        = 300000;
+input int    CloseAfterMs        = 30000;
 
 //--- fxDreema's POINT_FORMAT_RULES, which decide what a "pip" is
 input string POINT_FORMAT_RULES  = "0.001=0.01,0.00001=0.0001,0.000001=0.0001";
