@@ -1250,6 +1250,8 @@ function RouteSizingForm({ slave, onDone }) {
           capital_base: first.capital_base || "balance",
           rounding: first.rounding || "nearest_min1",
           round_band: first.round_band != null ? first.round_band : "",
+          max_risk_error:
+            first.max_risk_error != null ? +(first.max_risk_error * 100).toFixed(4) : "",
         });
       } catch (e) {
         setErr(e.message);
@@ -1274,6 +1276,13 @@ function RouteSizingForm({ slave, onDone }) {
           throw new Error("the step-down band must be between 0 and 0.5");
         }
       }
+      const tol = String(form.max_risk_error).trim();
+      if (tol !== "") {
+        const t = Number(tol);
+        if (Number.isNaN(t) || t < 0 || t >= 100) {
+          throw new Error("the risk tolerance must be a percentage from 0 to under 100");
+        }
+      }
 
       // Re-read at save time. These forms PATCH the whole config, and a
       // snapshot taken when the form opened silently restores anything
@@ -1290,6 +1299,8 @@ function RouteSizingForm({ slave, onDone }) {
         // falls back to it, and dropping it would resize those silently.
         if (band === "") delete sizing.round_band;
         else sizing.round_band = Number(band);
+        if (tol === "") delete sizing.max_risk_error;
+        else sizing.max_risk_error = Number(tol) / 100;
         if (cap === "") delete sizing.max_risk_pct;
         else sizing.max_risk_pct = Number(cap) / 100;
         sizing.capital_base = form.capital_base;
@@ -1370,6 +1381,18 @@ function RouteSizingForm({ slave, onDone }) {
           </select>
         </label>
         <label>
+          Step down over (% risk off)
+          <input
+            type="number"
+            step="1"
+            min="0"
+            max="99"
+            value={form.max_risk_error}
+            placeholder="off"
+            onChange={(e) => setForm({ ...form, max_risk_error: e.target.value })}
+          />
+        </label>
+        <label>
           Step down outside (band)
           <input
             type="number"
@@ -1384,11 +1407,23 @@ function RouteSizingForm({ slave, onDone }) {
       </div>
       <p className="muted small">
         <strong>Floor</strong> skips a signal that does not reach one whole unit rather than
-        rounding it up to one. <strong>Band</strong> only applies where a route lists more than
-        one contract size: within that distance of a whole contract it takes it -- down from
-        just above, up from just below -- and outside it steps down to the smaller contract,
-        where the same money divides finer. 0.25 sends 1.61 contracts to the micros and keeps
-        1.90 as two.
+        rounding it up to one.
+      </p>
+      {/* Both answer "take the bigger contract, or step down to the
+          smaller one?" and they ask it differently. The newer one is
+          listed first and wins, because a config carrying a stale band
+          should not look like it decides anything. */}
+      <p className="muted small">
+        <strong>% risk off</strong> rounds to the nearest whole contract and steps down to the
+        smaller one only when that rounding is further off the intended risk than this. At
+        15%, 3.35 contracts becomes 3 (10% off) and 6.65 becomes 7 (5% off), while 1.66 steps
+        down to the micros rather than take 2 at 21% over.
+      </p>
+      <p className="muted small">
+        <strong>Band</strong> is the older rule and is ignored while the one above is set. It
+        measures distance to a whole contract instead of cost, which cannot tell those cases
+        apart: the same 0.65 of a contract is 21% of the intended risk at 1 and 5% at 6, and no
+        band width takes the second while refusing the first.
       </p>
 
       <div className="slave-actions">
