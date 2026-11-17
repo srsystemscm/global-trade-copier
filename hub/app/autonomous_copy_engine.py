@@ -1343,11 +1343,28 @@ class AutonomousCopyEngine(SessionGateMixin):
             good_till=route.good_till,
             broker_brackets=route.broker_brackets,
             # Place this entry in slices over a window instead of in one
-            # print. None on either falls back to the slave's own setting,
-            # then to off -- so nothing changes for a route that does not
-            # ask. One position comes out of it either way.
-            split_slices=route.split_slices,
-            split_interval=route.split_interval,
+            # print. One position comes out of it either way.
+            #
+            # RESOLVED HERE, not left to the adapter's own default. The
+            # adapter reads entry_split_slices once, in its constructor,
+            # at hub startup -- while PATCH /slaves/{id} live-updates
+            # self.slave_config. So a slave-level split set through the
+            # UI saved cleanly, showed on the card as "entries split into
+            # 3 over 5s", and did nothing at all until the next restart.
+            #
+            # Measured on 2026-11-17: five routes with their own override
+            # split, and ETHUSD -- which had none and was relying on the
+            # slave's -- placed 831 MET in a single order.
+            #
+            # A route still wins over the slave, and 0 on a route is
+            # still an opt-out rather than "no opinion", so `is not None`
+            # does the choosing rather than truthiness.
+            split_slices=(
+                route.split_slices if route.split_slices is not None
+                else self.slave_config.get("entry_split_slices")),
+            split_interval=(
+                route.split_interval if route.split_interval is not None
+                else self.slave_config.get("entry_split_interval")),
         )
         if (route.split_slices or route.split_interval) and not getattr(
                 self.adapter, "supports_order_split", False):
