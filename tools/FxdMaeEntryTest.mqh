@@ -36,7 +36,7 @@ input double ATR_TP_MULT         = 1.0;     // ATR_TP_LONG / ATR_TP_SHORT
 input double TP_ADJUST           = 0.0;     // TP_1_LONG_ADJUST -- 0.0 means NO take-profit
 input int    ACCT_RISK_MODE      = 1;       // 0 fixed cash, 1 % of balance, 2 % of equity
 input int    FIXED_RISK_A        = 2000;    // used when ACCT_RISK_MODE = 0
-input double RISK_A              = 1.0;     // PERCENT, when ACCT_RISK_MODE = 1 or 2
+input double RISK_A              = 2.0;     // PERCENT, when ACCT_RISK_MODE = 1 or 2
 input double SPREAD_SLIPPAGE     = 5.0;
 input int    MagicStart          = MAE_MAGIC_START;
 input string Group               = "";      // magic = MagicStart + (int)Group
@@ -325,7 +325,7 @@ void CloseTicket(int ticket, string symbol, int digits)
 
 //+------------------------------------------------------------------+
 //| What the risk setting actually amounts to on THIS account, in the |
-//| deposit currency, so the log answers "1% of what?" by itself.     |
+//| deposit currency, so the log answers "2% of what?" by itself.     |
 //+------------------------------------------------------------------+
 string RiskDescription()
   {

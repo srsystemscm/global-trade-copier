@@ -38,18 +38,25 @@
 //| ONE DELIBERATE DIVERGENCE FROM THE EA, added in 1.01:              |
 //|                                                                    |
 //| ACCT_RISK_MODE defaults to 1 -- percent of BALANCE -- at RISK_A    |
-//| 1.0, where the EA's own default is mode 0, a flat $2000. This is a |
+//| 2.0, where the EA's own default is mode 0, a flat $2000. This is a |
 //| test setting and not the EA's: a fixed cash risk sizes differently |
 //| on every account it is dropped on, so the same script on ten       |
 //| charts would risk ten different fractions. Set ACCT_RISK_MODE back |
 //| to 0 to get the EA's real default.                                 |
 //|                                                                    |
-//| It is 1% PER CHART. The script knows nothing of the other charts   |
+//| It is 2% PER CHART. The script knows nothing of the other charts   |
 //| it is running on, so N charts started together risk N% between     |
 //| them, and the slaves re-size independently of all of it.           |
 //|                                                                    |
 //| Versions:                                                          |
 //|   1.00 2026-11-11 initial build                                    |
+//|   1.03 2026-11-16 RISK_A 1.0 -> 2.0, because 2% of balance is what  |
+//|                   the strategies actually send: "most EA are going  |
+//|                   to send a 2% risk of balance on signal". A test   |
+//|                   that stakes half of that measures the copier's    |
+//|                   sizing against a signal it will not see.          |
+//|   1.02 2026-11-16 hold a run long enough for the order splitter to  |
+//|                   place every slice (CloseAfterMs 300000 -> 30000)  |
 //|   1.01 2026-11-13 risk 1% of balance by default, and say in the    |
 //|                   log what that came to in cash                    |
 //+------------------------------------------------------------------+
@@ -67,7 +74,7 @@
 #property script_show_inputs
 #property version "1.02"
 
-#define MAE_SCRIPT_VERSION "1.02"
+#define MAE_SCRIPT_VERSION "1.03"
 #define MAE_BASE_TF        PERIOD_D1
 #define MAE_MAGIC_START    1001
 

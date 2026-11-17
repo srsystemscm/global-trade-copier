@@ -30,7 +30,7 @@
 #property script_show_inputs
 #property version "1.02"
 
-#define MAE_SCRIPT_VERSION "1.02-H4"
+#define MAE_SCRIPT_VERSION "1.03-H4"
 #define MAE_BASE_TF        PERIOD_H4
 #define MAE_MAGIC_START    221003
 
