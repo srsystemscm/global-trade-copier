@@ -635,6 +635,18 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         # Whether entries go out in one print or in slices over a window.
         # None on every slave that has not configured it.
         "split_summary": _split_summary(slave.config),
+        # Whether this slave's adapter can split an entry AT ALL. The
+        # fields travel on every OrderRequest and only IBKR acts on them,
+        # so offering the control on an MT slave would be a setting that
+        # saves cleanly and changes nothing -- the kind this file has had
+        # to go back and gate twice already.
+        #
+        # None when no engine is running, which is "not known yet" rather
+        # than "no".
+        "supports_order_split": (
+            bool(getattr(getattr(engine, "adapter", None),
+                         "supports_order_split", False))
+            if engine is not None else None),
         **_slave_summary_extras(slave),
     }
 

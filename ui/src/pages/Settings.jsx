@@ -374,6 +374,7 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
   const [editingMagic, setEditingMagic] = useState(false);
   const [editingMasters, setEditingMasters] = useState(false);
   const [editingRoll, setEditingRoll] = useState(false);
+  const [editingSplit, setEditingSplit] = useState(false);
   const [showRoutes, setShowRoutes] = useState(false);
 
   function toggle() {
@@ -637,6 +638,33 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
         <ContractRollForm
           slave={slave}
           onDone={() => { setEditingRoll(false); onSaved && onSaved(); }}
+        />
+      )}
+
+      {/* HOW an entry reaches the market, which is not how big it is --
+          so it sits apart from sizing. Shown on every slave, including
+          the ones that cannot do it: "off" and "this broker places one
+          order per entry" are different answers and the page should not
+          give the first when it means the second. */}
+      <div className="slave-risk-row">
+        <div>
+          <span className="muted small">Order splitting</span>
+          <div className="slave-risk-sizing">
+            {slave.supports_order_split === false
+              ? "not available -- this broker places one order per entry"
+              : slave.split_summary || "off -- each entry goes out as one order"}
+          </div>
+        </div>
+        {slave.supports_order_split !== false && (
+          <button className="btn btn-small" onClick={() => setEditingSplit((v) => !v)}>
+            {editingSplit ? "Cancel" : "Edit"}
+          </button>
+        )}
+      </div>
+      {editingSplit && (
+        <OrderSplitForm
+          slave={slave}
+          onDone={() => { setEditingSplit(false); onSaved && onSaved(); }}
         />
       )}
 
@@ -1810,6 +1838,148 @@ function ContractRollForm({ slave, onDone }) {
       </p>
       <div className="slave-actions">
         <button className="btn btn-small" onClick={save} disabled={busy}>
+          {busy ? "Saving..." : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The slave-wide default for the order splitter: how many orders one
+ * entry goes out in, and how long apart.
+ *
+ * A ROUTE may set its own and wins over this. There is no field for that
+ * here on purpose -- a route's split belongs with the rest of its
+ * settings, and a slave-level control that silently loses to a route is
+ * the setting-that-saves-cleanly-and-does-nothing this page has had to
+ * go back and fix twice.
+ */
+function OrderSplitForm({ slave, onDone }) {
+  const [form, setForm] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const got = await api.getSlave(slave.id);
+        setForm({
+          slices: got.config.entry_split_slices ?? "",
+          interval: got.config.entry_split_interval ?? "",
+        });
+      } catch (e) {
+        setErr(e.message);
+      }
+    })();
+  }, [slave.id]);
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const slices = String(form.slices).trim();
+      const interval = String(form.interval).trim();
+
+      // Off is BOTH cleared, not one of them. Slices with no interval is
+      // one order sent in pieces -- commission per piece and nothing
+      // gained -- and the engine reads it as off, so a config that says
+      // "4" while nothing splits is the worst of both.
+      const off = (slices === "" || Number(slices) <= 1) &&
+                  (interval === "" || Number(interval) <= 0);
+
+      let n = null;
+      let secs = null;
+      if (!off) {
+        n = Number(slices);
+        secs = Number(interval);
+        if (!Number.isInteger(n) || n < 2) {
+          throw new Error("slices must be a whole number of 2 or more -- 1 is not a split");
+        }
+        if (Number.isNaN(secs) || secs <= 0) {
+          throw new Error("the delay between slices must be more than 0 seconds");
+        }
+      }
+
+      // Read-modify-write: PATCH replaces config_json whole, so routes,
+      // mirror_map, host and ports travel back untouched or they are
+      // deleted by omission.
+      const config = await currentConfig(slave.id);
+      if (off) {
+        delete config.entry_split_slices;
+        delete config.entry_split_interval;
+      } else {
+        config.entry_split_slices = n;
+        config.entry_split_interval = secs;
+      }
+
+      await api.patchSlave(slave.id, { config });
+      onDone();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (err && !form) return <div className="banner banner-error">{err}</div>;
+  if (!form) return <p className="muted small">Loading this slave&apos;s configuration...</p>;
+
+  const n = Number(form.slices);
+  const secs = Number(form.interval);
+  const window = n > 1 && secs > 0 ? (n - 1) * secs : null;
+
+  return (
+    <div className="slave-risk-form">
+      {err && <div className="banner banner-error">{err}</div>}
+
+      <label>
+        Slices
+        <input
+          type="number"
+          min="0"
+          step="1"
+          value={form.slices}
+          placeholder="off"
+          onChange={(e) => setForm({ ...form, slices: e.target.value })}
+        />
+      </label>
+      <label>
+        Seconds between them
+        <input
+          type="number"
+          min="0"
+          step="1"
+          value={form.interval}
+          placeholder="off"
+          onChange={(e) => setForm({ ...form, interval: e.target.value })}
+        />
+      </label>
+
+      {window != null && (
+        <p className="muted small">
+          One entry goes out as <strong>{n} orders</strong> over{" "}
+          <strong>{window}s</strong>, filling into <strong>one position</strong> -- one
+          row, one stop, one thing to roll. The trade has to outlive that window: a
+          master CLOSE arriving part-way calls off the orders still to come, and the
+          position is whatever had gone out.
+        </p>
+      )}
+      {window == null && (
+        <p className="muted small">
+          Off. Each entry goes to the broker as a single order. Set both fields to
+          split one -- for a size the book cannot absorb in one print.
+        </p>
+      )}
+
+      <p className="muted small">
+        This is the slave-wide default. A route may set its own{" "}
+        <code>split_slices</code> / <code>split_interval</code>, which wins over this,
+        and <code>split_slices: 0</code> on a route opts it out entirely.
+      </p>
+
+      <div className="form-actions">
+        <button className="btn btn-primary" onClick={save} disabled={busy}>
           {busy ? "Saving..." : "Save"}
         </button>
       </div>
