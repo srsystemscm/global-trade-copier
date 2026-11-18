@@ -281,6 +281,33 @@ def _sizing_summary(config: Dict[str, Any]) -> str:
     return _tally((r.get("sizing") for r in routes), "routes")
 
 
+def _cap(blocks: List[Optional[Dict[str, Any]]]) -> Any:
+    """The refusal ceiling in force, which on a routed slave is a RANGE.
+
+    "mixed" was accurate and useless. ibkr-paper-1 carries 20% at the
+    slave level, nine routes inherit it, and the ETHUSDRR/MET route
+    overrides it to 3.5% -- so the card asserted 20% of a slave where one
+    route is nearly six times tighter, and then asserted nothing at all.
+    The two numbers that bound it are what a reader wants, and they fit
+    in the same space. Chris, 2026-11-18: "show the cap as a range".
+
+    `unbounded` is the case worth keeping separate: a block with no
+    max_risk_pct refuses nothing, and folding that into a maximum would
+    report a ceiling where there is none.
+    """
+    values = [(b or {}).get("max_risk_pct") for b in blocks]
+    numbers = sorted(
+        v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)
+    )
+    if not numbers:
+        return None
+
+    unbounded = len(numbers) != len(values)
+    if not unbounded and numbers[0] == numbers[-1]:
+        return numbers[0]
+    return {"min": numbers[0], "max": numbers[-1], "unbounded": unbounded}
+
+
 def _sizing_blocks(config: Dict[str, Any]) -> List[Optional[Dict[str, Any]]]:
     """Every sizing block actually in force on this slave.
 
@@ -357,7 +384,7 @@ def _sizing_facts(config: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "mode": agreed(mode_of),
         "basis": agreed(basis_of),
-        "cap_pct": agreed(lambda b: b.get("max_risk_pct")),
+        "cap_pct": _cap(blocks),
         # 1.0 is a SETTING, not an absence: it means this slave takes the
         # EA's signalled risk unscaled. Reported as a number so no screen
         # has to decide what a null means.

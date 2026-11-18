@@ -90,6 +90,17 @@ function word(value) {
 
 function pct(value) {
   if (value === null || value === undefined) return null;
+  // A RANGE, where the routes in force do not agree on a ceiling. The
+  // percent sign is said once: "3.50-20.00%" reads as one figure with
+  // two ends, where "3.50%-20.00%" reads as two figures.
+  if (typeof value === "object") {
+    const lo = (value.min * 100).toFixed(2);
+    // Open-ended on purpose: a route with no max_risk_pct refuses
+    // nothing, and naming a number there would report a ceiling that
+    // does not exist.
+    if (value.unbounded) return `${lo}%–none`;
+    return `${lo}–${(value.max * 100).toFixed(2)}%`;
+  }
   if (typeof value !== "number") return word(value);
   return `${(value * 100).toFixed(2)}%`;
 }
