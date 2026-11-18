@@ -218,11 +218,26 @@ registry."* A draft therefore carries **no magic numbers and no risk scales**,
 and the copier cannot resolve a `unit_id` -- it does not read the registry, and
 must not.
 
-So PM needs one small export of its own: for each member of a portfolio
-version, read the unit's `magic` and the member's `risk_scale`, and write the
-file at the top of this document. Every join it needs is a query it already
-makes (`registry.portfolio_members()` returns `unit_id, risk_scale,
-instrument`; `registry.units()` carries `magic`).
+**That export now exists**, written on 2026-11-18:
+`portfolio_manager/portfoliomanager/copier.py`, reached from **Export for
+copier** beside Commit on PM's Portfolio tab. It builds the file at the top of
+this document from the members already loaded, and refuses the same things
+this side refuses -- an empty portfolio, a legacy unit with no magic, one
+magic at two scales, a scale above 10 -- so a bad selection is found while
+somebody is looking at the portfolio rather than at a rejected file.
+
+A file it produced was read by this hub's import route end to end on
+2026-11-18: the plan came back correct and the dry run wrote nothing.
+
+Two things PM decides there, both deliberate:
+
+- **The revision is stamped only when it is true.** PM sends one when the
+  draft is unmodified and was opened from a committed version, and omits it
+  otherwise -- an edited draft is not that version, and this copier reports
+  the revision each slave is running back to the ops hub.
+- **`portfolio.id` is the registry's own id**, not the portfolio's name. A
+  portfolio with no committed version has no id, and PM refuses to export
+  one rather than inventing a key.
 
 ### One field not to map
 
