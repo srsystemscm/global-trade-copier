@@ -95,7 +95,12 @@ def test_where_a_selection_came_from_is_recorded():
     the two sides can talk about the same book."""
     source = pi.apply({}, pi.parse(TWO))["magic_filter"]["source"]
 
-    assert source["kind"] == "portfolio_manager"
+    # THE AGREED WORD, not a new one. The reporter already sends this
+    # block to the ops hub, and docs/hub-reporter.md settled "kind" as
+    # ops_hub_registry before this importer existed -- the hub's registry
+    # IS its portfolio manager. A second name for one thing would have
+    # had the hub read every imported selection as hand-written.
+    assert source["kind"] == "ops_hub_registry"
     assert source["portfolio_id"] == "pf_7f3a9c"
     assert source["revision"] == 7
     assert source["imported_at"].endswith("Z")
@@ -239,6 +244,32 @@ def test_a_hand_written_selection_is_not_claimed_as_an_import():
                    pi.parse(TWO))["replaces_import"] is None
 
 
+def test_the_reported_source_is_the_word_the_ops_hub_already_reads():
+    """This block does not stay on the slave: the reporter sends it in
+    `snapshot.slaves[].magic_filter`, which is how the hub's Copier tab
+    shows which book a slave is running. docs/hub-reporter.md fixed the
+    word for it before this importer existed, and inventing a second one
+    would have made every imported selection read as hand-written."""
+    from pathlib import Path
+
+    contract = (Path(__file__).resolve().parents[2]
+                / "docs" / "hub-reporter.md").read_text(encoding="utf-8")
+    assert f'"kind": "{pi.SOURCE_KIND}"' in contract, (
+        f"{pi.SOURCE_KIND!r} is not the value the reporter contract "
+        f"documents, so the hub will not recognise an imported selection"
+    )
+
+
+def test_a_selection_written_under_the_older_word_is_still_an_import():
+    """It existed for an afternoon on 2026-11-18. Read back as a hand
+    edit, an import over it would say it replaces nothing."""
+    config = {"magic_filter": {"allow": [1001],
+                               "source": {"kind": "portfolio_manager",
+                                          "portfolio_id": "pf_old",
+                                          "revision": 2}}}
+    assert pi.plan(config, pi.parse(TWO))["replaces_import"]["portfolio_id"] == "pf_old"
+
+
 # --- the route -------------------------------------------------------
 #
 # Read off the source, as the other route guarantees in this suite are:
@@ -275,3 +306,30 @@ def test_the_route_writes_through_patch_slave_rather_than_around_it():
         "the import writes the config itself, so the bus is never told "
         "which strategies this slave now takes"
     )
+
+
+def test_an_imported_portfolio_reaches_the_ops_hub_as_it_stands():
+    """The slave reports the portfolio it is running, with no further
+    plumbing. Chris asked whether it could; it already does.
+
+    `snapshot.slaves[].magic_filter` is magic_filter.parse(config).as_dict()
+    verbatim, so everything the import writes travels on the next snapshot
+    -- the magics, the strategy NAMES, and which portfolio at which
+    revision they were resolved from. That is what lets the hub's Copier
+    tab say "this slave takes the trend-following book" in its own words,
+    and spot one that has drifted since.
+
+    Spans two modules that know nothing about each other, which is why it
+    is worth a test: either could stop carrying `source` without the other
+    noticing.
+    """
+    from app import magic_filter
+
+    config = pi.apply({"mode": "autonomous"}, pi.parse(TWO))
+    reported = magic_filter.parse(config).as_dict()
+
+    assert reported["allow"] == [1001, 1002]
+    assert reported["labels"] == {"1001": "US2000 trend", "1002": "GC breakout"}
+    assert reported["source"]["portfolio_id"] == "pf_7f3a9c"
+    assert reported["source"]["revision"] == 7
+    assert reported["source"]["kind"] == pi.SOURCE_KIND

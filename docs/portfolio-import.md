@@ -69,7 +69,11 @@ engine, so an import needs no restart and no new concept:
     {"magic": 1002, "strategy": "GC breakout",  "portfolio": "Trend"}
   ],
   "source": {
-    "kind": "portfolio_manager",
+    // The word docs/hub-reporter.md already settled for this. The hub's
+    // registry IS its portfolio manager, and the reporter sends this
+    // block on to it -- a second name for one thing would have the hub
+    // read every imported selection as hand-written.
+    "kind": "ops_hub_registry",
     "portfolio": "Trend",
     "portfolio_id": "pf_7f3a9c",
     "revision": 7,
@@ -80,6 +84,14 @@ engine, so an import needs no restart and no new concept:
 
 "risk_scale_by_magic": {"1001": 0.5, "1002": 1.0}
 ```
+
+**The ops hub is told, without anything further being built.** The reporter
+already sends `source` verbatim inside `snapshot.slaves[].magic_filter`
+(`docs/hub-reporter.md`), so a slave reports the portfolio it is running on
+the next snapshot after an import -- which portfolio, at which revision,
+applied when. That is what lets the hub's Copier tab say "this slave takes
+the trend-following book", and show one that has drifted since. The copier
+still resolves nothing and still never calls out.
 
 `magic_filter` decides whether a signal reaches the slave at all;
 `risk_scale_by_magic` multiplies what it stakes when it does. The shape of

@@ -723,6 +723,28 @@ down one socket, and each slave takes a selection of them by magic number
 empty selection; the tab has to tell those apart. `labels` and `source` are
 present only where the selection was imported with them.
 
+**`source` gained two fields on 2026-11-18**, both additive and both safe to
+ignore:
+
+```jsonc
+"source": {"kind": "ops_hub_registry", "portfolio": "Trend",
+           "portfolio_id": "pf_7f3a9c", "revision": 7,
+           "exported_at": "2026-11-18T09:12:03Z",
+           "imported_at": "2026-11-18T14:02:11Z"}
+```
+
+`portfolio_id` is the portfolio manager's own identifier, and it is the
+field to join on: `portfolio` is a name, and a name is not a key. Chris
+asked for it -- "the portfolios from PM could/should have an ID that GTC can
+use however it needs as well". `exported_at` is when PM wrote the file,
+where `imported_at` is when the copier applied it; a wide gap between them
+is a selection that sat in someone's downloads.
+
+They are written by the import described in `docs/portfolio-import.md`,
+which is what produces this block now. `kind` is unchanged, deliberately:
+the copier briefly wrote `portfolio_manager` and that would have had this
+tab read every imported selection as hand-written.
+
 This is the field that closes the loop with the hub's own registry — the
 portfolio manager is what names a magic number, so the tab can render
 "this slave takes the trend-following book" rather than five integers,

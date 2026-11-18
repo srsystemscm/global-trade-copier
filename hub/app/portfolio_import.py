@@ -209,11 +209,35 @@ def _text(value: Any) -> Optional[str]:
     return text or None
 
 
+# What `source.kind` says, and why it is not a new word.
+#
+# The reporter already sends this block to the Operations hub --
+# `snapshot.slaves[].magic_filter` carries `source` verbatim -- and
+# docs/hub-reporter.md settled the value as "ops_hub_registry" before this
+# importer existed. The hub's registry IS its portfolio manager: one thing
+# that names a magic number and groups magics into portfolios.
+#
+# This wrote "portfolio_manager" for an afternoon, which would have had the
+# hub read every imported selection as hand-written. A second word for one
+# thing is exactly the drift docs/hub-reporter.md records having already
+# happened once on this endpoint, so the agreed one wins.
+SOURCE_KIND = "ops_hub_registry"
+
+# Read back as well, so a selection written during that afternoon is still
+# recognised as an import rather than reported as a replaced hand edit.
+KNOWN_SOURCE_KINDS = (SOURCE_KIND, "portfolio_manager")
+
+
 def source_block(portfolio: Portfolio, now: Optional[float] = None) -> Dict[str, Any]:
     """Where a selection came from, recorded and never acted on."""
     stamp = time.gmtime(now if now is not None else time.time())
     block: Dict[str, Any] = {
-        "kind": "portfolio_manager",
+        "kind": SOURCE_KIND,
+        # NEW BESIDE THE AGREED FIELDS, and additive: the shape in
+        # docs/hub-reporter.md carries the portfolio's NAME and revision,
+        # and a name is not a key. Chris asked for one: "the portfolios
+        # from PM could/should have an ID that GTC can use however it
+        # needs as well." A hub that does not know the field ignores it.
         "portfolio_id": portfolio.id,
         "imported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", stamp),
     }
@@ -351,7 +375,7 @@ def _previous_import(config: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     if not isinstance(block, dict):
         return None
     source = block.get("source")
-    if not isinstance(source, dict) or source.get("kind") != "portfolio_manager":
+    if not isinstance(source, dict) or source.get("kind") not in KNOWN_SOURCE_KINDS:
         return None
     return {
         "portfolio_id": source.get("portfolio_id"),
