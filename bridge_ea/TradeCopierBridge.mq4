@@ -35,7 +35,7 @@
 //|                   in daily ATRs. See AtrTimeframeForMagic().       |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.06"
+#property version   "1.07"
 // MUST match #property version above. MQL has no way to read that from
 // code, so the two are kept in step by hand -- and they had already
 // drifted once: the property said 1.04 while this said 1.03, which would
