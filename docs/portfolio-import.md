@@ -241,17 +241,31 @@ Two things PM decides there, both deliberate:
 
 ### One field not to map
 
-**PM's `account` is not this contract's `account`.** A portfolio version is
-committed *for* an account -- `portfolio_version.account_id`, chosen in the
-commit dialog -- which is the account the book is meant to run on. The
-`account` here is the **master terminal that publishes the magic**, which is
-what tells two masters' colliding magic numbers apart. They are different
-things and mapping one onto the other would put a slave's account number where
-a master's belongs.
+**PM's `account` may or may not be this contract's `account`, and nobody has
+decided yet.** A portfolio version is committed *for* an account
+(`portfolio_version.account_id`, chosen in the commit dialog), and the
+registry's `account` table carries broker, server, kind and currency -- the
+shape of an MT4 account either way.
 
-Leave `strategies[].account` out until PM can say which master an EA runs on.
-Omitted, it is simply not checked; wrong, it would be checked against the
-wrong thing.
+Read on 2026-11-18: **that table is empty and no portfolio version has ever
+been committed**, so the meaning is unset rather than wrong. A master runs a
+separate MT4 account on its own terminal, so if an `account` row comes to mean
+*the terminal whose EAs publish the signals*, then it is exactly this field
+and PM can carry it. If it comes to mean the slave account a book is destined
+for, it is not, and mapping it here would put a destination account number
+where an origin belongs.
+
+So PM's exporter omits `strategies[].account` for now. Omitted it is simply
+not checked; wrong it would be checked against the wrong thing. The question
+is written up for the registry in that repository's
+`docs/downstream-trade-copier.md`.
+
+**The collision this field guards against is already prevented for anything
+the registry owns.** `unit.magic` is `UNIQUE` there, and a trigger
+(`unit_magic_is_permanent`) refuses to change one once assigned -- so two
+registry units cannot share a magic whatever terminal they run on. The refusal
+above can only be reached by an EA that is not a registry unit, or by magic
+`0`, which is a trade placed by hand. It stays, as the safety net it is.
 
 ### `instrument` is not read
 
