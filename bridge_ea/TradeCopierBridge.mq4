@@ -41,14 +41,32 @@
 // drifted once: the property said 1.04 while this said 1.03, which would
 // have had every master reporting the wrong build through the very
 // handshake added to stop that happening.
-#define   BRIDGE_VERSION "1.06"
+#define   BRIDGE_VERSION "1.07"
 
 #include <Zmq/Zmq.mqh>
 
 input string HubHost              = "127.0.0.1";
 input int    HubPubPort           = 5555;   // hub SUB socket - we PUB/connect here
 input int    HubPushPort          = 5557;   // hub PULL socket - we PUSH/connect here
-input int    PollIntervalMs       = 500;    // how often to diff open orders
+//--- HOW WIDE THE RACE IS. This EA has no trade event to hook: MT4 has
+//--- no OnTradeTransaction, so an order is only ever noticed by polling.
+//--- If an order is opened AND modified between two polls, the first
+//--- sighting already carries the modified stop and is published as the
+//--- OPEN -- with no MODIFY to follow, because by then nothing has
+//--- changed.
+//---
+//--- That is not cosmetic. The hub sizes a copy from the staked risk the
+//--- OPEN reports, so a widened stop arriving as the opening one asks
+//--- every slave to stake roughly twice what the master did. On
+//--- 2026-11-17 it put USTEC, XTIUSD and XNGUSD over mt5-icm-1's 2.50%
+//--- ceiling and all three were refused -- correctly, on a signal that
+//--- was not true.
+//---
+//--- 100ms rather than 500 narrows the window five-fold. It cannot close
+//--- it: nothing on MT4 can, short of a trade event that does not exist.
+//--- What is left is reported instead -- see the late-sighting warning
+//--- in DiffAndPublish.
+input int    PollIntervalMs       = 100;    // how often to diff open orders
 input int    HeartbeatIntervalMs  = 5000;   // how often to send a heartbeat
 input double SlTpEpsilon          = 0.00001; // ignore SL/TP deltas smaller than this (float noise)
 input int    AtrPeriod            = 14;      // iATR() period used for the "atr" field
@@ -93,6 +111,10 @@ struct OrderSnapshot
    double tp;
    int    magic;    // OrderMagicNumber() -- identifies which strategy opened it
    string comment;  // OrderComment() -- secondary identifier, free-form
+   //--- Server time the order was filled. Only used to notice that this
+   //--- EA is seeing it LATE, which means the stop it is carrying may
+   //--- already have been modified -- see DiffAndPublish.
+   datetime opened;
   };
 
 OrderSnapshot knownOrders[];
@@ -176,6 +198,7 @@ void TakeSnapshot(OrderSnapshot &out[])
       // on it -- without this every strategy's signals are indistinguishable.
       out[n].magic   = OrderMagicNumber();
       out[n].comment = OrderComment();
+      out[n].opened  = OrderOpenTime();
      }
   }
 
@@ -210,6 +233,26 @@ void DiffAndPublish(OrderSnapshot &prev[], OrderSnapshot &curr[])
       int prevIdx = FindByTicket(prev, curr[i].ticket);
       if(prevIdx < 0)
         {
+         //--- SEEN LATE? Then the stop on it may not be the one it opened
+         //--- with, and this OPEN is about to tell the hub a staked risk
+         //--- the master never staked.
+         //---
+         //--- Said here, at the source, because the alternative is what
+         //--- happened on 2026-11-17: three symbols refused by a slave's
+         //--- risk ceiling, and an hour of comparing OPEN and MODIFY
+         //--- stops across two runs to work out why.
+         //---
+         //--- One second is the resolution of these clocks, so this
+         //--- catches the terminal being wedged rather than a tight
+         //--- race. That is the case worth catching: at 100ms polls a
+         //--- genuine race needs the terminal to be in trouble anyway.
+         int lateBy = (int)(TimeCurrent() - curr[i].opened);
+         if(curr[i].opened > 0 && lateBy >= 2)
+            Print("TradeCopierBridge: WARNING ticket ", curr[i].ticket,
+                  " (", curr[i].symbol, ") was first seen ", lateBy,
+                  "s after it opened -- if it was modified in that time, the",
+                  " stop below is NOT the one it opened with and every copy",
+                  " will be sized from it");
          PublishSignal("OPEN", curr[i]);
         }
       else if(MathAbs(curr[i].sl - prev[prevIdx].sl) > SlTpEpsilon ||
