@@ -704,7 +704,11 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
           <div className="slave-risk-row">
             <div>
               <span className="row-k">Sizing on every route</span>
-              <div className="slave-risk-sizing">{slave.sizing_summary}</div>
+              {/* The one descriptor that is a sentence rather than a
+                  state -- twenty routes, their mode, their basis, their
+                  ceiling and the fallback, in one line. Caps on a line
+                  that wraps is harder to read, not easier. */}
+              <div className="slave-risk-sizing is-long">{slave.sizing_summary}</div>
             </div>
             <button className="btn btn-small" onClick={() => setEditingRoutes((v) => !v)}>
               {editingRoutes ? "Cancel" : "Edit"}

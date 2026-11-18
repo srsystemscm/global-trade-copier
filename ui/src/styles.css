@@ -955,9 +955,17 @@ code {
   gap: 1px 10px;
   margin-bottom: 8px;
   font-size: 10.5px;
-  text-transform: uppercase;
   letter-spacing: 0.07em;
   font-variant-numeric: tabular-nums;
+}
+
+/* UPPERCASE IS THE LABELS' JOB, not the row's. On the row it also hit
+   the values -- which arrive already cased from the hub -- and turned
+   the multiplier in "x1.00" into "X1.00", a capital X in the middle of
+   a number. */
+.slave-facts .slave-fact-k,
+.slave-risk-facts .slave-fact-k {
+  text-transform: uppercase;
 }
 
 .slave-fact {
@@ -976,7 +984,6 @@ code {
 .slave-row-rc {
   white-space: nowrap;
   font-size: 11px;
-  text-transform: uppercase;
   letter-spacing: 0.06em;
 }
 
@@ -1095,7 +1102,6 @@ code {
   gap: 4px 20px;
   margin-top: 4px;
   font-size: 10.5px;
-  text-transform: uppercase;
   letter-spacing: 0.07em;
   font-variant-numeric: tabular-nums;
 }
@@ -1326,4 +1332,56 @@ code {
 .slave-name-edit input + .btn-tiny,
 .slave-name-edit .btn-tiny:focus {
   opacity: 1;
+}
+
+/* --- what a setting currently says ---------------------------------
+ *
+ * The descriptor beside each label -- "every signal taken in full",
+ * "the broker's own balance", "every master" -- was body text, which
+ * made each row read as a sentence someone had written rather than as
+ * a value the hub is reporting. Set in caps it reads as state, and the
+ * column of them down the card becomes scannable.
+ */
+.slave-risk-row .slave-risk-sizing {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text);
+}
+
+/* The few that are genuinely long -- twenty routes described in one
+   line -- stay sentence-cased, because caps on a line that wraps is
+   harder to read rather than easier. */
+.slave-risk-row .slave-risk-sizing.is-long {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+}
+
+/* Hub facts inside a master card: a footer rule and the smallest type
+   on the page, so repeating them per card costs nothing. */
+.master-card-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 10px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.master-card-foot .k {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  opacity: 0.75;
+  margin-right: 3px;
+}
+
+/* The symbol and action of the last signal: a fact about one moment,
+   not the card's subject, which is the account. */
+.master-sig {
+  font-size: 12px;
+  letter-spacing: 0.02em;
 }

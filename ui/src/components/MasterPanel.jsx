@@ -37,29 +37,7 @@ export default function MasterPanel({ status, trades }) {
 
   return (
     <section className="masters">
-      {/* The section head carries what a master's signals arrive
-          THROUGH -- how long this hub has been listening, and on which
-          two ports. It sits here rather than on each card because it is
-          one hub serving every master: printed per card it would repeat,
-          and with four masters a repeated figure reads as four
-          different ones. It was a panel of its own above the masters
-          until 2026-11-17 and a strip in the page header until
-          2026-11-18. */}
-      <div className="section-head masters-head">
-        <h2>Masters</h2>
-        <div className="hub-state">
-          <div className="hub-state-cell">
-            <span className="hub-state-label">Hub uptime</span>
-            <span className="hub-state-value">{formatUptime(status.uptime_seconds)}</span>
-          </div>
-          <div className="hub-state-cell">
-            <span className="hub-state-label">Signal ports</span>
-            <span className="hub-state-value">
-              SUB :{status.master.sub_port} / PULL :{status.master.pull_port}
-            </span>
-          </div>
-        </div>
-      </div>
+      <h2>Masters</h2>
       {accounts.length === 0 && (
         <p className="muted">
           No master has reported yet. The bridge EA publishes a heartbeat as soon as it
@@ -90,12 +68,31 @@ export default function MasterPanel({ status, trades }) {
                 <span className="value">
                   {sig ? (
                     <>
-                      {sig.symbol} {sig.action}{" "}
+                      <span className="master-sig">
+                        {sig.symbol} {sig.action}
+                      </span>{" "}
                       <span className="muted">{formatAge(now - sig.received_at)}</span>
                     </>
                   ) : (
                     <span className="muted">none this session</span>
                   )}
+                </span>
+              </div>
+              {/* WHAT THIS MASTER'S SIGNALS ARRIVE THROUGH, inside the
+                  card they belong to. Hub-wide facts, so they repeat on
+                  every card -- which is the point: with four masters,
+                  reading one card tells you the whole path for that
+                  master without looking anywhere else, and a card is
+                  what gets screenshotted when one of them goes quiet.
+                  Kept to a footer rule and the smallest type on the
+                  page so repetition costs nothing. */}
+              <div className="master-card-foot">
+                <span>
+                  <span className="k">Uptime</span> {formatUptime(status.uptime_seconds)}
+                </span>
+                <span>
+                  <span className="k">Ports</span> SUB :{status.master.sub_port} / PULL :
+                  {status.master.pull_port}
                 </span>
               </div>
             </div>
