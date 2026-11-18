@@ -183,6 +183,68 @@ With `dry_run=false` the same plan is returned, and the config is written
 through the same path a hand edit takes: validated first, refused as a whole
 if the selection cannot be read, and live without a restart.
 
+## What PM has today, and what it still needs
+
+Read out of the Portfolio Manager source on 2026-11-18
+(`portfolio_manager/portfoliomanager/`), so this is what it is, not what it
+was described as.
+
+**Everything this contract needs already exists in PM's data model.**
+
+| this contract | PM | where |
+|---|---|---|
+| `strategies[].magic` | `unit.magic` | a unit is one strategy-symbol-timeframe-side; `''` for legacy units, which `Member.deployable` already refuses |
+| `strategies[].name` | `Member.label` | built as `strategy symbol TF [side]` |
+| `strategies[].risk_scale` | `portfolio_member.risk_scale` | on the member, committed through the registry CLI as `--member unit_id:risk_scale[:instrument]` |
+| `portfolio.name` | `portfolio.name` | |
+| `portfolio.revision` | `portfolio_version.version` | a portfolio is versioned, which is exactly what `revision` is for |
+
+**`risk_scale` is still there, pinned.** `draft.Member.risk_scale` defaults to
+`1.0` with the comment *"kept at 1: risk is set in the EA's .set at promote"*,
+and `Draft.set_scale()` is written and enforces `0 < scale <= 10`. Chris: *"PM
+originally had a version of risk scale in it that I had removed, but in this
+setting it would make sense again."* It is the field this import was built
+around.
+
+Its bounds and this contract's agree where it matters: **both refuse anything
+above 10**, arrived at separately. PM additionally refuses `0`, where this
+accepts it as "do not trade this strategy here" -- so PM simply never emits
+one, and nothing has to change on either side.
+
+**The saved draft file cannot be used as it stands.** `drafts.save()` writes
+`{"unit_id", "label"}` per member and nothing else, deliberately: *"The file
+keeps unit ids, not figures: opening a draft reads each unit fresh from the
+registry."* A draft therefore carries **no magic numbers and no risk scales**,
+and the copier cannot resolve a `unit_id` -- it does not read the registry, and
+must not.
+
+So PM needs one small export of its own: for each member of a portfolio
+version, read the unit's `magic` and the member's `risk_scale`, and write the
+file at the top of this document. Every join it needs is a query it already
+makes (`registry.portfolio_members()` returns `unit_id, risk_scale,
+instrument`; `registry.units()` carries `magic`).
+
+### One field not to map
+
+**PM's `account` is not this contract's `account`.** A portfolio version is
+committed *for* an account -- `portfolio_version.account_id`, chosen in the
+commit dialog -- which is the account the book is meant to run on. The
+`account` here is the **master terminal that publishes the magic**, which is
+what tells two masters' colliding magic numbers apart. They are different
+things and mapping one onto the other would put a slave's account number where
+a master's belongs.
+
+Leave `strategies[].account` out until PM can say which master an EA runs on.
+Omitted, it is simply not checked; wrong, it would be checked against the
+wrong thing.
+
+### `instrument` is not read
+
+`portfolio_member.instrument` is carried by PM and ignored here. What a signal
+becomes on a slave is `routes`, which is per slave and per target -- an ETF
+slave and a futures slave trade the same strategy as different instruments, so
+a portfolio cannot be the thing that decides it.
+
 ## Version history
 
 **1.0** (2026-11-18) -- first. Magics, names and risk scales, with a
