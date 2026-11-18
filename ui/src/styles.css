@@ -1385,3 +1385,80 @@ code {
   font-size: 12px;
   letter-spacing: 0.02em;
 }
+
+/* A multiplier keeps its lowercase x inside a row set in caps. */
+.slave-risk-sizing .mult {
+  text-transform: none;
+}
+
+/* --- a portfolio, before it is applied ------------------------------
+ *
+ * The plan is the whole point of this panel: an import replaces a
+ * slave's entire strategy selection, so what it would change is read
+ * before anything is written. Laid out like the rows above it, with the
+ * same label column, so it reads as a statement about this slave rather
+ * than as a dialog.
+ */
+.portfolio-import {
+  max-width: 640px;
+}
+
+.import-plan {
+  margin-top: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface2);
+}
+
+.import-plan-head {
+  margin-bottom: 8px;
+}
+
+.import-plan-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 4px 0;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.import-plan-row > div {
+  min-width: 0;
+}
+
+/* Strategies this slave would STOP taking, and the first import on a
+   slave that currently takes everything. Both are losses of coverage,
+   which is the direction worth colouring. */
+.import-warn {
+  margin: 0 0 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--warn);
+  border-radius: 6px;
+  color: var(--warn);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.import-warn-text {
+  color: var(--warn);
+}
+
+.import-scale {
+  display: inline-block;
+  margin-right: 12px;
+}
+
+.form-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.portfolio-import input[type="file"] {
+  font-size: 12px;
+  color: var(--muted);
+}

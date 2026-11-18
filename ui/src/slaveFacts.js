@@ -93,3 +93,25 @@ function pct(value) {
   if (typeof value !== "number") return word(value);
   return `${(value * 100).toFixed(2)}%`;
 }
+
+/**
+ * What drives this slave, named as what it is: an ADAPTER, not a broker.
+ *
+ * `broker_type` is one of mt4 / ibkr / schwab and it selects the adapter
+ * class -- and the mt4 adapter drives MT4 and MT5 terminals alike,
+ * through SlaveBridge.mq4 and SlaveBridge.mq5. So "mt4" beside Darwinex
+ * MT5 Futures was not a wrong value, it was the adapter's name shown
+ * where a reader takes it for the platform. Chris, 2026-11-18:
+ * "Darwinex MT5 lists the broker as MT4."
+ *
+ * The hub genuinely does not know which terminal it is attached to: the
+ * bridge's STATUS reply carries an account, a balance and a
+ * bridge_version, and nothing that says MT4 or MT5. Saying "MT4/MT5" is
+ * the whole of what is known. The fix that would let this be exact is
+ * one line in each bridge -- a "platform" field on that reply -- which
+ * means recompiling and redeploying the EA to every slave terminal.
+ */
+export function adapterLabel(brokerType) {
+  if (brokerType === "mt4") return "MT4/MT5";
+  return String(brokerType || "").toUpperCase();
+}

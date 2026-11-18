@@ -7,7 +7,7 @@
  * behind a toggle. Six slaves already scroll; the plan is more.
  */
 import { useState } from "react";
-import { slaveFacts, slaveRouting } from "../slaveFacts.js";
+import { adapterLabel, slaveFacts, slaveRouting } from "../slaveFacts.js";
 
 export default function SlaveRow({ slave, onTogglePause, onRemove }) {
   const [open, setOpen] = useState(false);
@@ -29,8 +29,8 @@ export default function SlaveRow({ slave, onTogglePause, onRemove }) {
           <div className="slave-name">{slave.name}</div>
           {/* Broker and what it trades on. The mode sentence that used
               to sit here wrapped this column to three lines. */}
-          <div className="slave-meta">
-            {slave.broker_type} &middot; {slaveRouting(slave)}
+          <div className="slave-meta" title="The adapter driving this slave. The MT4 adapter drives MT4 and MT5 terminals alike -- the bridge does not say which.">
+            {adapterLabel(slave.broker_type)} &middot; {slaveRouting(slave)}
           </div>
         </td>
         <td>

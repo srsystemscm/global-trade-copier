@@ -1,0 +1,43 @@
+{
+  "_comment": [
+    "A worked example of the file the Portfolio Manager hands over.",
+    "The contract is docs/portfolio-import.md. Unknown fields -- this one",
+    "included -- are ignored at every level, so PM can carry whatever it",
+    "likes alongside what the copier reads.",
+    "",
+    "Drop this on a slave in Settings -> Risk -> Import to see the plan.",
+    "It is a dry run until Apply is pressed."
+  ],
+
+  "schema": "gtc.portfolio-import/1.0",
+
+  "portfolio": {
+    "id": "pf_example_trend",
+    "name": "Trend (example)",
+    "revision": 1,
+    "exported_at": "2026-11-18T09:12:03Z"
+  },
+
+  "strategies": [
+    {
+      "magic": 1001,
+      "name": "US2000 trend",
+      "risk_scale": 0.5,
+      "account": "44964870",
+      "sharpe": 1.7
+    },
+    {
+      "magic": 1002,
+      "name": "GC breakout",
+      "risk_scale": 1.0,
+      "account": "44964870"
+    },
+    {
+      "magic": 1003,
+      "name": "ETHUSD mean reversion",
+      "risk_scale": 0,
+      "account": "44964870",
+      "_note": "0 is not 'remove it': it is 'do not trade this one here'."
+    }
+  ]
+}

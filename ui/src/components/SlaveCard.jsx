@@ -1,4 +1,4 @@
-import { slaveFacts, slaveRouting } from "../slaveFacts.js";
+import { adapterLabel, slaveFacts, slaveRouting } from "../slaveFacts.js";
 
 export default function SlaveCard({ slave, onTogglePause, onRemove }) {
   // "running" describes the engine OBJECT, and a stalled engine is still
@@ -27,8 +27,8 @@ export default function SlaveCard({ slave, onTogglePause, onRemove }) {
               describe_mode()'s whole sentence -- "own stops from ATR, 10
               routed instruments" -- which wrapped to three lines on a
               tile and repeated the mode the name already gives. */}
-          <div className="slave-meta">
-            {slave.broker_type} &middot; {slaveRouting(slave)}
+          <div className="slave-meta" title="The adapter driving this slave. The MT4 adapter drives MT4 and MT5 terminals alike -- the bridge does not say which.">
+            {adapterLabel(slave.broker_type)} &middot; {slaveRouting(slave)}
           </div>
         </div>
         <span className={`badge ${statusClass}`}>{statusBadge}</span>

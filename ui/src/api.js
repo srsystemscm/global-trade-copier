@@ -25,6 +25,15 @@ export const api = {
   getConfig: () => request("/config"),
   patchConfig: (payload) => request("/config", { method: "PATCH", body: JSON.stringify(payload) }),
   getLogs: (lines = 200) => request(`/logs?lines=${lines}`),
+  // A Portfolio Manager export, applied to one slave. DRY RUN BY
+  // DEFAULT: an import replaces that slave's whole strategy selection,
+  // so the screen asks what it would change before it changes anything.
+  // See docs/portfolio-import.md.
+  importPortfolio: (id, document, dryRun = true) =>
+    request(`/slaves/${id}/import/portfolio?dry_run=${dryRun ? "true" : "false"}`, {
+      method: "POST",
+      body: JSON.stringify(document),
+    }),
   getRisk: () => request("/risk"),
   patchRisk: (payload) => request("/risk", { method: "PATCH", body: JSON.stringify(payload) }),
 };

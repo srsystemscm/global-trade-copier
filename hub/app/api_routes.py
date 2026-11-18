@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from app import magic_filter, master_filter, trade_registry
+from app import magic_filter, master_filter, portfolio_import, trade_registry
 from app.adapters.base import AdapterError
 from app.config import settings
 from app.db import db_cursor, get_config_value, list_logs, set_config_value
@@ -1047,6 +1047,55 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
         slave = get_slave(slave_id)
 
     return await _slave_summary(request, slave)
+
+
+@router.post("/slaves/{slave_id}/import/portfolio")
+async def import_portfolio(
+    slave_id: str, document: Dict[str, Any], request: Request, dry_run: bool = True
+):
+    """Apply a Portfolio Manager export to this slave.
+
+    The file says which strategies a portfolio holds and what share of each
+    EA's signal to take; this writes those as the two keys the engine
+    already reads. The contract is docs/portfolio-import.md.
+
+    DRY RUN BY DEFAULT. An import replaces a slave's whole strategy
+    selection -- a magic the file does not mention is one the slave stops
+    taking -- so the question "what would this change" has to be
+    answerable without answering it by doing it. The same plan comes back
+    either way, so what was approved and what happened are the same words.
+
+    The write goes through patch_slave rather than around it. That route
+    validates the selection before anything is stored, updates the bus so
+    the change takes effect without a restart, and leaves the engine's
+    live tunables consistent -- reimplementing two of those three here is
+    how an import comes to be a slightly different kind of save.
+    """
+    slave = get_slave(slave_id)
+    if slave is None:
+        raise HTTPException(404, f"no slave with id={slave_id!r}")
+
+    try:
+        portfolio = portfolio_import.parse(document)
+    except portfolio_import.PortfolioImportError as exc:
+        # 400 with the reason in words: whoever is holding the file is the
+        # one who can fix it, and "invalid" would send them to the logs.
+        raise HTTPException(400, str(exc)) from exc
+
+    plan = portfolio_import.plan(slave.config, portfolio)
+    if dry_run:
+        return {"applied": False, "plan": plan}
+
+    # Read-modify-write: PATCH replaces config_json wholesale, so the new
+    # config is this slave's own config with two keys changed.
+    config = portfolio_import.apply(slave.config, portfolio)
+    await patch_slave(slave_id, SlaveUpdate(config=config), request)
+    logger.info(
+        "slave=%s imported portfolio %s (%s) rev=%s: %d strategies",
+        slave_id, portfolio.id, portfolio.name, portfolio.revision,
+        len(portfolio.strategies),
+    )
+    return {"applied": True, "plan": plan}
 
 
 @router.delete("/slaves/{slave_id}")

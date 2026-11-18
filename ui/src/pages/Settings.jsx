@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api.js";
 import ConnectionWizard from "../components/ConnectionWizard.jsx";
 import { useHub } from "../hub.jsx";
-import { slaveFacts, slaveRouting } from "../slaveFacts.js";
+import { adapterLabel, slaveFacts, slaveRouting } from "../slaveFacts.js";
 
 const TABS = ["General", "Master", "Slaves", "Risk", "Notifications", "Logs", "Export"];
 
@@ -231,7 +231,9 @@ function SlavesTab({ status, onChanged }) {
         <thead>
           <tr>
             <th>Name</th>
-            <th>Broker</th>
+            {/* ADAPTER, not broker: the value selects the adapter class,
+                and the mt4 one drives MT4 and MT5 terminals alike. */}
+            <th title="Which adapter drives this slave">Adapter</th>
             <th>How it copies</th>
             <th>Status</th>
             <th></th>
@@ -244,7 +246,9 @@ function SlavesTab({ status, onChanged }) {
                 <SlaveName slave={s} onSaved={onChanged} />
                 <div className="slave-meta">{slaveRouting(s)}</div>
               </td>
-              <td>{s.broker_type}</td>
+              <td title="The MT4 adapter drives MT4 and MT5 terminals alike -- the bridge does not report which">
+                {adapterLabel(s.broker_type)}
+              </td>
               {/* The engine selector, and under it the four facts that
                   say what this slave actually does with a signal. The
                   cell used to print describe_mode()'s sentence above the
@@ -510,6 +514,7 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
   const [editingBasis, setEditingBasis] = useState(false);
   const [editingRoutes, setEditingRoutes] = useState(false);
   const [editingMagic, setEditingMagic] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [editingMasters, setEditingMasters] = useState(false);
   const [editingRoll, setEditingRoll] = useState(false);
   const [editingSplit, setEditingSplit] = useState(false);
@@ -533,7 +538,9 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
         <div className="slave-risk-ident">
           <span className="fold-caret">{open ? "\u25be" : "\u25b8"}</span>{" "}
           <strong>{slave.name}</strong>{" "}
-          <span className="muted small">{slave.broker_type}</span>
+          <span className="muted small" title="The adapter driving this slave">
+            {adapterLabel(slave.broker_type)}
+          </span>
           {/* The four worth seeing folded, on one row. What this slave
               takes of a signal, where the size comes from, what it is
               measured against, and where it refuses. An adjusted or
@@ -578,6 +585,16 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
                 <button className="btn btn-tiny" onClick={() => setEditingMagic((v) => !v)}>
                   {editingMagic ? "Cancel" : "Edit"}
                 </button>
+                {/* The same decision, taken from the Portfolio Manager
+                    instead of typed in. It sits beside Edit because it
+                    writes exactly what Edit writes. */}
+                <button
+                  className="btn btn-tiny"
+                  title="Apply a portfolio exported from the Portfolio Manager: its strategies and their risk scales"
+                  onClick={() => setImporting((v) => !v)}
+                >
+                  {importing ? "Cancel" : "Import"}
+                </button>
               </div>
             </div>
           </div>
@@ -594,6 +611,12 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
         <StrategyForm
           slave={slave}
           onDone={() => { setEditingMagic(false); onSaved && onSaved(); }}
+        />
+      )}
+      {importing && (
+        <PortfolioImportForm
+          slave={slave}
+          onDone={() => { setImporting(false); onSaved && onSaved(); }}
         />
       )}
 
@@ -1302,19 +1325,35 @@ function describeScale(slave) {
   // x0.25)" -- because that product is the number being asked about, and
   // multiplying two decimals in your head is how a position comes out
   // four times the size intended.
-  const baseText =
-    base === 1
-      ? "every signal taken in full"
-      : `x${Number(base).toFixed(2)} of signal at intake`;
-  if (entries.length === 0) return baseText;
+  // Chris's words, 2026-11-18. The figure IS a ratio -- what this slave
+  // takes of what the EA signalled -- and the row said it two different
+  // ways depending on the value, so x1.00 read as a sentence about
+  // policy and x0.25 as a measurement. One phrase, always, with the
+  // figure in front of it.
+  //
+  // Returned as elements rather than a string so the multipliers can
+  // opt OUT of the row's uppercase. The descriptors are set in caps and
+  // a plain "x1.00" comes out "X1.00" -- a capital X in the middle of a
+  // number, which is the same defect that was just fixed on the facts
+  // row and would walk straight back in here.
   const listed = entries
     .map(([magic, scale]) => {
-      const each = `${magic} x${Number(scale).toFixed(2)}`;
       const net = Number(base) * Number(scale);
-      return base === 1 ? each : `${each} (= x${net.toFixed(2)})`;
+      return base === 1
+        ? `${magic} x${Number(scale).toFixed(2)}`
+        : `${magic} x${Number(scale).toFixed(2)} (= x${net.toFixed(2)})`;
     })
     .join(", ");
-  return `${baseText}; then ${listed}`;
+  return (
+    <>
+      <span className="mult">x{Number(base).toFixed(2)}</span> ratio of intake signal
+      {entries.length > 0 && (
+        <>
+          ; then <span className="mult">{listed}</span>
+        </>
+      )}
+    </>
+  );
 }
 
 function RiskScaleForm({ slave, onDone }) {
@@ -1879,6 +1918,211 @@ function describeSelection(slave) {
       return sc != null && sc !== 1 ? `${m} x${sc}` : String(m);
     })
     .join(", ");
+}
+
+/**
+ * A Portfolio Manager export, applied to one slave.
+ *
+ * This is the manual step it removes, in Chris's words on 2026-11-18:
+ * "I dont want to have to (if possible) introduce a manual, error prone
+ * step like adding magic numbers and their risk scale by hand."
+ *
+ * TWO STEPS, ALWAYS, and never one. An import REPLACES this slave's
+ * whole strategy selection -- a magic the file does not mention is one
+ * the slave stops taking -- so the file is read, the hub is asked what
+ * applying it would change, and that answer is shown before anything is
+ * written. The plan shown is the plan the hub returns, not one built
+ * here, so what is approved and what happens are the same words.
+ *
+ * The file never leaves this machine except to the hub. Nothing fetches
+ * a portfolio: see docs/portfolio-import.md.
+ */
+function PortfolioImportForm({ slave, onDone }) {
+  const [document_, setDocument] = useState(null);
+  const [fileName, setFileName] = useState(null);
+  const [plan, setPlan] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  async function choose(event) {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    setErr(null);
+    setPlan(null);
+    setDocument(null);
+    setFileName(file.name);
+
+    let parsed;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch (e) {
+      // Said here rather than sent to the hub: a file that is not JSON
+      // never had a chance of being a portfolio.
+      setErr(`${file.name} is not readable JSON -- ${e.message}`);
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const res = await api.importPortfolio(slave.id, parsed, true);
+      setDocument(parsed);
+      setPlan(res.plan);
+    } catch (e) {
+      setErr(importError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function apply() {
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.importPortfolio(slave.id, document_, false);
+      onDone && onDone();
+    } catch (e) {
+      setErr(importError(e));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="slave-risk-form portfolio-import">
+      <label>
+        Portfolio file from PM
+        <input type="file" accept="application/json,.json" onChange={choose} disabled={busy} />
+      </label>
+
+      {busy && !plan && <p className="muted small">Reading {fileName}...</p>}
+      {err && <div className="banner banner-error">{err}</div>}
+
+      {plan && (
+        <>
+          <div className="import-plan">
+            <div className="import-plan-head">
+              <strong>{plan.portfolio.name || plan.portfolio.id}</strong>{" "}
+              <span className="muted small">
+                {plan.portfolio.revision != null && `rev ${plan.portfolio.revision} `}
+                &middot; {plan.strategies} strateg{plan.strategies === 1 ? "y" : "ies"}
+                {" "}&middot; {fileName}
+              </span>
+            </div>
+
+            {/* The largest change this can make, and "2 added" understates
+                it: every slave today takes every strategy. */}
+            {plan.narrows_from_every_magic && (
+              <p className="import-warn">
+                This slave takes <strong>every strategy</strong> today. Applying this
+                narrows it to the {plan.strategies} listed here &mdash; anything else the
+                master sends stops reaching it.
+              </p>
+            )}
+
+            {plan.replaces_import && (
+              <p className="muted small">
+                Replaces an earlier import:{" "}
+                {plan.replaces_import.portfolio || plan.replaces_import.portfolio_id}
+                {plan.replaces_import.revision != null &&
+                  ` rev ${plan.replaces_import.revision}`}
+                {plan.replaces_import.imported_at &&
+                  `, applied ${plan.replaces_import.imported_at}`}
+                .
+              </p>
+            )}
+
+            <PlanLine
+              label="Strategies added"
+              values={plan.magics_added}
+              empty="none"
+            />
+            {/* Spelled out rather than counted: a strategy this slave
+                stops taking is the change someone most needs to see. */}
+            <PlanLine
+              label="No longer taken"
+              values={plan.magics_removed}
+              empty="none"
+              warn
+            />
+
+            <div className="import-plan-row">
+              <span className="row-k">Risk scales</span>
+              <div>
+                {plan.scales_changed.length === 0 ? (
+                  <span className="muted">unchanged</span>
+                ) : (
+                  plan.scales_changed.map((c) => (
+                    <span key={c.magic} className="import-scale">
+                      {c.magic} {c.from == null ? "new" : `x${Number(c.from).toFixed(2)}`}
+                      {" \u2192 "}
+                      x{Number(c.to).toFixed(2)}
+                    </span>
+                  ))
+                )}
+                {plan.unchanged > 0 && (
+                  <span className="muted small"> &middot; {plan.unchanged} unchanged</span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="form-actions">
+            <button className="btn btn-primary btn-small" onClick={apply} disabled={busy}>
+              {busy ? "Applying..." : "Apply to this slave"}
+            </button>
+            <span className="muted small">
+              Nothing has been written yet. Sizing, routes, masters and every limit on this
+              slave are untouched either way.
+            </span>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function PlanLine({ label, values, empty, warn }) {
+  return (
+    <div className="import-plan-row">
+      <span className="row-k">{label}</span>
+      <div className={warn && values.length > 0 ? "import-warn-text" : undefined}>
+        {values.length === 0 ? <span className="muted">{empty}</span> : values.join(", ")}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * A failed import, said in words someone can act on.
+ *
+ * The hub answers 400 with the reason -- which entry, and what is wrong
+ * with it -- because whoever is holding the file is the one who can fix
+ * it. The one case it cannot explain is its own absence: the route
+ * arrives with this change, so a hub that has not been restarted since
+ * does not have it.
+ *
+ * MEASURED, not assumed: that hub answers 405, not 404. A POST to a path
+ * the API router does not define falls through to the UI's catch-all,
+ * which is registered for GET -- so the method is what it refuses. The
+ * 404 is kept beside it because it is what the same request would answer
+ * if the catch-all ever stopped matching first.
+ */
+function importError(error) {
+  const text = String(error.message || error);
+  if (/-> 40[45]:/.test(text)) {
+    return (
+      "This hub has no portfolio import yet. The route is part of this change, " +
+      "and it starts answering when the hub is next restarted -- the UI alone " +
+      "cannot add it."
+    );
+  }
+  const detail = /-> \d+: (.*)$/.exec(text);
+  if (!detail) return text;
+  try {
+    const parsed = JSON.parse(detail[1]);
+    return parsed.detail || detail[1];
+  } catch {
+    return detail[1];
+  }
 }
 
 function StrategyForm({ slave, onDone }) {
