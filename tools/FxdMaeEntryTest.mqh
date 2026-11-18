@@ -125,28 +125,50 @@ input string POINT_FORMAT_RULES  = "0.001=0.01,0.00001=0.0001,0.000001=0.0001";
 
 
 //+------------------------------------------------------------------+
-void OnStart()
+//+------------------------------------------------------------------+
+//| SPLIT INTO THREE STEPS (1.06), so that something other than this  |
+//| script can drive them.                                            |
+//|                                                                   |
+//| This file placed one trade, waited, widened its stop and closed   |
+//| it -- the right shape for "does one EA's leg copy correctly". The |
+//| go-live gate asks a different question: do ALL of them, at once.  |
+//| That cannot be a loop over this body, because the body sleeps:    |
+//| twenty units would open over several minutes and never be the     |
+//| simultaneous burst the test is for.                               |
+//|                                                                   |
+//| So opening, widening and closing are separate, and the caller      |
+//| decides the order. OnStart below still runs them 1-2-3 and this   |
+//| script behaves exactly as it did; the gate opens every unit first |
+//| and only then waits once for all of them.                          |
+//+------------------------------------------------------------------+
+bool TradingIsAllowed()
   {
-   string symbol = Symbol();
-   int    digits = (int)MarketInfo(symbol, MODE_DIGITS);
+   if(IsTradeAllowed())
+      return(true);
+   Print("ERROR: trading is not allowed. Enable AutoTrading, and tick ",
+         "'Allow live trading' in the script's own properties dialog.");
+   return(false);
+  }
 
-   Print("FxdMaeEntryTest ", SCRIPT_VERSION, " on ", symbol,
-         " (", GoLong ? "LONG" : "SHORT", "), account ", AccountNumber());
-
-   if(!IsTradeAllowed())
-     {
-      Print("ERROR: trading is not allowed. Enable AutoTrading, and tick ",
-            "'Allow live trading' in the script's own properties dialog.");
-      return;
-     }
+//+------------------------------------------------------------------+
+//| Open one unit's leg: size it from `tf`'s ATR and send it, as one  |
+//| order or as several. Returns how many orders actually opened, and |
+//| fills the arrays with what has to be modified and closed later.   |
+//|                                                                   |
+//| Does NOT sleep, modify or close. See the note above.               |
+//+------------------------------------------------------------------+
+int OpenLeg(string symbol, int magic, bool goLong, ENUM_TIMEFRAMES tf,
+            int &tickets[], double &ops[], double &oldSls[], int &type)
+  {
+   int digits = (int)MarketInfo(symbol, MODE_DIGITS);
 
    //--- blocks 841 / 26: the ATR the whole trade is built from -------------
-   double atr = iATR(symbol, BASE_TF, ATR_PERIOD, ATR_SHIFT);
+   double atr = iATR(symbol, tf, ATR_PERIOD, ATR_SHIFT);
    if(atr <= 0.0)
      {
       Print("ERROR: iATR returned ", atr, " -- not enough ",
-            EnumToString(BASE_TF), " history on ", symbol, " to compute it.");
-      return;
+            EnumToString(tf), " history on ", symbol, " to compute it.");
+      return(0);
      }
 
    double atrStpLs = ATR_SL_MULT * atr;   // v::ATR_STP_LS
@@ -164,13 +186,13 @@ void OnStart()
    double lots = DynamicLotsRisk(symbol, slPips);
    if(lots <= 0.0)
      {
-      Print("ERROR: computed lot size of ", lots, " -- nothing to send.");
-      return;
+      Print("ERROR: computed lot size of ", lots, " -- nothing to send on ", symbol, ".");
+      return(0);
      }
    lots = AlignLots(symbol, lots);
 
    //--- market order, stops derived from the fill price --------------------
-   int type = GoLong ? OP_BUY : OP_SELL;
+   type = goLong ? OP_BUY : OP_SELL;
 
    //--- NOT the levels anything is sent with. Each order below prices its
    //--- own stop from its own quote, because each is a separate trade at
@@ -179,9 +201,7 @@ void OnStart()
    //--- `sl` and `tp` sitting here would read as the levels in force.
    bool hasTp = (tpPips > 0.0);
 
-   int magic = MagicStart + (int)StringToInteger(Group);
-
-   Print("  ATR(", ATR_PERIOD, ",", EnumToString(BASE_TF), ",shift ", ATR_SHIFT, ") = ",
+   Print("  ATR(", ATR_PERIOD, ",", EnumToString(tf), ",shift ", ATR_SHIFT, ") = ",
          DoubleToStr(atr, digits));
    PrintTimeframeProbe(symbol, digits, magic);
    Print("  stop distance = ", DoubleToStr(ATR_SL_MULT, 2), " x ATR = ",
@@ -204,16 +224,13 @@ void OnStart()
    if(pieces <= 0)
      {
       Print("ERROR: ", DoubleToStr(lots, 2), " lots could not be split into orders.");
-      return;
+      return(0);
      }
    if(pieces > 1)
       Print("  ", DoubleToStr(lots, 2), " lots is over this broker's per-order maximum of ",
             DoubleToStr(MarketInfo(symbol, MODE_MAXLOT), 2),
             " -- sending it as ", pieces, " orders");
 
-   int    tickets[];
-   double ops[];
-   double oldSls[];
    ArrayResize(tickets, pieces);
    ArrayResize(ops, pieces);
    ArrayResize(oldSls, pieces);
@@ -224,14 +241,14 @@ void OnStart()
       //--- Re-read per order. Each piece is its own trade at its own
       //--- price, and deriving all of them from one pre-trade quote
       //--- would put stops where no fill happened.
-      double pxI = GoLong ? MarketInfo(symbol, MODE_ASK) : MarketInfo(symbol, MODE_BID);
+      double pxI = goLong ? MarketInfo(symbol, MODE_ASK) : MarketInfo(symbol, MODE_BID);
       pxI = NormalizeDouble(pxI, digits);
       double slI = AlignStopLoss(symbol, type, pxI, 0.0, slPips);
       double tpI = (tpPips > 0.0) ? AlignTakeProfit(symbol, type, pxI, tpPips) : 0.0;
 
       int t = OrderSend(symbol, type, chunks[pi], pxI,
                         (int)(SPREAD_SLIPPAGE * PipValue(symbol)),
-                        slI, tpI, MyComment, magic, 0, GoLong ? clrBlue : clrRed);
+                        slI, tpI, MyComment, magic, 0, goLong ? clrBlue : clrRed);
       if(t < 0)
         {
          //--- Not a return. Whatever opened still has to be modified and
@@ -260,75 +277,128 @@ void OnStart()
 
    if(placed <= 0)
      {
-      Print("ERROR: nothing opened.");
-      return;
+      Print("ERROR: nothing opened on ", symbol, " for magic ", magic, ".");
+      return(0);
      }
    if(placed < pieces)
       Print("  NOTE: only ", placed, " of ", pieces, " orders opened -- the test is ",
             "running on less than the size it sized for.");
+   return(placed);
+  }
+
+//+------------------------------------------------------------------+
+//| The MAE stop-widening step, for everything OpenLeg placed.        |
+//|                                                                   |
+//| `delayMs` is time for the MASTER BRIDGE to see the opening stop   |
+//| before it is changed. Taken once, not once per order -- and the   |
+//| gate takes it once for every unit together, which is why it is a  |
+//| parameter rather than a sleep inside the loop.                     |
+//+------------------------------------------------------------------+
+void MaeLeg(string symbol, int digits, int type,
+            int &tickets[], double &ops[], double &oldSls[], int placed, int delayMs)
+  {
+   if(!DoMaeModify)
+     {
+      Print("MAE modify skipped (DoMaeModify = false)");
+      return;
+     }
+   if(delayMs > 0)
+      Sleep(delayMs);
+   for(int mi = 0; mi < placed; mi++)
+     {
+      if(oldSls[mi] <= 0.0)
+        {
+         Print("MAE modify skipped for ticket ", tickets[mi], ": no stop to widen.");
+         continue;
+        }
+      DoMaeStep(tickets[mi], ops[mi], oldSls[mi], type, symbol, digits);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Hold for `holdMs`, then close every ticket -- or close at once if |
+//| the script is stopped. Separated so a caller holding several      |
+//| units' legs waits ONCE for all of them.                            |
+//+------------------------------------------------------------------+
+void HoldThenClose(string symbol, int digits, int &tickets[], int placed, int holdMs)
+  {
+   if(holdMs <= 0)
+     {
+      Print("Leaving ", placed, " ticket(s) open (CloseAfterMs = 0) -- ",
+            "these trades and every slave leg they opened are yours to close");
+      return;
+     }
+
+   //--- INTERRUPTIBLE, not one long Sleep(). At 3000ms a blind sleep
+   //--- was fine; at the minutes these tests now need, a script that
+   //--- cannot be stopped is one you have to kill the terminal to get
+   //--- out of -- and killing it mid-wait is exactly how a position
+   //--- gets left open with nothing watching it.
+   //---
+   //--- So it waits in one-second steps, and CLOSES ON THE WAY OUT if
+   //--- you remove the script. The whole point of a timed close is
+   //--- that nothing is left behind; stopping early should not undo
+   //--- that.
+   int waited = 0;
+   bool stopped = false;
+   while(waited < holdMs)
+     {
+      if(IsStopped())
+        {
+         stopped = true;
+         break;
+        }
+      int step = (holdMs - waited > 1000) ? 1000 : (holdMs - waited);
+      Sleep(step);
+      waited += step;
+     }
+   if(stopped)
+      Print("Script stopped after ", waited, "ms of ", holdMs,
+            " -- closing ", placed, " ticket(s) anyway rather than leaving them open");
+   else
+      Print("Held ", placed, " ticket(s) for ", waited, "ms; closing now");
+   //--- EVERY piece, and no early exit. One close failing must not
+   //--- leave the others open: that is the state this whole branch
+   //--- exists to prevent.
+   for(int ci = 0; ci < placed; ci++)
+      CloseTicket(tickets[ci], symbol, digits);
+  }
+
+//+------------------------------------------------------------------+
+//| GUARDED (1.06). The gate includes this file for OpenLeg, DoMaeStep
+//| and CloseTicket, and brings its own OnStart -- two in one build is
+//| a compile error. Everything above is shared; this is the part that
+//| is only this script's.
+#ifndef MAE_NO_ONSTART
+void OnStart()
+  {
+   string symbol = Symbol();
+   int    digits = (int)MarketInfo(symbol, MODE_DIGITS);
+
+   Print("FxdMaeEntryTest ", SCRIPT_VERSION, " on ", symbol,
+         " (", GoLong ? "LONG" : "SHORT", "), account ", AccountNumber());
+
+   if(!TradingIsAllowed())
+      return;
+
+   int magic = MagicStart + (int)StringToInteger(Group);
+
+   int    tickets[];
+   double ops[];
+   double oldSls[];
+   int    type = 0;
+
+   int placed = OpenLeg(symbol, magic, GoLong, BASE_TF, tickets, ops, oldSls, type);
+   if(placed <= 0)
+      return;
 
    //--- Deliberately no early returns from here on: whatever happens to the
    //--- MAE step, the position still has to be closed, or a skipped modify
    //--- would silently leave a live trade behind.
-   if(!DoMaeModify)
-      Print("MAE modify skipped (DoMaeModify = false)");
-   else
-     {
-      //--- Let the master bridge EA observe the original stop first. Once,
-      //--- not once per order: the delay is for the bridge to see the
-      //--- opening stop, and it has seen all of them by now.
-      Sleep(MAE_DELAY_MS);
-      for(int mi = 0; mi < placed; mi++)
-        {
-         if(oldSls[mi] <= 0.0)
-           {
-            Print("MAE modify skipped for ticket ", tickets[mi], ": no stop to widen.");
-            continue;
-           }
-         DoMaeStep(tickets[mi], ops[mi], oldSls[mi], type, symbol, digits);
-        }
-     }
-
-   if(CloseAfterMs > 0)
-     {
-      //--- INTERRUPTIBLE, not one long Sleep(). At 3000ms a blind sleep
-      //--- was fine; at the minutes these tests now need, a script that
-      //--- cannot be stopped is one you have to kill the terminal to get
-      //--- out of -- and killing it mid-wait is exactly how a position
-      //--- gets left open with nothing watching it.
-      //---
-      //--- So it waits in one-second steps, and CLOSES ON THE WAY OUT if
-      //--- you remove the script. The whole point of a timed close is
-      //--- that nothing is left behind; stopping early should not undo
-      //--- that.
-      int waited = 0;
-      bool stopped = false;
-      while(waited < CloseAfterMs)
-        {
-         if(IsStopped())
-           {
-            stopped = true;
-            break;
-           }
-         int step = (CloseAfterMs - waited > 1000) ? 1000 : (CloseAfterMs - waited);
-         Sleep(step);
-         waited += step;
-        }
-      if(stopped)
-         Print("Script stopped after ", waited, "ms of ", CloseAfterMs,
-               " -- closing ", placed, " ticket(s) anyway rather than leaving them open");
-      else
-         Print("Held ", placed, " ticket(s) for ", waited, "ms; closing now");
-      //--- EVERY piece, and no early exit. One close failing must not
-      //--- leave the others open: that is the state this whole branch
-      //--- exists to prevent.
-      for(int ci = 0; ci < placed; ci++)
-         CloseTicket(tickets[ci], symbol, digits);
-     }
-   else
-      Print("Leaving ", placed, " ticket(s) open (CloseAfterMs = 0) -- ",
-            "these trades and every slave leg they opened are yours to close");
+   MaeLeg(symbol, digits, type, tickets, ops, oldSls, placed, MAE_DELAY_MS);
+   HoldThenClose(symbol, digits, tickets, placed, CloseAfterMs);
   }
+#endif
 
 //+------------------------------------------------------------------+
 //| blocks 4302 / 4319: NewSLTPmode "percent", RelativeTo "openprice" |
