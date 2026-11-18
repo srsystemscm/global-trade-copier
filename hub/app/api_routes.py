@@ -281,6 +281,94 @@ def _sizing_summary(config: Dict[str, Any]) -> str:
     return _tally((r.get("sizing") for r in routes), "routes")
 
 
+def _sizing_blocks(config: Dict[str, Any]) -> List[Optional[Dict[str, Any]]]:
+    """Every sizing block actually in force on this slave.
+
+    One block for a slave that carries one, a block per target for the
+    {"MGC": {...}} form, and a block per route where routes carry their
+    own -- merged over the slave block, because merge_sizing lets a route
+    name only the keys it changes and reading such a route alone reports
+    the slave's own ceiling as absent.
+    """
+    per_target = _per_target_sizing(config)
+    if per_target:
+        return list(per_target.values())
+
+    slave_block = config.get("sizing") or None
+    routes = config.get("routes") or []
+    if routes and any(r.get("sizing") for r in routes):
+        return [{**(slave_block or {}), **(r.get("sizing") or {})} for r in routes]
+    return [slave_block]
+
+
+def _sizing_facts(config: Dict[str, Any]) -> Dict[str, Any]:
+    r"""The same facts as `sizing_summary`, as values rather than a sentence.
+
+    Every screen that shows a slave was folding its own line out of that
+    sentence, and a sentence drifts. When the pct_risk wording changed on
+    2026-11-16 the Risk tab's own test for it (/\d+\.\d+% of/) stopped
+    matching, so the card printed the raw summary where a calibration line
+    belonged -- and the dashboard went on reading a ceiling back out with
+    a regex over "capped 2.50%". Chris, looking at the slave column:
+    "stale info".
+
+    Four values, decided here once, so the tiles, the list, the Risk tab
+    and the ops hub cannot answer differently:
+
+      mode    where the SIZE comes from -- the master's staked risk, or
+              the master's lot count carried across unchanged
+      basis   what a percentage is a percentage OF
+      cap     the ceiling past which a signal is refused
+      scale   this slave's calibration against what the EA signalled
+
+    "mixed" rather than one of the values means the blocks in force do
+    not agree, which on a twenty-route slave is a real state and reading
+    it as any single answer would be a lie about nineteen of them.
+    """
+    blocks = _sizing_blocks(config)
+
+    def agreed(read):
+        seen = []
+        for block in blocks:
+            value = read(block or {})
+            if value not in seen:
+                seen.append(value)
+        return seen[0] if len(seen) == 1 else "mixed"
+
+    def mode_of(block: Dict[str, Any]) -> str:
+        mode = block.get("mode")
+        # The two live shapes, named for what they DO. pct_risk stakes
+        # what the master staked -- apply_master_risk replaces risk_pct on
+        # every signal a modern bridge sends -- and no block at all sends
+        # the master's lot count across unchanged. The other three modes
+        # are their own answer and are returned as they are.
+        if not mode:
+            return "mirror"
+        return "master" if mode == "pct_risk" else mode
+
+    def basis_of(block: Dict[str, Any]) -> Optional[str]:
+        if not block.get("mode"):
+            return None
+        # compute_size reads balance when nothing says otherwise, so a
+        # pct_risk block without the key is sized against balance and the
+        # screen should say balance rather than nothing.
+        return block.get("capital_base", "balance") if block["mode"] == "pct_risk" else None
+
+    return {
+        "mode": agreed(mode_of),
+        "basis": agreed(basis_of),
+        "cap_pct": agreed(lambda b: b.get("max_risk_pct")),
+        # 1.0 is a SETTING, not an absence: it means this slave takes the
+        # EA's signalled risk unscaled. Reported as a number so no screen
+        # has to decide what a null means.
+        "risk_scale": float(config.get("risk_scale") or 1.0),
+        # How many strategies are off that headline figure. The figures
+        # themselves are on the Risk calibration row; this is the count
+        # that says to go and look.
+        "scale_overrides": len(config.get("risk_scale_by_magic") or {}),
+    }
+
+
 def _describe_route_sizing(block: Optional[Dict[str, Any]]) -> str:
     """A route's sizing, which may be whole, absent, or a partial override.
 
@@ -632,6 +720,10 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         # A line a reader can act on without opening the JSON, and the only
         # place the per-route case is represented at all.
         "sizing_summary": _sizing_summary(slave.config),
+        # The same facts as numbers. See _sizing_facts: the screens read
+        # these, so a change of wording above cannot quietly change what
+        # the slave column says it stakes.
+        "sizing_facts": _sizing_facts(slave.config),
         # Whether editing slave-level sizing would do anything. Routes carry
         # their own and win over the shared block, so offering a slave-level
         # control on a route-based slave is a setting that saves cleanly and
