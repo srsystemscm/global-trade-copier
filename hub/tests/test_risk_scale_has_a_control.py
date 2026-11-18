@@ -70,15 +70,39 @@ def test_every_form_on_the_settings_page_is_mounted_somewhere(source):
 
 def test_the_control_sits_on_the_risk_card_not_inside_strategy_selection(source):
     """It has to be reachable from the line that names it. Being somewhere
-    on the page was already true and was not enough."""
-    assert re.search(r'muted small">Risk calibration<', source), (
+    on the page was already true and was not enough.
+
+    MATCHED ON THE LABEL, NOT ON ITS CSS CLASS. This read
+    `muted small">Risk calibration<` until 2026-11-18, when every row
+    label on the card moved to one shared style -- so it broke on a
+    change that moved no control anywhere, which is not the thing it is
+    here to catch. The ordering half went with it: the row it compared
+    against, "Strategy selection", is now a control in the card's head,
+    where it is above the whole body by construction.
+
+    What replaces it is the property the name actually claims: the
+    editor is mounted BY THE CARD and not from inside the strategy
+    editor, which is where it used to hide."""
+    assert re.search(r'>Risk calibration<', source), (
         "no Risk calibration row on the card"
     )
-    # Ordered: the row belongs above the strategy selection it used to hide
-    # inside, because it is read off the headline at the top.
-    assert source.index('muted small">Risk calibration<') < source.index(
-        'muted small">Strategy selection<'
+    card = _body(source, "SlaveRisk")
+    assert "<RiskScaleForm" in card, (
+        "the risk calibration editor is not mounted by the card that "
+        "leads with the figure"
     )
+    assert "<RiskScaleForm" not in _body(source, "StrategyForm"), (
+        "the calibration editor is back inside the strategy selection, "
+        "which is where it was unreachable from the line naming it"
+    )
+
+
+def _body(source: str, function: str) -> str:
+    """One top-level function's source, by name."""
+    start = source.index(f"function {function}(")
+    rest = source[start + 1:]
+    end = re.search(r"^function \w+\(", rest, re.M)
+    return rest if end is None else rest[: end.start()]
 
 
 def test_the_slave_wide_scale_has_exactly_one_editor(source):
@@ -133,7 +157,10 @@ def test_a_route_sized_slave_can_edit_its_cap(source):
     figure means on a slave that sizes per route."""
     assert "function RouteSizingForm" in source
     assert "<RouteSizingForm" in source, "written and never mounted again"
-    assert re.search(r'muted small">Sizing on every route<', source), (
+    # On the label, not on its CSS class: the labels on this card moved
+    # to one shared style on 2026-11-18 and this broke without any
+    # control having moved.
+    assert re.search(r'>Sizing on every route<', source), (
         "no row to reach the editor from"
     )
     # It must say how many routes it is about to rewrite. A bulk edit
