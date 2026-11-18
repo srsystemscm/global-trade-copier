@@ -21,3 +21,12 @@ hub/config/hub_key.txt
 # Built VPS packages. A release artefact, rebuilt from source on demand,
 # and large enough that committing one would be noticed in every later diff.
 dist/
+
+# Compiled MQL4. The source is tracked and a terminal recompiles it in
+# seconds; an .ex4 is whatever MetaEditor last produced on one machine.
+tools/*.ex4
+
+# The gate's unit list (tools/make_gate_list.py). A SNAPSHOT of which
+# units were live when it ran -- committing one would have the next
+# person fire a list that was true last month.
+tools/gtc-gate-list.csv
