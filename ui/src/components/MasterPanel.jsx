@@ -9,7 +9,7 @@
  * it last sent a signal. They are different questions: a terminal can be
  * alive and flat for hours.
  */
-export default function MasterPanel({ status, trades, wsConnected }) {
+export default function MasterPanel({ status, trades }) {
   if (!status) {
     return <div className="panel">Loading master status...</div>;
   }
@@ -37,26 +37,29 @@ export default function MasterPanel({ status, trades, wsConnected }) {
 
   return (
     <section className="masters">
-      <div className="panel hub-strip">
-        <div className="master-stat">
-          <span className="label">Hub uptime</span>
-          <span className="value">{formatUptime(status.uptime_seconds)}</span>
-        </div>
-        <div className="master-stat">
-          <span className="label">Signal ports</span>
-          <span className="value">
-            SUB :{status.master.sub_port} / PULL :{status.master.pull_port}
-          </span>
-        </div>
-        <div className="master-stat">
-          <span className="label">Live feed</span>
-          <span className={`badge ${wsConnected ? "badge-ok" : "badge-error"}`}>
-            {wsConnected ? "connected" : "disconnected"}
-          </span>
+      {/* The section head carries what a master's signals arrive
+          THROUGH -- how long this hub has been listening, and on which
+          two ports. It sits here rather than on each card because it is
+          one hub serving every master: printed per card it would repeat,
+          and with four masters a repeated figure reads as four
+          different ones. It was a panel of its own above the masters
+          until 2026-11-17 and a strip in the page header until
+          2026-11-18. */}
+      <div className="section-head masters-head">
+        <h2>Masters</h2>
+        <div className="hub-state">
+          <div className="hub-state-cell">
+            <span className="hub-state-label">Hub uptime</span>
+            <span className="hub-state-value">{formatUptime(status.uptime_seconds)}</span>
+          </div>
+          <div className="hub-state-cell">
+            <span className="hub-state-label">Signal ports</span>
+            <span className="hub-state-value">
+              SUB :{status.master.sub_port} / PULL :{status.master.pull_port}
+            </span>
+          </div>
         </div>
       </div>
-
-      <h2>Masters</h2>
       {accounts.length === 0 && (
         <p className="muted">
           No master has reported yet. The bridge EA publishes a heartbeat as soon as it
@@ -103,14 +106,6 @@ export default function MasterPanel({ status, trades, wsConnected }) {
   );
 }
 
-function formatUptime(seconds) {
-  const s = Math.floor(seconds);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  return `${h}h ${m}m ${sec}s`;
-}
-
 function formatAge(seconds) {
   const s = Math.max(0, Math.round(seconds));
   if (s < 90) return `${s}s ago`;
@@ -119,4 +114,11 @@ function formatAge(seconds) {
   const h = Math.round(m / 60);
   if (h < 48) return `${h}h ago`;
   return `${Math.round(h / 24)}d ago`;
+}
+
+function formatUptime(seconds) {
+  const s = Math.floor(seconds || 0);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return `${h}h ${m}m ${s % 60}s`;
 }

@@ -1,14 +1,26 @@
+/* Black, not navy.
+ *
+ * This runs on a trading desk beside terminals that are black, and the
+ * old palette was #0f1420 navy throughout -- a panel on it read as a
+ * slab rather than as a surface. The page is now true black, panels are
+ * graphite lifted off it, and borders are hairlines. --border and
+ * --surface2 were used by a dozen rules and defined by none of them,
+ * each falling back to a literal: they are tokens now.
+ */
 :root {
-  --bg: #0f1420;
-  --panel: #161d2e;
-  --panel-border: #262f45;
-  --text: #e6e9f0;
-  --muted: #8b93a7;
-  --accent: #4f8cff;
-  --ok: #35c98f;
-  --warn: #e8b339;
-  --error: #f0556b;
-  --radius: 10px;
+  --bg: #000000;
+  --surface: #0b0c0e;
+  --surface2: #141619;
+  --panel: var(--surface);
+  --panel-border: #212429;
+  --border: #212429;
+  --text: #e9ebef;
+  --muted: #868d99;
+  --accent: #6f9df5;
+  --ok: #3ecf95;
+  --warn: #e0ae3c;
+  --error: #f25c72;
+  --radius: 8px;
 }
 
 * {
@@ -28,42 +40,114 @@ body {
   flex-direction: column;
 }
 
+/* Brand and tabs left, hub state hard right. */
 .top-nav {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 24px;
-  border-bottom: 1px solid var(--panel-border);
-  background: var(--panel);
+  gap: 24px;
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
 }
 
+.nav-left {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  min-width: 0;
+}
+
+/* GTC carries it; the full name is kept underneath because the hub
+   reports to an ops hub that knows this machine by its full name. */
 .brand {
-  font-weight: 600;
-  font-size: 1.1rem;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.05;
+}
+
+.brand-mark {
+  font-weight: 700;
+  font-size: 1.15rem;
+  letter-spacing: 0.08em;
+}
+
+.brand-full {
+  font-size: 0.56rem;
+  text-transform: uppercase;
+  letter-spacing: 0.17em;
+  color: var(--muted);
+  margin-top: 3px;
 }
 
 .nav-links {
   display: flex;
-  gap: 20px;
+  gap: 4px;
 }
 
 .nav-links a {
   color: var(--muted);
   text-decoration: none;
-  font-size: 0.95rem;
-  padding: 6px 4px;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 8px 12px;
+  border-radius: 6px;
   border-bottom: 2px solid transparent;
+}
+
+.nav-links a:hover {
+  color: var(--text);
 }
 
 .nav-links a.active {
   color: var(--text);
+  background: var(--surface2);
   border-bottom-color: var(--accent);
 }
 
+/* Uptime, ports, live feed. Hub-wide facts, so they sit on every tab
+   rather than in a panel on one of them. */
+.hub-state {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.hub-state-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  line-height: 1.1;
+}
+
+.hub-state-label {
+  font-size: 0.56rem;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--muted);
+}
+
+.hub-state-value {
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.hub-state .badge {
+  margin: 0;
+}
+
+/* 1200px was a reading width, and this is not reading. The copier's
+   order table is eleven columns wide with the slave legs in the last of
+   them, and at 1200 the legs column lost its right-hand figures --
+   slippage and latency -- off the edge of a scroll. */
 .main-content {
   flex: 1;
-  padding: 24px;
-  max-width: 1200px;
+  padding: 18px 24px 24px;
+  max-width: 1500px;
   width: 100%;
   margin: 0 auto;
 }
@@ -852,3 +936,394 @@ code {
 .mode-cell { display: flex; flex-direction: column; gap: 0.25rem; align-items: flex-start; }
 .mode-cell select { font-size: 0.85em; padding: 0.15rem 0.3rem; }
 .mode-cell .banner-error { margin: 0.2rem 0 0; font-size: 0.8em; }
+
+/* --- the slave column: three facts, not a sentence ------------------
+ *
+ * Chris, looking at the dashboard on 2026-11-17: "the slave column info
+ * has stale info ... sizing info needs pared down". It carried
+ * describe_mode()'s sentence under the name and _sizing_summary()'s
+ * under that -- together about twenty words, wrapping to five lines on
+ * a 260px tile, and both of them prose that had already drifted once.
+ *
+ * Deliberately SMALLER than .slave-meta, which is itself smaller than
+ * the name: three sizes, so the eye lands on the account first, then
+ * what it trades, then how it sizes.
+ */
+.slave-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 1px 10px;
+  margin-bottom: 8px;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-variant-numeric: tabular-nums;
+}
+
+.slave-fact {
+  display: contents;
+}
+
+.slave-fact-k {
+  color: var(--muted);
+}
+
+.slave-fact-v {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.slave-row-rc {
+  white-space: nowrap;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* --- Copier: one window, legs aligned down the column ----------------
+ *
+ * The day picker was on the page title row, two panels away from the
+ * table it filters. The counts, the picker and the orders are one
+ * instrument and now share one frame.
+ */
+.copier-panel {
+  padding: 0;
+  overflow: hidden;
+}
+
+.copier-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface2);
+}
+
+.copier-toolbar .copier-summary {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  gap: 1.6rem;
+}
+
+.copier-toolbar .copier-stat-n {
+  font-size: 1.1rem;
+}
+
+.copier-master-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 14px 6px;
+  margin: 0;
+}
+
+.copier-panel .copier-table-wrap {
+  border: 0;
+  border-radius: 0;
+  padding: 0 14px 14px;
+}
+
+/* The legs column runs to the right border: it is the widest thing in
+   the table and was being squeezed by eleven columns competing for the
+   same width. */
+.copier-table th:last-child,
+.copier-table td:last-child {
+  width: 100%;
+}
+
+/* One leg, as columns rather than as a flowed line. Reading down the
+   column is how you spot the leg that filled worse or arrived late, and
+   a flex row put each field wherever the one before it ended -- so no
+   two legs lined up and the eye had nothing to run down. Widths are
+   generous enough for the live values (slave ids to
+   "mt5-dwx-futures-1", tickets to MT5's ulong) and the row simply
+   starts a new line rather than clipping. */
+.copier-leg {
+  display: grid;
+  /* The SLACK IS IN THE MIDDLE, not on the end: the two execution
+     figures -- what the copy cost and how long it took -- sit hard
+     against the right border where they line up down the column, and
+     the slice marker takes whatever width is left over. Put the 1fr on
+     the last column instead and latency drifts 150px off the edge of
+     the figures above it. */
+  grid-template-columns: 124px 80px 98px 66px minmax(26px, 1fr) 76px 64px;
+  align-items: baseline;
+  gap: 0 10px;
+  white-space: nowrap;
+}
+
+/* The fills behind a split entry run under the leg they belong to,
+   starting beneath its symbol rather than at the left edge. */
+.copier-leg > .copier-leg-slicefills {
+  grid-column: 2 / -1;
+  margin-bottom: 2px;
+}
+
+.copier-leg-state .badge {
+  margin: 0;
+}
+
+.copier-leg-slicecell {
+  text-align: right;
+}
+
+.copier-leg .copier-slip,
+.copier-leg .copier-lat {
+  text-align: right;
+}
+
+.copier-leg .badge {
+  margin: 0;
+  justify-self: start;
+}
+
+/* --- Risk tab: the four facts on one row ----------------------------
+ *
+ * The fold head printed a built sentence -- "risk calibration x1.00 of
+ * what the master staked, against this balance" -- which is the same
+ * four values the slave column now shows, spelled out at ten times the
+ * width. Folded, six of these stacked is the whole screen.
+ */
+.slave-risk-facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 20px;
+  margin-top: 4px;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-variant-numeric: tabular-nums;
+}
+
+.slave-risk-facts .slave-fact {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.slave-risk-note {
+  margin: 14px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+/* The section title sits above its panel rather than inside it, so the
+   panel starts with the slaves it is about. */
+.section-title {
+  margin: 0 0 10px;
+}
+
+/* --- the individual slave card -------------------------------------
+ *
+ * The head is one statement about one slave: who it is on the left,
+ * and on the right the two decisions that say what it does -- which
+ * engine runs it, which strategies reach it -- presented alike, divided
+ * by hairlines rather than each drawn in its own shape.
+ *
+ * Below it, every setting is a block of its own: a bordered, lifted
+ * strip with its label in a fixed-width column, so the values line up
+ * down the card and a reader can pick the row they want instead of
+ * scanning a run of dashed rules for the one that moved. Padding is
+ * tighter throughout -- the card had the air of a form and the content
+ * of a list.
+ */
+.slave-risk {
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+
+.slave-risk-head {
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.slave-risk-ident {
+  min-width: 0;
+}
+
+.slave-risk-headctl {
+  display: flex;
+  align-items: flex-start;
+  cursor: default;
+}
+
+.headctl {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 14px;
+  border-left: 1px solid var(--border);
+}
+
+.headctl:first-child {
+  border-left: 0;
+}
+
+.headctl-k {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.headctl-v {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+/* A selection can be a long sentence -- "12 of 30 strategies, deny 2"
+   -- and it is not worth the width of the head. The whole of it is on
+   the hover. */
+.headctl-text {
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.headctl .mode-cell {
+  gap: 2px;
+}
+
+.headctl .mode-cell .muted.small {
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+/* Each setting is its own block. */
+.slave-risk-row {
+  align-items: center;
+  margin-top: 6px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-top: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface2);
+}
+
+.slave-risk-row > div {
+  gap: 10px;
+  min-width: 0;
+}
+
+/* Labels share one column width, so the values start at one x and the
+   card reads as a table rather than as ragged prose. */
+.row-k {
+  flex: 0 0 142px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+}
+
+.slave-risk-sizing {
+  font-size: 12px;
+}
+
+.slave-risk-flags {
+  margin-top: 8px;
+  gap: 5px;
+}
+
+.slave-risk-form {
+  margin-top: 8px;
+  padding: 10px;
+}
+
+/* --- a slave is a thing, so it sits ON the page rather than in it ---
+ *
+ * Chris, 2026-11-18: "give the slave cards a few clicks away from full
+ * black to give it some tiny separation". Everything was one value --
+ * page, panel and card alike -- so a card was a rectangle of borders on
+ * the same black, and four of them read as one block. These are three
+ * steps, each small enough not to look like a colour: the page, the
+ * panel a card sits in, and the card itself.
+ */
+.slave-card,
+.slave-risk {
+  background: #15171b;
+  border-color: #272a30;
+}
+
+.slave-card:hover,
+.slave-risk:hover {
+  border-color: #33373f;
+}
+
+/* The rows inside an open card step up once more, so they read as
+   contents of the card rather than as more cards. */
+.slave-risk-row {
+  background: #1b1e23;
+  border-color: #2b2f36;
+}
+
+/* The same lift for a slave in a Settings table, so a slave looks like
+   a slave on whichever screen it appears. */
+.slave-table tbody tr,
+.settings .data-table tbody tr {
+  background: #121418;
+}
+
+.slave-table tbody tr:hover,
+.settings .data-table tbody tr:hover {
+  background: #171a1f;
+}
+
+/* The master cards get the same lift: they are the other thing on this
+   page that is an account rather than a container. */
+.master-card {
+  background: #15171b;
+  border-color: #272a30;
+}
+
+/* Uptime and ports, now beside the Masters heading. */
+.masters-head {
+  align-items: baseline;
+  margin-bottom: 10px;
+}
+
+.masters-head h2 {
+  margin: 28px 0 0;
+}
+
+.masters-head .hub-state {
+  gap: 18px;
+}
+
+/* Renaming a slave, in the cell where the name is read. */
+.slave-name-edit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.slave-name-edit input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 5px;
+  padding: 3px 7px;
+  font-size: 13px;
+  font-family: inherit;
+  min-width: 220px;
+}
+
+/* The button is there when wanted and quiet when not. */
+.slave-name-edit .btn-tiny {
+  opacity: 0;
+  transition: opacity 120ms;
+}
+
+.slave-name-edit:hover .btn-tiny,
+.slave-name-edit input + .btn-tiny,
+.slave-name-edit .btn-tiny:focus {
+  opacity: 1;
+}

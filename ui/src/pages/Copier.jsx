@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../api.js";
-import { useEvents } from "../useEvents.js";
+import { useHub } from "../hub.jsx";
 
 /** Local midnight for a yyyy-mm-dd string, as epoch seconds. */
 function dayBounds(isoDate) {
@@ -177,12 +177,22 @@ function OrderRow({ order }) {
           ) : (
             <div className="copier-legs">
               {order.copies.map((c) => (
+                /* EVERY CELL IS ALWAYS RENDERED, empty where there is no
+                   value. The row is a grid now so that a column of legs
+                   reads DOWN -- which is how you spot the one that filled
+                   worse or arrived late -- and a `cond && <span>` that
+                   renders nothing takes its column with it, sliding every
+                   later cell one place left. A leg with no split and no
+                   slippage had its latency sitting under another leg's
+                   ticket. */
                 <div key={`${c.slave_id}-${c.slave_symbol}-${c.slave_ticket}`} className="copier-leg">
                   <span className="copier-leg-slave">{c.slave_id}</span>
                   <span className="copier-leg-sym">{c.slave_symbol}</span>
                   <span className="mono copier-leg-ticket">#{c.slave_ticket ?? "--"}</span>
-                  <span className={c.status === "OPEN" ? "badge badge-ok" : "badge"}>
-                    {c.status?.toLowerCase()}
+                  <span className="copier-leg-state">
+                    <span className={c.status === "OPEN" ? "badge badge-ok" : "badge"}>
+                      {c.status?.toLowerCase()}
+                    </span>
                   </span>
                   {/* A SPLIT ENTRY. The leg is one position with one size
                       by design -- one row, one pair of protective legs,
@@ -191,20 +201,41 @@ function OrderRow({ order }) {
                       in one print or three. The size column is the whole
                       position either way, so this is the only thing that
                       distinguishes them. */}
-                  {c.entry_slices > 1 && (
-                    <span
-                      className="copier-leg-slices"
-                      title={`This entry went out as ${c.entry_slices} orders over a window, filling into one position`}
-                    >
-                      {c.entry_slices}&times;
-                    </span>
-                  )}
-                  {/* What each order filled. The leg's own price is the
-                      position's average, which is the number splitting
-                      was meant to improve -- so it cannot be the number
-                      that says whether it worked. These can: a later
-                      slice filling worse is impact the split did not
-                      avoid. */}
+                  <span className="copier-leg-slicecell">
+                    {c.entry_slices > 1 && (
+                      <span
+                        className="copier-leg-slices"
+                        title={`This entry went out as ${c.entry_slices} orders over a window, filling into one position`}
+                      >
+                        {c.entry_slices}&times;
+                      </span>
+                    )}
+                  </span>
+                  <span
+                    className={
+                      slip(order, c) === null
+                        ? "copier-slip"
+                        : slip(order, c) > 0
+                          ? "copier-slip pnl-negative"
+                          : "copier-slip pnl-positive"
+                    }
+                    title="Fill vs the master's price, signed so positive means it cost you"
+                  >
+                    {slip(order, c) === null
+                      ? ""
+                      : `${slip(order, c) > 0 ? "+" : ""}${px(slip(order, c))}`}
+                  </span>
+                  <span className="copier-lat muted" title="Hub received the signal to broker fill">
+                    {latency(order, c) === null ? "" : fmtLatency(latency(order, c))}
+                  </span>
+                  {/* What each order filled, on its own line under the
+                      leg. The leg's own price is the position's average,
+                      which is the number splitting was meant to improve
+                      -- so it cannot be the number that says whether it
+                      worked. These can: a later slice filling worse is
+                      impact the split did not avoid. Rendered LAST, so
+                      spanning a second row does not push the figures
+                      above it out of their columns. */}
                   {c.slices?.length > 1 && (
                     <span className="copier-leg-slicefills">
                       {c.slices.map((s) => (
@@ -213,20 +244,6 @@ function OrderRow({ order }) {
                           {s.fill_price ? ` @ ${px(s.fill_price)}` : " unfilled"}
                         </span>
                       ))}
-                    </span>
-                  )}
-                  {slip(order, c) !== null && (
-                    <span
-                      className={slip(order, c) > 0 ? "copier-slip pnl-negative" : "copier-slip pnl-positive"}
-                      title="Fill vs the master's price, signed so positive means it cost you"
-                    >
-                      {slip(order, c) > 0 ? "+" : ""}
-                      {px(slip(order, c))}
-                    </span>
-                  )}
-                  {latency(order, c) !== null && (
-                    <span className="copier-lat muted" title="Hub received the signal to broker fill">
-                      {fmtLatency(latency(order, c))}
                     </span>
                   )}
                 </div>
@@ -243,7 +260,7 @@ export default function Copier() {
   const [date, setDate] = useState(todayIso());
   const [trades, setTrades] = useState([]);
   const [error, setError] = useState(null);
-  const { events } = useEvents();
+  const { events } = useHub();
 
   const bounds = useMemo(() => dayBounds(date), [date]);
 
@@ -294,67 +311,76 @@ export default function Copier() {
     <div className="dashboard">
       <div className="dashboard-header">
         <h1>Copier</h1>
-        <div className="copier-daypick">
-          <button className="btn btn-small" onClick={() => setDate(shiftIso(date, -1))}>
-            &lsaquo; Prev
-          </button>
-          <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
-          <button
-            className="btn btn-small"
-            onClick={() => setDate(shiftIso(date, 1))}
-            disabled={isToday}
-          >
-            Next &rsaquo;
-          </button>
-          {!isToday && (
-            <button className="btn btn-small btn-primary" onClick={() => setDate(todayIso())}>
-              Today
-            </button>
-          )}
-        </div>
       </div>
 
       {error && <div className="banner banner-error">{error}</div>}
 
-      <section className="panel copier-summary">
-        <div className="master-stat">
-          <span className="copier-stat-n">{totals.orders}</span>
-          <span className="muted small">master orders</span>
-        </div>
-        <div className="master-stat">
-          <span className="copier-stat-n">{totals.legs}</span>
-          <span className="muted small">slave legs</span>
-        </div>
-        <div className="master-stat">
-          <span className="copier-stat-n">{totals.openNow}</span>
-          <span className="muted small">still open</span>
-        </div>
-        <div className="master-stat">
-          <span className={totals.uncopied ? "copier-stat-n pnl-negative" : "copier-stat-n"}>
-            {totals.uncopied}
-          </span>
-          <span className="muted small">not copied</span>
-        </div>
-      </section>
+      {/* THE DAY, THE COUNTS AND THE ORDERS IN ONE FRAME. The picker sat
+          on the page title row, two panels above the table it filters,
+          and the counts it governs sat in a third -- so the control, the
+          totals for the day it chose and the orders themselves were
+          three separate things on screen instead of one instrument. */}
+      <section className="panel copier-panel">
+        <div className="copier-toolbar">
+          <div className="copier-summary">
+            <div className="master-stat">
+              <span className="copier-stat-n">{totals.orders}</span>
+              <span className="muted small">master orders</span>
+            </div>
+            <div className="master-stat">
+              <span className="copier-stat-n">{totals.legs}</span>
+              <span className="muted small">slave legs</span>
+            </div>
+            <div className="master-stat">
+              <span className="copier-stat-n">{totals.openNow}</span>
+              <span className="muted small">still open</span>
+            </div>
+            <div className="master-stat">
+              <span className={totals.uncopied ? "copier-stat-n pnl-negative" : "copier-stat-n"}>
+                {totals.uncopied}
+              </span>
+              <span className="muted small">not copied</span>
+            </div>
+          </div>
 
-      {byMaster.length === 0 && (
-        <p className="muted">
-          No master orders on {date}
-          {isToday ? " yet." : "."}
-        </p>
-      )}
+          <div className="copier-daypick">
+            <button className="btn btn-small" onClick={() => setDate(shiftIso(date, -1))}>
+              &lsaquo; Prev
+            </button>
+            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+            <button
+              className="btn btn-small"
+              onClick={() => setDate(shiftIso(date, 1))}
+              disabled={isToday}
+            >
+              Next &rsaquo;
+            </button>
+            {!isToday && (
+              <button className="btn btn-small btn-primary" onClick={() => setDate(todayIso())}>
+                Today
+              </button>
+            )}
+          </div>
+        </div>
 
-      {byMaster.map(([account, group]) => (
-        <section key={account || "(unattributed)"}>
-          <h2>
-            {account || <span className="muted">unattributed master</span>}{" "}
-            <span className="muted small">
-              {group.length} order{group.length === 1 ? "" : "s"} &rarr;{" "}
-              {group.reduce((n, o) => n + o.copies.length, 0)} leg
-              {group.reduce((n, o) => n + o.copies.length, 0) === 1 ? "" : "s"}
-            </span>
-          </h2>
-          <div className="panel copier-table-wrap">
+        {byMaster.length === 0 && (
+          <p className="muted" style={{ padding: "14px" }}>
+            No master orders on {date}
+            {isToday ? " yet." : "."}
+          </p>
+        )}
+
+        {byMaster.map(([account, group]) => (
+          <div key={account || "(unattributed)"}>
+            <h2 className="copier-master-head">
+              {account || <span className="muted">unattributed master</span>}{" "}
+              <span className="muted small">
+                {group.length} order{group.length === 1 ? "" : "s"} &rarr;{" "}
+                {group.reduce((n, o) => n + o.copies.length, 0)} leg
+                {group.reduce((n, o) => n + o.copies.length, 0) === 1 ? "" : "s"}
+              </span>
+            </h2>
+            <div className="copier-table-wrap">
             <table className="positions-table copier-table">
               <thead>
                 <tr>
@@ -379,9 +405,10 @@ export default function Copier() {
                 ))}
               </tbody>
             </table>
+            </div>
           </div>
-        </section>
-      ))}
+        ))}
+      </section>
     </div>
   );
 }
