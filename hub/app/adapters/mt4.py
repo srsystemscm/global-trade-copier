@@ -193,6 +193,31 @@ class MT4Adapter(BrokerAdapter):
                 "tp": order.tp,
             }
         )
+        # THE EA SAYS WHEN IT COULD NOT OPEN THE WHOLE SIZE, and this is
+        # the only place that hears it.
+        #
+        # An MT5 symbol's SYMBOL_VOLUME_MAX can be far below a sized
+        # position -- Darwinex caps MBT_X at 20 lots against a 200-lot
+        # trade -- so SlaveBridge cuts the volume into clips and holds
+        # them together as one group under the first leg's ticket. If
+        # some clips open and others are refused, it deliberately does
+        # NOT roll back: the filled part is real, and unwinding could
+        # fail too. It reports the shortfall in `warning` instead, with
+        # the comment "so it cannot pass unnoticed".
+        #
+        # It passed unnoticed. `lots` below is what filled, so the
+        # registry was right, but nothing anywhere said the position is
+        # smaller than the signal asked for -- and on a slave whose
+        # sizes routinely exceed the per-order cap, that is the normal
+        # failure rather than a rare one.
+        warning = reply.get("warning")
+        if warning:
+            logger.error(
+                "slave=%s %s opened SHORT: %s -- the position is smaller than "
+                "this signal was sized for, and the copy carries less risk "
+                "than the master",
+                self.slave_id, order.symbol, warning,
+            )
         return OrderResult(
             slave_ticket=int(reply["slave_ticket"]),
             price=_level(reply.get("price")),
