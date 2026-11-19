@@ -590,6 +590,11 @@ def test_a_limit_entry_is_closed_with_a_limit_in_the_same_session():
 
 
 def test_a_market_entry_is_still_closed_at_market():
+    """MGC is a listed FUTURE, and that is why the market order stays.
+    It trades nearly round the clock, IBKR accepts a market order in the
+    overnight session, and a market order is the surest exit there is --
+    so the equity limit introduced for ETHT is deliberately not extended
+    here. See _closing_order."""
     a = _prepared(_adapter(), _Trade(price=3988.4, fills_after=1),
                   _Trade(price=1.0, fills_after=1))
     req = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=None,
@@ -598,7 +603,12 @@ def test_a_market_entry_is_still_closed_at_market():
     a.ib._all[0].poll()
     asyncio.run(a.close(res.slave_ticket))
     assert a.ib.placed[1].orderType == "MKT"
-    assert a.ib.placed[1].outsideRth is False
+    # Was `is False`, taken from the entry, and that flag is the whole
+    # defect: this position was opened inside regular hours, so the SELL
+    # that closed it at 19:51 asked not to trade outside them and was
+    # PARKED until the next open. A future's own session is nearly
+    # round the clock; the exit has to be allowed to use it.
+    assert a.ib.placed[1].outsideRth is True
 
 
 def test_no_quote_falls_back_to_market_rather_than_leaving_it_open():

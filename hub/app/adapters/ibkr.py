@@ -1437,7 +1437,21 @@ class IBKRAdapter(BrokerAdapter):
         closing_action = "SELL" if pos["direction"] == "BUY" else "BUY"
         closing_order = await self._closing_order(ib_mod, pos, closing_action)
         closing_order.tif = self.entry_tif
-        closing_order.outsideRth = pos.get("outside_rth", False)
+        #--- AN EXIT MAY TRADE OUTSIDE REGULAR HOURS WHATEVER THE ENTRY DID.
+        #---
+        #--- This read pos["outside_rth"] -- the flag the ENTRY was placed
+        #--- with -- on the reasoning recorded where it is stored: "kept so
+        #--- the EXIT can mirror the entry". Mirroring is right about the
+        #--- order type and wrong about the session, because an exit happens
+        #--- at a different time of day than its entry. A position opened
+        #--- inside regular hours carries False, and the master closing it
+        #--- at 19:51 then sends an order that cannot execute until 09:30.
+        #---
+        #--- The two failures are not symmetrical and should not be treated
+        #--- alike: an entry that does not fill leaves no position, while an
+        #--- exit that does not fill leaves one nobody is managing. The exit
+        #--- is therefore the more permissive of the two.
+        closing_order.outsideRth = True
         trade = self._place(pos["contract"], closing_order)
         # MARKED, NOT DROPPED (2026-11-18).
         #
@@ -1476,26 +1490,71 @@ class IBKRAdapter(BrokerAdapter):
         return None
 
     async def _closing_order(self, ib_mod, pos, action):
-        """Build the exit the same way the entry was built.
+        """Build the exit: an order that can execute in the session it is
+        actually sent in, which is not the same order for every venue.
 
-        A market order is simply refused outside regular hours, so a leg
-        deliberately opened on a limit in the evening session has to be
-        closed on one too. The limit is priced THROUGH the current quote in
-        the direction that gets filled -- the point is to exit, not to post
-        a resting order that quietly never trades.
+        A LISTED FUTURE keeps its market order. It trades nearly round
+        the clock, IBKR accepts a market order in the overnight session,
+        and a market order is the surest exit there is -- the only thing
+        that was wrong for a future is the outsideRth flag close() sets.
+
+        A US EQUITY gets a limit priced THROUGH the quote, because
+        outside 09:30-16:00 its venue accepts nothing else. That is the
+        case the live defect came from.
+
+        Both used to be decided by the ENTRY: a limit exit only for a
+        position whose entry was a limit, and a market order otherwise,
+        on the reasoning written here -- "a market order is simply
+        refused outside regular hours". THAT IS NOT WHAT IBKR DOES. It accepts the order and
+        PARKS it:
+
+            Warning 399: SELL 789 ETHT ARCA Warning: Your order will not
+            be placed at the exchange until 2026-11-19 09:30:00
+            US/Eastern.
+
+        Status PreSubmitted, filled 0 of 789. Nothing looks like a
+        failure, so the position sits unmanaged until the next open --
+        which on 2026-11-18 was overnight, under a registry row that
+        already said CLOSED.
+
+        A refusal would have been the better outcome, because a refusal
+        is visible.
+
+        Inside regular hours the equity limit costs nothing: priced
+        through the quote in the direction that fills, it behaves as a
+        market order does, and await_exit_fill re-prices it if the quote
+        moved. The point is to exit, not to post a resting order that
+        quietly never trades.
+
+        It is not extended to futures for that same reason read the other
+        way. The chase re-prices on a cadence, so a limit that misses a
+        fast overnight move exits late and worse than a market order
+        would have -- while for an equity outside regular hours a market
+        order does not exit AT ALL. The asymmetry is the venue's, not a
+        preference about pricing.
+
+        A market order remains the fallback for a position with no quote
+        to price against -- it at least reaches the broker.
         """
-        if pos.get("order_type") != "limit":
+        #--- Futures only. get_contract_spec is None for anything that is
+        #--- not a listed future, which is what makes it the test.
+        if get_contract_spec(pos.get("symbol")) is not None:
             return ib_mod.MarketOrder(action, pos["size"])
 
-        offset = float(pos.get("limit_offset_pct", 0.0))
+        # The entry's own offset where it had one, and the chase's step
+        # otherwise: an exit priced AT the quote is one that waits for the
+        # market to come back to it. Same fallback await_exit_fill uses
+        # when it re-prices, so the two agree about what "through" means.
+        offset = float(pos.get("limit_offset_pct", 0.0)) or float(self.exit_chase_pct)
         try:
             quote = await self.get_quote(
                 pos.get("symbol"), pos.get("month_slot", 0), pos.get("contract_id"))
         except Exception as exc:
-            # No quote means no limit price. A market order at least reaches
-            # the broker, and inside regular hours it fills; outside them it
-            # is refused, which surfaces as an error rather than as a
-            # position quietly left open.
+            # No quote means no limit price. A market order at least
+            # reaches the broker, and inside regular hours it fills.
+            # Outside them it is PARKED until the next open rather than
+            # refused -- see the docstring -- so this path is now the one
+            # that can still strand a position, and it says so.
             logger.warning(
                 "IBKRAdapter[%s] no quote to price the exit for %s (%s); "
                 "falling back to a market order",
