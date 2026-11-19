@@ -1861,6 +1861,14 @@ class AutonomousCopyEngine(SessionGateMixin):
                     # broker.
                     await self._abandon_unfilled_entry(
                         account, master_ticket, slave_symbol, slave_ticket)
+                else:
+                    # NOR IS THIS. The row was marked CLOSED when the
+                    # closing order was accepted, so a close that never
+                    # fills leaves this hub saying flat over a position the
+                    # broker still holds -- unmanaged, because nothing
+                    # trails or re-closes a row that reads CLOSED.
+                    await self._exit_never_filled(
+                        account, master_ticket, slave_symbol, slave_ticket)
                 return
             if which == "entry":
                 # It filled, so it is a position now. Cleared here rather
@@ -1895,6 +1903,49 @@ class AutonomousCopyEngine(SessionGateMixin):
             run(), name=f"fill-{which}-{self.slave_id}-{slave_ticket}")
         self._fill_tasks.add(task)
         task.add_done_callback(self._fill_tasks.discard)
+
+    async def _exit_never_filled(self, account: str, master_ticket: int,
+                                 slave_symbol: str, slave_ticket: int) -> None:
+        """A close that was accepted and never filled.
+
+        The registry row already says CLOSED -- _finish_close marks it when
+        the adapter accepts the order, before any fill -- so this is the
+        one moment that can say the hub and the broker disagree. It used to
+        `return` here, on the reasoning that an uncaptured fill "simply
+        leaves the column NULL". For an ENTRY that is true. For an exit it
+        is a live position nobody is managing.
+
+        Measured 2026-11-18, ETHT on ibkr-etf-1: the close was sent at
+        19:51 ET as a DAY market order with outsideRth unset, and IBKR
+        answered warning 399 -- "your order will not be placed at the
+        exchange until 2026-11-19 09:30:00 US/Eastern". Status
+        PreSubmitted, filled 0 of 789. The engine logged "closed deferred
+        ETHT after 93109s and 1055 attempt(s)", marked the row CLOSED with
+        a null close price, and said nothing further. 789 shares, no stop,
+        nothing watching.
+
+        DELIBERATELY PLACES NOTHING. The closing order is usually still
+        live -- that is the whole reason it has not filled -- and a second
+        one would sell a position twice at tomorrow's open. The fix for
+        the silence is not another order; it is saying so.
+        """
+        logger.error(
+            "slave=%s EXIT NEVER FILLED for %s slave_ticket=%s "
+            "(master_ticket=%s): the closing order was accepted but filled "
+            "nothing, and the registry row already says CLOSED. THE POSITION "
+            "IS STILL OPEN AT THE BROKER and nothing in this hub is managing "
+            "it -- check the order by hand. Outside regular hours an exit "
+            "rests until the next open rather than failing, which is what "
+            "this usually is",
+            self.slave_id, slave_symbol, slave_ticket, master_ticket,
+        )
+        await self._emit(
+            "exit_never_filled",
+            slave_symbol=slave_symbol,
+            slave_ticket=slave_ticket,
+            master_account=account,
+            master_ticket=master_ticket,
+        )
 
     async def _defer_close(self, signal, mapping, exc) -> None:
         """Hold an exit the broker refused, to execute at the next open.

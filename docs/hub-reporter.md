@@ -772,11 +772,30 @@ than reject the report:
 |---|---|---|
 | `contract_roll` | info | `slave_symbol`, `slave_ticket`, `from_contract`, `to_contract`, `sl`, `tp` |
 | `drawdown_alert` | **alert** | `account_type`, `drawdown_pct`, `peak_equity`, `equity` |
+| `exit_never_filled` | **alert** | `slave_symbol`, `slave_ticket` |
 
-Both are in the copier's vocabulary and neither was in the table. Dropping
-them would leave the tab missing the two events most likely to explain a
-surprise: a roll replaces a live position with a different contract, and a
-drawdown alert is the account itself saying something.
+The first two are in the copier's vocabulary and neither was in the table.
+Dropping them would leave the tab missing the two events most likely to
+explain a surprise: a roll replaces a live position with a different
+contract, and a drawdown alert is the account itself saying something.
+
+**`exit_never_filled` is new on 2026-11-18, and it is the one to surface
+loudest.** It says the copier accepted a closing order that filled nothing,
+while the registry row for that position ALREADY READS CLOSED -- so the
+copier reports itself flat on a position the broker still holds, with
+nothing trailing it and nothing re-closing it. Both sides' records agree
+and both are wrong.
+
+It is most often an exit sent outside regular hours: IBKR accepts the order
+and parks it until the next open rather than refusing it (warning 399), so
+nothing looks like a failure until the fill does not arrive. Seen live on
+ETHT, 789 shares, sent 19:51 ET.
+
+A tab showing it should treat the position as OPEN regardless of the order
+row, and should not expect a later `slave_close` to arrive on its own: the
+resting order may fill at the next open, or may be cancelled by hand, and
+the copier will not report either because as far as it is concerned that
+trade is finished.
 
 **More generally: the hub must tolerate a `type` it does not know.** The
 copier passes an unmapped bus event through with its own fields as `detail`,
