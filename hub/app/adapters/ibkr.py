@@ -489,11 +489,34 @@ class IBKRAdapter(BrokerAdapter):
 
     async def _contract_by_id(self, symbol: str, contract_id: int):
         """A specific contract by id -- the roll destination, and anything else
-        that must not be re-derived from a slot number that may have shifted."""
+        that must not be re-derived from a slot number that may have shifted.
+
+        NOT ALWAYS A FUTURE. This built `Future(conId=...,
+        exchange=get_contract_spec(symbol).exchange)` unconditionally, and
+        get_contract_spec returns None for anything that is not a listed
+        future -- its own docstring says so, and says to treat those as
+        equities. So on an ETF it raised "'NoneType' object has no
+        attribute 'exchange'" before it ever reached IBKR.
+
+        That is a restart-only path, which is why it survived: it is how
+        restore_position rebuilds the adapter's handle on a position the
+        hub already held. On ibkr-etf-1 -- a slave whose whole book is
+        ETFs -- it meant that after ANY restart, no held position could be
+        restored, and therefore none could be closed: every CLOSE answered
+        "no tracked IBKR position for slave_ticket=N" forever. ETHT 1485
+        and UGL 1256 were both in that state on 2026-11-18, the first of
+        them for twenty-four hours.
+
+        Branches the same way _contract_for does, because they are
+        answering the same question about the same symbol.
+        """
         ib_mod = self._require_ib()
-        qualified = self._qualified_only(await self.ib.qualifyContractsAsync(
-            ib_mod.Future(conId=contract_id, exchange=get_contract_spec(symbol).exchange)
-        ))
+        spec = get_contract_spec(symbol)
+        if spec is not None:
+            probe = ib_mod.Future(conId=contract_id, exchange=spec.exchange)
+        else:
+            probe = ib_mod.Stock(conId=contract_id, exchange="SMART", currency="USD")
+        qualified = self._qualified_only(await self.ib.qualifyContractsAsync(probe))
         if not qualified:
             raise AdapterRejectedError(f"IBKR could not qualify contract_id={contract_id} for {symbol}")
         return qualified[0]
