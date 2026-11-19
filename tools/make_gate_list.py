@@ -102,11 +102,27 @@ def live_set_risk(con: sqlite3.Connection) -> dict[str, tuple]:
 
 
 def rows_for(db: str, statuses: tuple[str, ...]) -> list[dict]:
+    """The units the gate is allowed to fire, and a count of the ones it
+    had to leave out.
+
+    THE COUNT IS NOT DECORATION. A gate list that comes up short without
+    saying so is a gate that passes vacuously -- every leg in it fires,
+    nothing fails, and the strategy that was missing is the one nobody
+    checked. A unit with no magic cannot be fired, because the magic is
+    the only thing the copier routes on, so it is skipped either way; the
+    difference is whether the skip is visible.
+    """
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         symbols = broker_symbol(con)
         risks = live_set_risk(con)
         out = []
+        #--- Counted separately because the row filter below is in SQL.
+        no_magic = [
+            code for code, status in con.execute(
+                "SELECT symbol, status FROM v_unit WHERE magic IS NULL")
+            if status not in NEVER and status in statuses
+        ]
         for unit_id, magic, code, tf, side, status in con.execute(
                 "SELECT id, magic, symbol, timeframe, side, status FROM v_unit "
                 "WHERE magic IS NOT NULL ORDER BY magic"):
@@ -126,6 +142,10 @@ def rows_for(db: str, statuses: tuple[str, ...]) -> list[dict]:
                 "risk_json": risk_json or "",
                 "source": "live_set" if mode is not None else "gate_defaults",
             })
+        for code in no_magic:
+            print(f"WARNING: {code} is {'/'.join(statuses)} but has no magic -- "
+                  f"not in the list, so the gate will not test it",
+                  file=sys.stderr)
         return out
     finally:
         con.close()
