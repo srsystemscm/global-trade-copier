@@ -1125,6 +1125,44 @@ async def import_portfolio(
     return {"applied": True, "plan": plan}
 
 
+@router.delete("/slaves/{slave_id}/import/portfolio")
+async def remove_portfolio(slave_id: str, request: Request, dry_run: bool = True):
+    """Take the portfolio back off this slave.
+
+    APPLYING ONE IS NOT ITS OWN INVERSE, which is why this exists. An
+    import writes the selection AND the per-strategy scales, and removing
+    only the selection -- the half that is visible on screen -- leaves the
+    scales in force over a slave that now takes every strategy again. On
+    mt5-icm-1 that happened minutes after the first live import: three
+    scales left behind, two of them halving a strategy, and the only sign
+    of it a "+3 EA" badge that read like a stale display.
+
+    Clears whatever is there rather than what an import would have left,
+    because the two drift: a selection can be edited or deleted by hand,
+    and the scales outlive it.
+
+    Dry run by default, like the import, and for the same reason: removing
+    a selection means the slave takes EVERY strategy again, which is the
+    largest change this can make and the one least visible afterwards.
+    """
+    slave = get_slave(slave_id)
+    if slave is None:
+        raise HTTPException(404, f"no slave with id={slave_id!r}")
+
+    plan = portfolio_import.removal_plan(slave.config)
+    if dry_run or plan["nothing_to_remove"]:
+        return {"removed": False, "plan": plan}
+
+    config = portfolio_import.remove(slave.config)
+    await patch_slave(slave_id, SlaveUpdate(config=config), request)
+    logger.info(
+        "slave=%s portfolio removed: %d magic(s) deselected, %d scale(s) cleared%s",
+        slave_id, len(plan["magics_dropped"]), len(plan["scales_dropped"]),
+        " -- it now takes EVERY strategy" if plan["widens_to_every_magic"] else "",
+    )
+    return {"removed": True, "plan": plan}
+
+
 @router.delete("/slaves/{slave_id}")
 async def remove_slave(slave_id: str, request: Request):
     slave = get_slave(slave_id)

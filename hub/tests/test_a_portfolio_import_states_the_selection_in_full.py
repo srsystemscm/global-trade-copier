@@ -333,3 +333,92 @@ def test_an_imported_portfolio_reaches_the_ops_hub_as_it_stands():
     assert reported["source"]["portfolio_id"] == "pf_7f3a9c"
     assert reported["source"]["revision"] == 7
     assert reported["source"]["kind"] == pi.SOURCE_KIND
+
+
+# --- taking it back off ------------------------------------------------
+#
+# Applying a portfolio is not its own inverse. The import writes TWO keys
+# and only one of them is visible on screen, so removing that one by hand
+# leaves the other in force: the slave takes every strategy again AND
+# still scales three of them.
+#
+# mt5-icm-1, 2026-11-18, minutes after the first live import --
+# magic_filter deleted, {"120002": 0.5, "121002": 1, "121003": 0.5} still
+# applied, and the only sign of it a "+3 EA" badge that read as a stale
+# display.
+
+def test_removing_a_portfolio_clears_the_scales_as_well():
+    """The defect. Either key left behind is a slave sized by a portfolio
+    it is no longer running."""
+    config = pi.apply({"mode": "autonomous"}, pi.parse(TWO))
+    after = pi.remove(config)
+
+    assert "magic_filter" not in after
+    assert "risk_scale_by_magic" not in after
+
+
+def test_everything_else_is_carried_across():
+    """PATCH replaces config_json wholesale, so removal is a
+    read-modify-write like the import."""
+    before = {
+        "mode": "autonomous",
+        "sizing": {"mode": "pct_risk", "max_risk_pct": 0.025},
+        "routes": [{"symbol": "ETHUSD", "target": "ETHUSD"}],
+        "netting": {"max_legs": 3},
+    }
+    after = pi.remove(pi.apply(before, pi.parse(TWO)))
+    for key, value in before.items():
+        assert after[key] == value, f"{key} was lost"
+
+
+def test_orphaned_scales_are_removable_on_their_own():
+    """mt5-icm-1's ACTUAL state after the selection was deleted by hand.
+    There is no import left to recognise -- the source block went with
+    the magic_filter -- so removal has to work from what is there."""
+    config = {"routes": [1], "risk_scale_by_magic": {"120002": 0.5, "121003": 0.5}}
+    plan = pi.removal_plan(config)
+
+    assert plan["was_imported"] is False
+    assert plan["nothing_to_remove"] is False
+    assert [s["magic"] for s in plan["scales_dropped"]] == [120002, 121003]
+    assert "risk_scale_by_magic" not in pi.remove(config)
+
+
+def test_it_says_when_the_slave_will_start_taking_everything():
+    """The mirror of narrows_from_every_magic, and just as large: a slave
+    that took three strategies will take all of them."""
+    config = pi.apply({}, pi.parse(TWO))
+    assert pi.removal_plan(config)["widens_to_every_magic"] is True
+
+    # Already taking everything -- only the scales are at stake.
+    assert pi.removal_plan(
+        {"risk_scale_by_magic": {"1001": 0.5}})["widens_to_every_magic"] is False
+
+
+def test_a_slave_with_nothing_on_it_says_so():
+    """So the route can decline rather than write a config identical to
+    the one it already has."""
+    assert pi.removal_plan({"routes": [1]})["nothing_to_remove"] is True
+    assert pi.removal_plan({})["nothing_to_remove"] is True
+
+
+def test_the_portfolio_it_is_removing_is_named():
+    """A removal that cannot say WHICH book it is taking off is one
+    nobody can check before clicking it."""
+    plan = pi.removal_plan(pi.apply({}, pi.parse(TWO)))
+    assert plan["portfolio"]["portfolio_id"] == "pf_7f3a9c"
+    assert plan["portfolio"]["revision"] == 7
+    assert plan["magics_dropped"] == [1001, 1002]
+
+
+def test_the_route_will_not_write_when_there_is_nothing_to_write():
+    import inspect
+
+    from app import api_routes
+
+    src = inspect.getsource(api_routes.remove_portfolio)
+    assert 'if dry_run or plan["nothing_to_remove"]:' in src
+    assert "await patch_slave(" in src, (
+        "removal must go through patch_slave, or the bus is never told the "
+        "slave's selection changed"
+    )

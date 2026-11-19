@@ -515,6 +515,7 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
   const [editingRoutes, setEditingRoutes] = useState(false);
   const [editingMagic, setEditingMagic] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [removing, setRemoving] = useState(false);
   const [editingMasters, setEditingMasters] = useState(false);
   const [editingRoll, setEditingRoll] = useState(false);
   const [editingSplit, setEditingSplit] = useState(false);
@@ -595,6 +596,17 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
                 >
                   {importing ? "Cancel" : "Import"}
                 </button>
+                {/* Beside Import, because it is the half of it that was
+                    missing. Deleting the selection by hand leaves the
+                    per-strategy scales in force over a slave that now
+                    takes everything -- seen live on mt5-icm-1. */}
+                <button
+                  className="btn btn-tiny"
+                  title="Take the portfolio back off this slave: its strategy selection AND the per-strategy risk scales"
+                  onClick={() => setRemoving((v) => !v)}
+                >
+                  {removing ? "Cancel" : "Remove"}
+                </button>
               </div>
             </div>
           </div>
@@ -617,6 +629,12 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
         <PortfolioImportForm
           slave={slave}
           onDone={() => { setImporting(false); onSaved && onSaved(); }}
+        />
+      )}
+      {removing && (
+        <PortfolioRemoveForm
+          slave={slave}
+          onDone={() => { setRemoving(false); onSaved && onSaved(); }}
         />
       )}
 
@@ -2076,6 +2094,128 @@ function PortfolioImportForm({ slave, onDone }) {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+/**
+ * Take a portfolio back off a slave.
+ *
+ * APPLYING ONE IS NOT ITS OWN INVERSE, which is the whole reason this
+ * exists. An import writes the selection AND the per-strategy scales,
+ * and only the selection is visible on this card -- so deleting that by
+ * hand leaves the scales in force over a slave that takes every
+ * strategy again. On mt5-icm-1 that left three scales behind, two of
+ * them halving a strategy, showing only as a "+3 EA" badge that read
+ * like a stale display.
+ *
+ * Asks first, like the import, and for a larger reason: removing a
+ * selection WIDENS the slave to everything the master sends, which is
+ * the least visible change either direction can make.
+ */
+function PortfolioRemoveForm({ slave, onDone }) {
+  const [plan, setPlan] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    let live = true;
+    (async () => {
+      try {
+        const res = await api.removePortfolio(slave.id, true);
+        if (live) setPlan(res.plan);
+      } catch (e) {
+        if (live) setErr(importError(e));
+      }
+    })();
+    return () => { live = false; };
+  }, [slave.id]);
+
+  async function remove() {
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.removePortfolio(slave.id, false);
+      onDone && onDone();
+    } catch (e) {
+      setErr(importError(e));
+      setBusy(false);
+    }
+  }
+
+  if (err) return <div className="banner banner-error">{err}</div>;
+  if (!plan) return <p className="muted small">Reading what is on this slave...</p>;
+
+  if (plan.nothing_to_remove) {
+    return (
+      <p className="muted small">
+        Nothing to remove: this slave has no strategy selection and no per-strategy
+        risk scales.
+      </p>
+    );
+  }
+
+  return (
+    <div className="slave-risk-form portfolio-import">
+      <div className="import-plan">
+        <div className="import-plan-head">
+          {plan.portfolio ? (
+            <>
+              <strong>{plan.portfolio.portfolio || plan.portfolio.portfolio_id}</strong>{" "}
+              <span className="muted small">
+                {plan.portfolio.revision != null && `rev ${plan.portfolio.revision} `}
+                &middot; imported {plan.portfolio.imported_at}
+              </span>
+            </>
+          ) : (
+            /* No source block: the selection was written or deleted by
+               hand, so there is no import to undo -- only leftovers to
+               clear, which is exactly the state this is for. */
+            <span className="muted small">
+              Not from an import &mdash; whatever is below was set by hand or left
+              behind by one.
+            </span>
+          )}
+        </div>
+
+        {plan.widens_to_every_magic && (
+          <p className="import-warn">
+            This slave takes <strong>{plan.magics_dropped.length} strateg
+            {plan.magics_dropped.length === 1 ? "y" : "ies"}</strong> today. Removing the
+            portfolio makes it take <strong>every strategy</strong> the master sends.
+          </p>
+        )}
+
+        <PlanLine
+          label="No longer selected"
+          values={plan.magics_dropped}
+          empty="none - it already takes everything"
+        />
+        <div className="import-plan-row">
+          <span className="row-k">Scales cleared</span>
+          <div>
+            {plan.scales_dropped.length === 0 ? (
+              <span className="muted">none</span>
+            ) : (
+              plan.scales_dropped.map((s) => (
+                <span key={s.magic} className="import-scale">
+                  {s.magic} x{Number(s.scale).toFixed(2)}
+                </span>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="form-actions">
+        <button className="btn btn-primary btn-small" onClick={remove} disabled={busy}>
+          {busy ? "Removing..." : "Remove from this slave"}
+        </button>
+        <span className="muted small">
+          Nothing has been written yet. Sizing, routes, masters and every limit on this
+          slave are untouched either way.
+        </span>
+      </div>
     </div>
   );
 }

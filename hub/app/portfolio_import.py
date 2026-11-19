@@ -383,3 +383,64 @@ def _previous_import(config: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         "revision": source.get("revision"),
         "imported_at": source.get("imported_at"),
     }
+
+
+# ------------------------------------------------------------ removing one
+#
+# APPLYING A PORTFOLIO IS NOT ITS OWN INVERSE. An import writes two keys --
+# the selection and the per-strategy scales -- and removing only the one
+# you can see leaves the other behind: the slave goes back to taking every
+# strategy, and silently halves two of them because `risk_scale_by_magic`
+# still says so.
+#
+# Seen on mt5-icm-1 on 2026-11-18, minutes after the first live import:
+# `magic_filter` deleted by hand, `{"120002": 0.5, "121002": 1,
+# "121003": 0.5}` still in force, and the only sign of it a "+3 EA" badge
+# that read like a stale display.
+
+
+def removal_plan(config: Mapping[str, Any]) -> Dict[str, Any]:
+    """What removing the portfolio from this slave would change.
+
+    Describes what is ACTUALLY THERE rather than what an import would have
+    left, because the two drift: a selection can be edited or deleted by
+    hand, and the scales outlive it.
+    """
+    selection = _selected_magics(config)
+    scales = _scales(config.get("risk_scale_by_magic"))
+    return {
+        "portfolio": _previous_import(config),
+        # None means no allow-list: the slave already takes everything, so
+        # removal only has the scales to answer for.
+        "magics_dropped": [] if selection is None else sorted(selection),
+        "scales_dropped": [
+            {"magic": m, "scale": s} for m, s in sorted(scales.items())
+        ],
+        # The mirror of narrows_from_every_magic, and just as worth saying:
+        # a slave that took three strategies will take ALL of them again,
+        # which is the largest change removal can make.
+        "widens_to_every_magic": selection is not None,
+        # A selection nobody imported -- hand-written, or left over. Removal
+        # still clears it, because a half-removed import is the state this
+        # exists to prevent, but it should not be mistaken for undoing
+        # something this hub did.
+        "was_imported": _previous_import(config) is not None,
+        "nothing_to_remove": selection is None and not scales,
+    }
+
+
+def remove(config: Mapping[str, Any]) -> Dict[str, Any]:
+    """The slave's config with the portfolio taken off it.
+
+    BOTH keys, always, whichever of them is present. Read-modify-write like
+    `apply`, so sizing, routes, masters and every limit are carried across
+    untouched.
+
+    The slave goes back to taking every strategy, which is what no
+    `magic_filter` means -- not "accept none", which is a different and
+    deliberate setting that has to be written on purpose.
+    """
+    out = dict(config)
+    out.pop("magic_filter", None)
+    out.pop("risk_scale_by_magic", None)
+    return out

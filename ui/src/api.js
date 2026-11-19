@@ -34,6 +34,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify(document),
     }),
+  // Taking it back off. DRY RUN BY DEFAULT like the import, because
+  // removing a selection means the slave takes EVERY strategy again --
+  // and because the import writes two keys, only one of which is
+  // visible, so this is the only way to clear both together.
+  removePortfolio: (id, dryRun = true) =>
+    request(`/slaves/${id}/import/portfolio?dry_run=${dryRun ? "true" : "false"}`, {
+      method: "DELETE",
+    }),
   getRisk: () => request("/risk"),
   patchRisk: (payload) => request("/risk", { method: "PATCH", body: JSON.stringify(payload) }),
 };
