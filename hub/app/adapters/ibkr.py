@@ -80,6 +80,15 @@ def _duration_for(period: int, bar_size: str) -> str:
     return f"{min(days, 365)} D"
 
 
+# How long a closing order this adapter placed may be unaccounted for in
+# trades() before a repeat CLOSE is allowed to place another. Short enough
+# that a genuinely stranded position recovers on the engine's own retry
+# cadence; long enough that the duplicate CLOSEs which arrive seconds
+# apart -- a master closing a group, a reconciliation pass -- are refused
+# rather than doubled.
+CLOSE_RETRY_AFTER_S = 300.0
+
+
 class IBKRAdapter(BrokerAdapter):
     """Talks to Interactive Brokers via TWS/IB Gateway's API, through
     `ib_async`.
@@ -1218,29 +1227,48 @@ class IBKRAdapter(BrokerAdapter):
         pos["tp"] = None if tp is None else self._round_to_tick(
             tp, pos.get("symbol") or pos["contract"].symbol)
 
-    def _live_closing_order(self, pos: dict):
-        """The closing order already working for this position, if any.
+    def _closing_order_state(self, pos: dict):
+        """What became of the closing order already placed for this
+        position: "none", "working", "finished" or "unknown".
 
-        Matched by the order id this adapter remembers placing, and by
-        nothing else. Matching on contract and direction instead would
-        catch the position's own protective STOP -- a SELL on the same
-        contract -- and a close would then refuse itself forever, which is
-        a worse failure than the one this guards against.
+        "unknown" IS ITS OWN ANSWER, and the distinction is the whole
+        point. The first version of this collapsed it into "finished" --
+        an order id that matches nothing in trades() was read as an order
+        that is over -- and the consequence was a SECOND closing order on
+        a position that may already be closing. On a flat account that is
+        a new short. Stranding a position is recoverable; selling it twice
+        is not, so not knowing has to mean not acting.
 
-        After a restart the id is not remembered (it is not persisted), so
-        a close placed before the restart is invisible here. That exposure
-        is the same as it has always been and is not made worse by this.
+        Matched by the remembered order id and by nothing else. Matching
+        on contract and direction would catch the position's own
+        protective STOP, a SELL on the same contract, and a close would
+        then refuse itself forever.
+
+        Defensive about what trades() yields: it is the broker library's
+        object in production and a stand-in under test, and this is not
+        the place to be fussy about either.
         """
         order_id = pos.get("closing_order_id")
-        if order_id is None or self.ib is None:
-            return None
+        if order_id is None:
+            #--- A close was placed whose order id could not be read is
+            #--- still a close that was placed.
+            return "unknown" if pos.get("closing_since") else "none"
+
+        trades = []
+        if self.ib is not None:
+            try:
+                trades = list(self.ib.trades())
+            except Exception:
+                trades = []
+
         working = ("ApiPending", "PendingSubmit", "PreSubmitted", "Submitted")
-        for trade in self.ib.trades():
-            if getattr(trade.order, "orderId", None) != order_id:
+        for trade in trades:
+            order = getattr(trade, "order", None)
+            if order is None or getattr(order, "orderId", None) != order_id:
                 continue
             status = getattr(getattr(trade, "orderStatus", None), "status", "")
-            return trade if status in working else None
-        return None
+            return "working" if status in working else "finished"
+        return "unknown"
 
     async def close(self, slave_ticket: int) -> Optional[float]:
         ib_mod = self._require_ib()
@@ -1249,29 +1277,51 @@ class IBKRAdapter(BrokerAdapter):
         if pos is None:
             raise AdapterRejectedError(f"no tracked IBKR position for slave_ticket={slave_ticket}")
 
-        #--- A close already working. Checked BEFORE the protective orders
-        #--- are cancelled, so a repeated CLOSE cannot strip a position of
-        #--- its stop and then decline to do anything else.
-        working = self._live_closing_order(pos)
-        if working is not None:
+        #--- What happened to the close already placed for this position.
+        #--- Checked BEFORE the protective orders are cancelled, so a
+        #--- repeated CLOSE cannot strip a position of its stop and then
+        #--- decline to do anything else.
+        state = self._closing_order_state(pos)
+        previous = pos.get("closing_order_id")
+
+        if state == "working":
+            #--- One is in flight. Nothing to do, and the exit's fill is
+            #--- collected by await_exit_fill as usual.
             logger.info(
                 "IBKRAdapter[%s] close for slave_ticket=%s: order %s is already "
-                "working (%s) -- not placing a second",
-                self.slave_id, slave_ticket, working.order.orderId,
-                working.orderStatus.status,
+                "working -- not placing a second",
+                self.slave_id, slave_ticket, previous,
             )
             return None
 
-        #--- A close that was placed and did NOT complete. The position is
-        #--- still at the broker, so this is a retry rather than a repeat,
-        #--- and it is worth saying out loud: an exit that has to be
-        #--- re-placed is an exit that rested or was refused.
-        if pos.get("closing_order_id") is not None:
+        if state == "unknown":
+            #--- The order is not in trades() at all. It may have been
+            #--- placed a second ago and not surfaced yet, or it may be
+            #--- long finished and dropped. Within the window that is a
+            #--- REPEATED CLOSE and must not place another order; past it
+            #--- the position has demonstrably stayed open and a retry is
+            #--- the only way out of the strand this whole change exists
+            #--- to fix.
+            age = time.time() - float(pos.get("closing_since") or 0.0)
+            if age < CLOSE_RETRY_AFTER_S:
+                raise AdapterRejectedError(
+                    f"a close for slave_ticket={slave_ticket} was placed "
+                    f"{age:.0f}s ago (order {previous}) and cannot be confirmed "
+                    f"finished; not placing a second")
+            logger.warning(
+                "IBKRAdapter[%s] close for slave_ticket=%s: closing order %s has "
+                "been unconfirmable for %.0fs and the position is still open -- "
+                "placing another",
+                self.slave_id, slave_ticket, previous, age,
+            )
+        elif state == "finished":
+            #--- Placed, over, and the position is still here: it rested,
+            #--- was refused, or expired. Worth saying out loud.
             logger.warning(
                 "IBKRAdapter[%s] close for slave_ticket=%s: the previous "
                 "closing order %s is no longer working and the position is "
                 "still open -- placing another",
-                self.slave_id, slave_ticket, pos.get("closing_order_id"),
+                self.slave_id, slave_ticket, previous,
             )
 
         self._cancel_tracked_order(pos.get("sl_order_id"))
@@ -1389,7 +1439,13 @@ class IBKRAdapter(BrokerAdapter):
         # rather than inferring it from a missing dict key, so an exit
         # still working blocks a second one and an exit that died does
         # not.
-        pos["closing_order_id"] = trade.order.orderId
+        #--- The id may not be readable -- a broker object this adapter did
+        #--- not shape, or a stand-in under test. `closing_since` is set
+        #--- either way, and _closing_order_state treats a close with no
+        #--- id as UNKNOWN rather than as no close at all: the one thing
+        #--- that must not follow from "I cannot tell" is a second order.
+        placed_order = getattr(trade, "order", None)
+        pos["closing_order_id"] = getattr(placed_order, "orderId", None)
         pos["closing_since"] = time.time()
         # Collected out of band too, for the same reason as the entry.
         self._exit_trades[slave_ticket] = (

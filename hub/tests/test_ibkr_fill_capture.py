@@ -394,7 +394,18 @@ def test_collected_trades_are_not_retained():
 
 def test_a_second_close_places_no_second_order():
     """Closing twice must not send another closing order -- that would open
-    an unintended short on a flat account."""
+    an unintended short on a flat account.
+
+    THE PROPERTY IS THE ORDER COUNT, not how the second call declines.
+    This used to require the second close to RAISE, which was true only
+    of how it was implemented: the first close deleted the position, so
+    the second could not find it. Since 2026-11-18 the position is kept
+    and marked (a close that never filled was otherwise unrecoverable --
+    789 ETHT stranded for 24 hours), so a repeat is declined by seeing
+    that a close is already working, and declining by doing nothing is a
+    fair answer to "close this" when it is already being closed.
+
+    Both shapes are accepted here; a SECOND ORDER is not."""
     a = _prepared(_adapter(), _Trade(price=1.0, fills_after=1))
     a._positions[35] = {"direction": "BUY", "size": 1.0,
                         "contract": object(), "sl_order_id": None,
@@ -402,8 +413,10 @@ def test_a_second_close_places_no_second_order():
 
     async def two_closes():
         await a.close(35)
-        with pytest.raises(Exception):
+        try:
             await a.close(35)
+        except AdapterRejectedError:
+            pass        # the other fair answer: refused outright
 
     asyncio.run(two_closes())
     assert len(a.ib.placed) == 1

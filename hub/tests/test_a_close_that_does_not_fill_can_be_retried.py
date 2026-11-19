@@ -71,37 +71,54 @@ def adapter(trades):
 
 
 # --- the guard -------------------------------------------------------
+#
+# Four answers, not two. "unknown" earned its place the hard way: the
+# first version of this collapsed it into "finished", so an order id
+# matching nothing in trades() read as an order that was over -- and the
+# full suite caught it placing a SECOND closing order, which on a flat
+# account is a new short. Stranding a position is recoverable. Selling it
+# twice is not. Not knowing therefore means not acting.
+
 
 @pytest.mark.parametrize("status", ["ApiPending", "PendingSubmit",
                                     "PreSubmitted", "Submitted"])
-def test_an_exit_still_working_blocks_a_second_one(status):
-    """The property the old `del` was there to protect, kept. A second
-    closing order would sell a position that is already being sold."""
+def test_an_exit_still_working_is_working(status):
+    """The property the old `del` protected, kept: a second closing order
+    would sell a position that is already being sold."""
     a = adapter([_Trade(4972, status)])
-    assert a._live_closing_order({"closing_order_id": 4972}) is not None
+    assert a._closing_order_state({"closing_order_id": 4972}) == "working"
 
 
 @pytest.mark.parametrize("status", ["Cancelled", "ApiCancelled", "Inactive",
                                     "Filled", "Expired"])
-def test_an_exit_that_is_over_does_not_block_a_retry(status):
-    """The defect. A closing order that rested and expired left a live
-    position that nothing could ever close again."""
+def test_an_exit_that_is_over_is_finished(status):
+    """The defect this file exists for: a closing order that rested and
+    expired left a live position nothing could ever close again."""
     a = adapter([_Trade(4972, status)])
-    assert a._live_closing_order({"closing_order_id": 4972}) is None
+    assert a._closing_order_state({"closing_order_id": 4972}) == "finished"
 
 
-def test_a_position_with_no_close_in_flight_is_free_to_close():
+def test_a_position_with_no_close_in_flight_has_none():
     a = adapter([_Trade(4972, "Submitted")])
-    assert a._live_closing_order({}) is None
+    assert a._closing_order_state({}) == "none"
 
 
-def test_an_order_id_the_broker_no_longer_lists_does_not_block():
-    """IBKR drops finished orders from trades() after a while. An id that
-    matches nothing is an order that is over, not one still working --
-    reading it the other way would strand the position again, by the
-    same mechanism and for the opposite reason."""
+def test_an_order_the_broker_does_not_list_is_unknown_not_finished():
+    """THE ONE THAT WAS WRONG. IBKR drops finished orders from trades()
+    eventually, and an order placed a moment ago may not have surfaced
+    yet -- those two look identical from here. Reading either as
+    "finished" places a second order into the second case."""
     a = adapter([_Trade(1111, "Submitted")])
-    assert a._live_closing_order({"closing_order_id": 4972}) is None
+    assert a._closing_order_state({"closing_order_id": 4972}) == "unknown"
+
+
+def test_a_close_whose_order_id_could_not_be_read_is_still_a_close():
+    """A broker object this adapter did not shape, or a stand-in under
+    test. A close was placed; the only thing that must not follow from
+    "I cannot tell which order" is a second one."""
+    a = adapter([])
+    assert a._closing_order_state({"closing_since": 1.0}) == "unknown"
+    assert a._closing_order_state({}) == "none"
 
 
 def test_the_position_s_own_stop_is_not_mistaken_for_a_close():
@@ -111,7 +128,18 @@ def test_the_position_s_own_stop_is_not_mistaken_for_a_close():
     stop = _Trade(5050, "PreSubmitted")
     stop.order.orderType = "STP"
     a = adapter([stop])
-    assert a._live_closing_order({"closing_order_id": 4972}) is None
+    assert a._closing_order_state({"closing_order_id": 4972}) == "unknown"
+
+
+def test_a_broker_that_will_not_answer_is_unknown_rather_than_fatal():
+    """trades() raising must not take the close path down with it."""
+    class _Angry:
+        def trades(self):
+            raise RuntimeError("not connected")
+
+    a = adapter([])
+    a.ib = _Angry()
+    assert a._closing_order_state({"closing_order_id": 4972}) == "unknown"
 
 
 # --- what close() does with it ---------------------------------------
@@ -157,6 +185,7 @@ def test_the_record_is_dropped_on_a_fill_and_not_on_a_placement():
         "will strand it exactly as before"
     )
     assert "closing_order_id" in close_src
+    assert "_closing_order_state(" in close_src
 
     await_src = code_only(ibkr.IBKRAdapter.await_exit_fill)
     assert await_src.count("self._positions.pop(slave_ticket, None)") == 2, (
