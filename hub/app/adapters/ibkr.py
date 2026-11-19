@@ -1218,12 +1218,61 @@ class IBKRAdapter(BrokerAdapter):
         pos["tp"] = None if tp is None else self._round_to_tick(
             tp, pos.get("symbol") or pos["contract"].symbol)
 
+    def _live_closing_order(self, pos: dict):
+        """The closing order already working for this position, if any.
+
+        Matched by the order id this adapter remembers placing, and by
+        nothing else. Matching on contract and direction instead would
+        catch the position's own protective STOP -- a SELL on the same
+        contract -- and a close would then refuse itself forever, which is
+        a worse failure than the one this guards against.
+
+        After a restart the id is not remembered (it is not persisted), so
+        a close placed before the restart is invisible here. That exposure
+        is the same as it has always been and is not made worse by this.
+        """
+        order_id = pos.get("closing_order_id")
+        if order_id is None or self.ib is None:
+            return None
+        working = ("ApiPending", "PendingSubmit", "PreSubmitted", "Submitted")
+        for trade in self.ib.trades():
+            if getattr(trade.order, "orderId", None) != order_id:
+                continue
+            status = getattr(getattr(trade, "orderStatus", None), "status", "")
+            return trade if status in working else None
+        return None
+
     async def close(self, slave_ticket: int) -> Optional[float]:
         ib_mod = self._require_ib()
         self._require_connected()
         pos = self._positions.get(slave_ticket)
         if pos is None:
             raise AdapterRejectedError(f"no tracked IBKR position for slave_ticket={slave_ticket}")
+
+        #--- A close already working. Checked BEFORE the protective orders
+        #--- are cancelled, so a repeated CLOSE cannot strip a position of
+        #--- its stop and then decline to do anything else.
+        working = self._live_closing_order(pos)
+        if working is not None:
+            logger.info(
+                "IBKRAdapter[%s] close for slave_ticket=%s: order %s is already "
+                "working (%s) -- not placing a second",
+                self.slave_id, slave_ticket, working.order.orderId,
+                working.orderStatus.status,
+            )
+            return None
+
+        #--- A close that was placed and did NOT complete. The position is
+        #--- still at the broker, so this is a retry rather than a repeat,
+        #--- and it is worth saying out loud: an exit that has to be
+        #--- re-placed is an exit that rested or was refused.
+        if pos.get("closing_order_id") is not None:
+            logger.warning(
+                "IBKRAdapter[%s] close for slave_ticket=%s: the previous "
+                "closing order %s is no longer working and the position is "
+                "still open -- placing another",
+                self.slave_id, slave_ticket, pos.get("closing_order_id"),
+            )
 
         self._cancel_tracked_order(pos.get("sl_order_id"))
         self._cancel_tracked_order(pos.get("tp_order_id"))
@@ -1317,11 +1366,31 @@ class IBKRAdapter(BrokerAdapter):
         closing_order.tif = self.entry_tif
         closing_order.outsideRth = pos.get("outside_rth", False)
         trade = self._place(pos["contract"], closing_order)
-        # Dropped before awaiting the fill, deliberately: the position is
-        # gone from IBKR's point of view the moment the closing order is
-        # accepted, and a second CLOSE arriving during the wait must not
-        # place a second closing order.
-        del self._positions[slave_ticket]
+        # MARKED, NOT DROPPED (2026-11-18).
+        #
+        # This used to `del self._positions[slave_ticket]` here, before
+        # awaiting the fill, so that a second CLOSE arriving during the
+        # wait could not place a second closing order. That half worked:
+        # it did stop the double close, and it also made a close that
+        # never completed UNRECOVERABLE. The position stays at the broker
+        # while the adapter has forgotten it, and every later attempt dies
+        # at the lookup above with "no tracked IBKR position".
+        #
+        # ibkr-etf-1 held 789 ETHT that way from 2026-11-17 18:00 for
+        # twenty-four hours and 965 attempts, across four log rotations
+        # and several hub restarts -- each restart restoring the position
+        # from engine_positions, granting exactly one more attempt, and
+        # losing it again. The error at the end of await_exit_fill already
+        # said "the position is still open there -- it needs a look"; by
+        # then there was nothing left to look with.
+        #
+        # The entry stays, and carries which order is closing it. The
+        # double-close guard now reads that order's REAL status from IBKR
+        # rather than inferring it from a missing dict key, so an exit
+        # still working blocks a second one and an exit that died does
+        # not.
+        pos["closing_order_id"] = trade.order.orderId
+        pos["closing_since"] = time.time()
         # Collected out of band too, for the same reason as the entry.
         self._exit_trades[slave_ticket] = (
             trade, float(pos.get("limit_offset_pct", 0.0) or 0.0))
@@ -1996,6 +2065,10 @@ class IBKRAdapter(BrokerAdapter):
 
         price, size = await self._await_fill(trade, "close")
         if price is not None:
+            # CONFIRMED, so the position is genuinely gone and the entry
+            # goes with it. This is the only place it is dropped: a fill,
+            # not the placing of an order that might produce one.
+            self._positions.pop(slave_ticket, None)
             return await self._complete_exit_fill(trade, price, size)
         if getattr(trade.order, "orderType", "") != "LMT":
             # A market order that did not fill is not a pricing problem,
@@ -2032,12 +2105,14 @@ class IBKRAdapter(BrokerAdapter):
                 # Through the same completion as the first wait: a chase
                 # step can fill part of the order just as readily, and a
                 # partial here would book the same under-measured close.
+                self._positions.pop(slave_ticket, None)
                 return await self._complete_exit_fill(trade, price, size)
 
         logger.error(
             "IBKRAdapter[%s] exit %s for %s never filled after %d re-prices; "
             "the order is still live at the broker and the position is still "
-            "open there -- it needs a look",
+            "open there -- it needs a look. The position stays tracked, so a "
+            "later CLOSE will re-place the exit once this order is done",
             self.slave_id, trade.order.orderId, symbol, steps,
         )
         return None, None
