@@ -24,6 +24,12 @@
 //|   1.03 2026-11-11 CLOSE publishes the exit price, not the entry    |
 //|   1.04 2026-11-14 publish what the order actually staked, and     |
 //|                   report this build on the heartbeat               |
+//|   1.10 2026-11-20 the heartbeat goes FIRST and cannot block. Sent  |
+//|                   last, after the snapshot and the publish, it was |
+//|                   starved by the very activity that most needs a   |
+//|                   live master: a test burst left a 98s gap against |
+//|                   a 30s staleness threshold, so the hub called the |
+//|                   master disconnected while it was busiest.        |
 //|   1.09 2026-11-20 the ZMQ context is UNNAMED. A named one is      |
 //|                   reference counted through MT4 GLOBAL VARIABLES,  |
 //|                   which survive a terminal restart -- so a count   |
@@ -50,13 +56,13 @@
 //|                   in daily ATRs. See AtrTimeframeForMagic().       |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.09"
+#property version   "1.10"
 // MUST match #property version above. MQL has no way to read that from
 // code, so the two are kept in step by hand -- and they had already
 // drifted once: the property said 1.04 while this said 1.03, which would
 // have had every master reporting the wrong build through the very
 // handshake added to stop that happening.
-#define   BRIDGE_VERSION "1.09"
+#define   BRIDGE_VERSION "1.10"
 
 #include <Zmq/Zmq.mqh>
 
@@ -275,16 +281,32 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTimer()
   {
+   //--- FIRST, and it used to be last.
+   //---
+   //--- Below this line is the snapshot, the diff and the publishing --
+   //--- all of which get slower exactly when the master is busy, which
+   //--- is exactly when "is the master alive?" matters most. MT4 does
+   //--- not re-enter a timer either, so a slow pass does not merely
+   //--- delay the heartbeat, it SKIPS the ticks it overran.
+   //---
+   //--- Seen on 2026-11-20: a four-signal test burst left a 98 second
+   //--- gap, against watchdog_stale_heartbeat_seconds = 30. The hub
+   //--- reported the master disconnected in the middle of the one run
+   //--- that proved it was working. Sent first, the gap can only be as
+   //--- long as a single pass rather than however many piled up.
+   if(GetTickCount() - lastHeartbeatSent >= (uint)HeartbeatIntervalMs)
+     {
+      //--- Only on success. A failed send that still stamped the clock
+      //--- would wait the full interval before trying again, turning one
+      //--- dropped frame into a reported outage.
+      if(SendHeartbeat())
+         lastHeartbeatSent = GetTickCount();
+     }
+
    OrderSnapshot current[];
    TakeSnapshot(current);
    DiffAndPublish(knownOrders, current);
    CopySnapshots(knownOrders, current);
-
-   if(GetTickCount() - lastHeartbeatSent >= (uint)HeartbeatIntervalMs)
-     {
-      SendHeartbeat();
-      lastHeartbeatSent = GetTickCount();
-     }
   }
 
 //+------------------------------------------------------------------+
@@ -566,7 +588,7 @@ string JsonEscape(string raw)
   }
 
 //+------------------------------------------------------------------+
-void SendHeartbeat()
+bool SendHeartbeat()
   {
    // The build each master is running, said by the master itself.
    //
@@ -585,6 +607,11 @@ void SendHeartbeat()
       "{\"account\":\"%d\",\"bridge_version\":\"%s\",\"ts\":%.3f}",
       AccountNumber(), BRIDGE_VERSION, (double)TimeGMT());
    ZmqMsg msg(json);
-   pushSocket.send(msg);
+   //--- NOWAIT. A PUSH socket blocks once its queue fills with no one
+   //--- draining it, and blocking here would freeze OnTimer -- so a hub
+   //--- that went away would stop the master from publishing signals
+   //--- too, turning a reporting outage into a trading one. A dropped
+   //--- heartbeat costs nothing; the next is a few seconds away.
+   return(pushSocket.send(msg, true));
   }
 //+------------------------------------------------------------------+
