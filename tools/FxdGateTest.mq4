@@ -59,6 +59,23 @@
 #include "FxdMaeEntryTest.mqh"
 
 //--- the gate's own inputs -------------------------------------------
+//--- THE SIMPLE PATH, and the one to reach for when the job is just
+//--- "send these legs at once and see what the copier does".
+//---
+//---     ETHUSD:120002:both,XAGUSD:110001:both
+//---
+//--- SYMBOL:MAGIC:SIDE, and an optional fourth field for the ATR
+//--- timeframe (ETHUSD:120002:both:H4). Without it a leg uses THIS
+//--- CHART'S timeframe, which is printed per leg so it is never a
+//--- guess. Side is long, short or both; both is the opposing pair,
+//--- sent in one burst.
+//---
+//--- Filled in, this WINS over GateListFile: nothing is read from the
+//--- registry, no status is consulted, and sizing comes from this
+//--- script's own RISK_A. That is the point -- the registry list
+//--- answers "which strategies may fire", which is a different
+//--- question from "fire these now".
+input string Legs            = "";
 input string GateListFile    = "gtc-gate-list.csv";  // in MQL4/Files; see make_gate_list.py
 //--- Empty fires every timeframe in the list. "D" or "D,H4" fires those.
 //--- The timeframe is the unit's, from the registry -- not this chart's.
@@ -110,6 +127,30 @@ ENUM_TIMEFRAMES TfFromCode(string code)
    if(c == "M5")              return(PERIOD_M5);
    if(c == "M1")              return(PERIOD_M1);
    return(PERIOD_CURRENT);
+  }
+
+//+------------------------------------------------------------------+
+//| The inverse, so a typed leg with no timeframe field can report     |
+//| the chart's own period as a word the plan line can print and       |
+//| TfFromCode can read straight back.                                 |
+//+------------------------------------------------------------------+
+string TfCode(ENUM_TIMEFRAMES tf)
+  {
+   switch(tf)
+     {
+      case PERIOD_W1:  return("W");
+      case PERIOD_D1:  return("D");
+      case PERIOD_H4:  return("H4");
+      case PERIOD_H1:  return("H1");
+      case PERIOD_M30: return("M30");
+      case PERIOD_M15: return("M15");
+      case PERIOD_M5:  return("M5");
+      case PERIOD_M1:  return("M1");
+     }
+   //--- A period with no code of its own. Named rather than silently
+   //--- turned into D1: the ATR timeframe decides the stop distance,
+   //--- which decides the size of every leg in the burst.
+   return("TF" + IntegerToString((int)tf));
   }
 
 //+------------------------------------------------------------------+
@@ -168,6 +209,77 @@ string ResolveSymbol(string wanted)
         }
      }
    return("");
+  }
+
+//+------------------------------------------------------------------+
+//| Legs typed straight into the input, no registry involved.          |
+//|                                                                    |
+//| SYMBOL:MAGIC:SIDE[:TF], comma separated. A leg that cannot be read  |
+//| is NAMED and skipped, like a bad list line -- a burst that silently |
+//| lost a leg is the failure this whole script exists to avoid.        |
+//|                                                                    |
+//| The magic still has to be the EA's own. The script places the       |
+//| orders itself and stamps them, so the copier sees exactly what it   |
+//| would see from the EA; what this does NOT test is the EA's own      |
+//| entry logic or that it is attached at all. `live-set verify` is the |
+//| check for that, and it needs no orders.                            |
+//+------------------------------------------------------------------+
+int ParseLegs(string spec, GateUnit &units[])
+  {
+   string trimmed = spec;
+   StringTrimLeft(trimmed);
+   StringTrimRight(trimmed);
+   if(trimmed == "")
+      return(0);
+
+   string items[];
+   StringSplitSimple(trimmed, ',', items);
+   int count = 0;
+
+   for(int i = 0; i < ArraySize(items); i++)
+     {
+      string item = items[i];
+      StringTrimLeft(item);
+      StringTrimRight(item);
+      if(item == "")
+         continue;
+
+      string f[];
+      StringSplitSimple(item, ':', f);
+      if(ArraySize(f) < 3)
+        {
+         Print("  ! '", item, "' needs SYMBOL:MAGIC:SIDE -- skipped");
+         continue;
+        }
+
+      GateUnit u;
+      u.symbol = f[0];
+      u.magic  = (int)StringToInteger(f[1]);
+      u.side   = f[2];
+      StringTrimLeft(u.symbol); StringTrimRight(u.symbol);
+      StringTrimLeft(u.side);   StringTrimRight(u.side);
+      StringToLower(u.side);
+      //--- No fourth field means this chart's timeframe. TfCode turns it
+      //--- back into a word so the plan prints what it actually used.
+      u.timeframe = (ArraySize(f) >= 4) ? f[3] : TfCode((ENUM_TIMEFRAMES)Period());
+      StringTrimLeft(u.timeframe); StringTrimRight(u.timeframe);
+      //--- Typed legs carry no registry status. Named rather than left
+      //--- blank so OnlyStatus still behaves predictably if it is set,
+      //--- and so nothing downstream has to treat "" as a status.
+      u.status = "typed";
+      u.source = "typed";
+
+      if(u.magic <= 0)
+        {
+         Print("  ! '", item, "' has no usable magic -- skipped");
+         continue;
+        }
+
+      ArrayResize(units, count + 1);
+      units[count] = u;
+      count++;
+     }
+   return(count);
   }
 
 //+------------------------------------------------------------------+
@@ -252,11 +364,32 @@ void OnStart()
          " -- ", (Fire ? "FIRING" : "DRY RUN, nothing will be sent"));
 
    GateUnit units[];
-   int found = ReadGateList(GateListFile, units);
-   if(found <= 0)
+   int found = 0;
+   //--- Typed legs win. Said out loud, because running the registry list
+   //--- when you meant to fire two legs by hand -- or the reverse -- is
+   //--- the one mistake here that costs real money.
+   string typed = Legs;
+   StringTrimLeft(typed);
+   StringTrimRight(typed);
+   if(typed != "")
      {
-      Print("ERROR: no units read from ", GateListFile);
-      return;
+      Print("source: Legs input (typed) -- GateListFile ignored, no registry read");
+      found = ParseLegs(typed, units);
+      if(found <= 0)
+        {
+         Print("ERROR: no usable legs in Legs=\"", Legs, "\"");
+         return;
+        }
+     }
+   else
+     {
+      Print("source: ", GateListFile, " (registry list)");
+      found = ReadGateList(GateListFile, units);
+      if(found <= 0)
+        {
+         Print("ERROR: no units read from ", GateListFile);
+         return;
+        }
      }
 
    //--- plan ------------------------------------------------------------
