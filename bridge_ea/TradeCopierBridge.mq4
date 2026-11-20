@@ -24,6 +24,21 @@
 //|   1.03 2026-11-11 CLOSE publishes the exit price, not the entry    |
 //|   1.04 2026-11-14 publish what the order actually staked, and     |
 //|                   report this build on the heartbeat               |
+//|   1.09 2026-11-20 the ZMQ context is UNNAMED. A named one is      |
+//|                   reference counted through MT4 GLOBAL VARIABLES,  |
+//|                   which survive a terminal restart -- so a count   |
+//|                   leaked by any kill that skips OnDeinit left the  |
+//|                   next attach reading a handle from a dead process |
+//|                   (or 0), forever. Nothing could clear it: not     |
+//|                   reattaching, not restarting, not recompiling.    |
+//|   1.08 2026-11-20 the ZMQ context and sockets are built in OnInit  |
+//|                   and CHECKED. Built at global scope they ran      |
+//|                   before OnInit with nothing watching: on a        |
+//|                   terminal restart one wedged, and the EA sat on   |
+//|                   the chart for 20 minutes logging NOTHING. Worse, |
+//|                   OnInit then printed "connected" without reading  |
+//|                   either connect()'s result, so a reattach that    |
+//|                   opened no socket at all still said connected.    |
 //|   1.06 2026-11-16 the ATR is measured on the last CLOSED bar,     |
 //|                   which is the bar the EA sized from. Shift 0 was  |
 //|                   the forming one, stretching every slave stop --  |
@@ -35,13 +50,13 @@
 //|                   in daily ATRs. See AtrTimeframeForMagic().       |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.07"
+#property version   "1.09"
 // MUST match #property version above. MQL has no way to read that from
 // code, so the two are kept in step by hand -- and they had already
 // drifted once: the property said 1.04 while this said 1.03, which would
 // have had every master reporting the wrong build through the very
 // handshake added to stop that happening.
-#define   BRIDGE_VERSION "1.07"
+#define   BRIDGE_VERSION "1.09"
 
 #include <Zmq/Zmq.mqh>
 
@@ -96,9 +111,23 @@ input bool   AtrTimeframeFromMagic = true;   // leading digit of the magic picks
 //--- see.
 input int    AtrShift             = 1;       // 1 = last closed bar, 0 = the forming one
 
-Context zmqContext("bridge_ea_master");
-Socket  pubSocket(zmqContext, ZMQ_PUB);
-Socket  pushSocket(zmqContext, ZMQ_PUSH);
+//--- BUILT IN OnInit, not here, and that is the point.
+//---
+//--- A global object's constructor runs before OnInit, outside any code
+//--- that could check it or log it. zmq_ctx_new() and zmq_socket() are
+//--- DLL calls, so when libzmq cannot load -- or loads and wedges --
+//--- there is no return value anyone reads and no line in the Experts
+//--- tab. Seen on 2026-11-20: the terminal restarted, the EA loaded,
+//--- printed its inputs, and then nothing at all for twenty minutes.
+//--- No error, no socket, no heartbeat, and a master that simply looked
+//--- absent.
+//---
+//--- As pointers the construction moves into OnInit, where every step
+//--- is checked and named, and a failure returns INIT_FAILED instead of
+//--- leaving a dead EA sitting on the chart looking attached.
+Context *zmqContext = NULL;
+Socket  *pubSocket  = NULL;
+Socket  *pushSocket = NULL;
 
 struct OrderSnapshot
   {
@@ -131,16 +160,85 @@ int OnInit()
    string pubAddr  = StringFormat("tcp://%s:%d", HubHost, HubPubPort);
    string pushAddr = StringFormat("tcp://%s:%d", HubHost, HubPushPort);
 
+   // Each step says it happened. If the EA dies between two of these
+   // lines, the last one printed is the step that killed it -- which is
+   // the whole diagnosis, available immediately in the Experts tab.
+   // UNNAMED, and that is the fix for a day lost on 2026-11-20.
+   //
+   // Context(name) is reference counted across EAs through MT4 GLOBAL
+   // VARIABLES -- "<name>_Count" and "<name>_Ref". The constructor only
+   // calls zmq_ctx_new() when the count is ZERO; otherwise it trusts
+   // "_Ref" and reuses it:
+   //
+   //     if(long(GlobalVariable::get(m_counterName))==0)
+   //        m_ref = m_hm.create();
+   //     else
+   //        m_ref = (T)(GlobalVariable::get(m_refName));
+   //
+   // The count is only decremented by the DESTRUCTOR. Any exit that
+   // skips it -- terminal killed, crash, abrupt close -- leaks the
+   // count, and MT4's "temporary" globals only clear on a CLEAN exit.
+   // So the next attach takes the else branch and adopts a handle from
+   // a process that no longer exists, or 0 where "_Ref" went. Dead
+   // context, dead sockets, no connection. The stale state lives in
+   // gvariables.dat, which outlives the terminal, so reattaching,
+   // restarting and recompiling all fail identically and forever.
+   //
+   // Unnamed makes CriticalSection::isValid() false, which takes the
+   // direct path: m_ref = m_hm.create(), no globals touched at all.
+   // Sharing bought nothing here -- this EA is the only user of the
+   // context in this terminal -- and cost exactly one whole failure
+   // mode, invisible in every log.
+   zmqContext = new Context();
+   if(zmqContext == NULL || zmqContext.ref() == 0)
+     {
+      Print("FATAL: ZMQ context could not be created. libzmq.dll is missing ",
+            "from the MQL4 Libraries folder, or 'Allow DLL imports' is off for this EA. ",
+            "Nothing can leave this terminal -- no signals, no heartbeat.");
+      return(INIT_FAILED);
+     }
+   Print("TradeCopierBridge ", BRIDGE_VERSION, ": ZMQ context created");
+
+   pubSocket  = new Socket(zmqContext, ZMQ_PUB);
+   pushSocket = new Socket(zmqContext, ZMQ_PUSH);
+   if(pubSocket == NULL || !pubSocket.valid())
+     {
+      Print("FATAL: the PUB socket could not be created -- signals cannot be published.");
+      return(INIT_FAILED);
+     }
+   if(pushSocket == NULL || !pushSocket.valid())
+     {
+      Print("FATAL: the PUSH socket could not be created -- no heartbeat can be sent.");
+      return(INIT_FAILED);
+     }
+   Print("TradeCopierBridge ", BRIDGE_VERSION, ": PUB and PUSH sockets created");
+
    // LINGER=0 so OnDeinit can't block MT4's shutdown trying to flush queued
    // frames to a hub that isn't there. Observed as "shutdown by timeout" in
    // the Experts log (uninit reason 9) when closing the terminal.
    pubSocket.setLinger(0);
    pushSocket.setLinger(0);
 
-   pubSocket.connect(pubAddr);
-   pushSocket.connect(pushAddr);
+   // READ, not ignored. Ignoring these is how 1.07 came to print
+   // "connected" while the terminal held no socket to the hub at all --
+   // the log said one thing and netstat said another, and the log was
+   // the one being believed.
+   if(!pubSocket.connect(pubAddr))
+     {
+      Print("FATAL: PUB could not connect to ", pubAddr, " -- signals would go nowhere.");
+      return(INIT_FAILED);
+     }
+   if(!pushSocket.connect(pushAddr))
+     {
+      Print("FATAL: PUSH could not connect to ", pushAddr, " -- no heartbeat can be sent.");
+      return(INIT_FAILED);
+     }
 
-   Print("TradeCopierBridge ", BRIDGE_VERSION, " connected: PUB->", pubAddr, "  PUSH->", pushAddr);
+   // Still only "accepted": zmq_connect is asynchronous, so this says the
+   // addresses were taken, not that the hub answered. The hub showing a
+   // heartbeat is the proof, and it is five seconds away.
+   Print("TradeCopierBridge ", BRIDGE_VERSION, " connect accepted: PUB->", pubAddr,
+         "  PUSH->", pushAddr, " -- the hub's heartbeat is the confirmation");
 
    TakeSnapshot(knownOrders);
    EventSetMillisecondTimer(PollIntervalMs);
@@ -151,8 +249,27 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    EventKillTimer();
-   pubSocket.disconnect(StringFormat("tcp://%s:%d", HubHost, HubPubPort));
-   pushSocket.disconnect(StringFormat("tcp://%s:%d", HubHost, HubPushPort));
+   // Guarded, because OnDeinit also runs after an OnInit that returned
+   // INIT_FAILED -- the case where some of these were never created.
+   if(pubSocket != NULL)
+     {
+      pubSocket.disconnect(StringFormat("tcp://%s:%d", HubHost, HubPubPort));
+      delete pubSocket;
+      pubSocket = NULL;
+     }
+   if(pushSocket != NULL)
+     {
+      pushSocket.disconnect(StringFormat("tcp://%s:%d", HubHost, HubPushPort));
+      delete pushSocket;
+      pushSocket = NULL;
+     }
+   // After the sockets, never before: closing the context first leaves
+   // zmq_close with a handle to something already gone.
+   if(zmqContext != NULL)
+     {
+      delete zmqContext;
+      zmqContext = NULL;
+     }
   }
 
 //+------------------------------------------------------------------+
