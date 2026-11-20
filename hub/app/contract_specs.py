@@ -108,6 +108,25 @@ MICRO_FUTURES_SPECS: Dict[str, ContractSpec] = {
 
     "GC":  ContractSpec("GC",  tick_size=0.10, tick_value=10.00, point_value=100.0, exchange="COMEX", liquid_months=(2, 4, 6, 8, 12)), # Gold
 
+    # The remaining full-size parents of micros already routed here. Added
+    # 2026-11-15 so every asset can offer the same step-down chain gold
+    # now has: the largest contract when rounding to a whole one of them
+    # is cheap, the micro when it is not.
+    #
+    # Each is exactly TEN of its micro, which is the CME convention for
+    # this group and is asserted per-pair in the tests rather than
+    # assumed -- the crypto and metals pairs are 50x, 500x and 5x, so a
+    # blanket rule would be wrong four times over.
+    #
+    # Indicative, like everything else in this table: tick_value is
+    # minTick x multiplier, and CME can change a multiplier. Verify
+    # against CME's published specs before trading real size.
+    "ES":  ContractSpec("ES",  tick_size=0.25, tick_value=12.50, point_value=50.0,   exchange="CME",   liquid_months=(3, 6, 9, 12)),  # E-mini S&P 500, $50 x index
+    "NQ":  ContractSpec("NQ",  tick_size=0.25, tick_value=5.00,  point_value=20.0,   exchange="CME",   liquid_months=(3, 6, 9, 12)),  # E-mini Nasdaq-100, $20 x index
+    "RTY": ContractSpec("RTY", tick_size=0.10, tick_value=5.00,  point_value=50.0,   exchange="CME",   liquid_months=(3, 6, 9, 12)),  # E-mini Russell 2000, $50 x index
+    "YM":  ContractSpec("YM",  tick_size=1.00, tick_value=5.00,  point_value=5.0,    exchange="CBOT",  liquid_months=(3, 6, 9, 12)),  # E-mini Dow, $5 x index
+    "CL":  ContractSpec("CL",  tick_size=0.01, tick_value=10.00, point_value=1000.0, exchange="NYMEX"),                               # WTI Crude Oil, 1,000 bbl
+
     # Silver, both sizes. Verified against the live Gateway rather than a
     # fact card: multiplier 1000 and 5000, minTick 0.005 on both, so a tick
     # is $5.00 on the micro and $25.00 on the full-size. Both are listed

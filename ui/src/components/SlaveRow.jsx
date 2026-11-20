@@ -7,6 +7,7 @@
  * behind a toggle. Six slaves already scroll; the plan is more.
  */
 import { useState } from "react";
+import { adapterLabel, slaveFacts, slaveRouting } from "../slaveFacts.js";
 
 export default function SlaveRow({ slave, onTogglePause, onRemove }) {
   const [open, setOpen] = useState(false);
@@ -19,16 +20,17 @@ export default function SlaveRow({ slave, onTogglePause, onRemove }) {
     slave.connected === true ? "badge-ok" : slave.connected === false ? "badge-error" : "badge-warn";
 
   const positions = slave.positions;
-  const scale = slave.risk_scale ?? 1;
-  const byMagic = Object.keys(slave.risk_scale_by_magic || {}).length;
+  const facts = slaveFacts(slave);
 
   return (
     <>
       <tr className="slave-row">
         <td>
           <div className="slave-name">{slave.name}</div>
-          <div className="slave-meta">
-            {slave.broker_type} &middot; {slave.mode}
+          {/* Broker and what it trades on. The mode sentence that used
+              to sit here wrapped this column to three lines. */}
+          <div className="slave-meta" title="The adapter driving this slave. The MT4 adapter drives MT4 and MT5 terminals alike -- the bridge does not say which.">
+            {adapterLabel(slave.broker_type)} &middot; {slaveRouting(slave)}
           </div>
         </td>
         <td>
@@ -38,19 +40,34 @@ export default function SlaveRow({ slave, onTogglePause, onRemove }) {
           {slave.running ? <span className={`badge ${connClass}`}>{connBadge}</span> : <span className="muted">--</span>}
         </td>
         <td className="slave-row-masters">{slave.master_filter_summary}</td>
-        <td className="slave-row-sizing">{slave.sizing_summary}</td>
-        <td>
-          {scale === 1 && byMagic === 0 ? (
-            <span className="muted">full</span>
-          ) : (
-            <>
-              {scale !== 1 && <span>x{scale}</span>}
-              {byMagic > 0 && (
-                <span className="badge" title="Strategies with their own scale on this slave">
-                  {byMagic} per-EA
-                </span>
-              )}
-            </>
+        {/* The same three facts as the tile, in the same order and from
+            the same place, so the two views cannot disagree about what a
+            slave stakes. */}
+        <td className="slave-row-sizing">
+          <div className="slave-facts">
+            <div className="slave-fact">
+              <span className="slave-fact-k">Mode</span>
+              <span className="slave-fact-v">{facts.mode || "--"}</span>
+            </div>
+            <div className="slave-fact">
+              <span className="slave-fact-k">Risk</span>
+              <span className="slave-fact-v">{facts.risk || "--"}</span>
+            </div>
+            <div className="slave-fact">
+              <span className="slave-fact-k">Cap</span>
+              <span className="slave-fact-v">{facts.cap || "--"}</span>
+            </div>
+          </div>
+        </td>
+        <td className="slave-row-rc">
+          <span className="slave-fact-v">x{facts.rc}</span>
+          {facts.overrides > 0 && (
+            <span
+              className="badge"
+              title="Strategies with their own figure, which multiplies this slave's calibration"
+            >
+              {facts.overrides} per-EA
+            </span>
           )}
         </td>
         <td>{slave.magic_filter_summary}</td>

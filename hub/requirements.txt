@@ -20,6 +20,15 @@ python-dotenv==1.2.2
 httpx==0.28.1
 pytest==9.1.1
 python-multipart==0.0.32
+# The IANA timezone database, for zoneinfo. Windows ships no system copy,
+# so without this `ZoneInfo("America/New_York")` raises -- and that is the
+# zone every US session boundary in app/order_timing.py is defined in.
+#
+# It was already installed here, pulled in transitively, which is exactly
+# why it is declared now: a resolver change that stopped bringing it along
+# would break GTD deadlines on a hub nobody had touched. The alternative --
+# a hardcoded UTC offset for Eastern -- is wrong for half the year.
+tzdata==2025.3
 
 # Optional -- only needed for IBKR slaves (app/adapters/ibkr.py lazy-imports
 # it, so the hub runs fine without it). ib_async is the maintained successor

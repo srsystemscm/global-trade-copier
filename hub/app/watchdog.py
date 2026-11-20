@@ -338,3 +338,145 @@ class MasterWatchdog:
                     await self.notifier.notify(
                         "master_disconnected", f"Master account {account} stopped sending heartbeats", account=account
                     )
+
+
+class ConsumeWatchdog:
+    """Watches that every engine is still draining its signal queue.
+
+    THE GAP THIS FILLS. SlaveWatchdog watches the adapter and MasterWatchdog
+    watches the feed. Nothing watched the thing in between: the per-slave
+    consume loop. On 2026-11-16 four AutonomousCopyEngines stopped
+    consuming -- an exception that was not an AdapterError escaped `_run`
+    and ended the task -- and every indicator stayed green. The adapter was
+    connected, the engine object was alive, /slaves said running: true, and
+    eight signals reached mt5-icm-1 and never reached ibkr-paper-1. The only
+    symptom was an absence, and an absence looks exactly like a quiet
+    master.
+
+    Two conditions, deliberately separate:
+
+      ENDED   -- the task is done. Terminal: every signal from now on is
+                 dropped. This also RETRIEVES the task's exception, which
+                 is the only way that exception is ever seen: asyncio
+                 reports an un-retrieved one when the task is garbage
+                 collected, and the engine holds the reference forever.
+
+      BACKED UP -- the queue has depth and nothing has been taken off it
+                 for `stale_after`. Covers a loop wedged inside a handler
+                 (a broker call with no timeout), where the task is still
+                 alive and still consuming nothing.
+
+    Reads app.state.engines rather than holding its own list, so slaves
+    added by POST /slaves while the hub runs are watched too.
+    """
+
+    def __init__(
+        self,
+        app_state,
+        events: EventBus,
+        notifier: Notifier,
+        poll_interval: float = 15.0,
+        stale_after: float = 60.0,
+    ) -> None:
+        self.app_state = app_state
+        self.events = events
+        self.notifier = notifier
+        self.poll_interval = poll_interval
+        self.stale_after = stale_after
+        # Alert once per condition per slave, not once per poll. A dead
+        # loop stays dead, and a notification every fifteen seconds is how
+        # an alert gets muted.
+        self._alerted: Dict[str, str] = {}
+        self._task: Optional[asyncio.Task] = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._loop(), name="watchdog-consume")
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+    @staticmethod
+    def _consume_task(engine) -> Optional[asyncio.Task]:
+        """AutonomousCopyEngine calls it _consume_task, CopyEngine _task."""
+        return getattr(engine, "_consume_task", None) or getattr(engine, "_task", None)
+
+    async def _loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.poll_interval)
+            try:
+                await self._check_all()
+            except Exception:
+                # The watchdog is the thing that is supposed to survive.
+                # Dying here would reproduce the exact failure it exists
+                # to catch, one level up.
+                logger.exception("consume watchdog poll failed; still watching")
+
+    async def _check_all(self) -> None:
+        now = time.time()
+        for engine in list(getattr(self.app_state, "engines", []) or []):
+            slave_id = getattr(engine, "slave_id", "?")
+            task = self._consume_task(engine)
+            queue = getattr(engine, "queue", None)
+            depth = queue.qsize() if queue is not None else 0
+            last = float(getattr(engine, "last_consumed_at", 0.0) or 0.0)
+
+            if task is not None and task.done():
+                await self._alert_once(slave_id, "ended", self._ended_message(slave_id, task, depth))
+                continue
+
+            idle_for = now - last if last else None
+            if depth and (idle_for is None or idle_for > self.stale_after):
+                waited = f"{idle_for:.0f}s" if idle_for is not None else "since the hub started"
+                await self._alert_once(slave_id, "backed_up", (
+                    f"Slave {slave_id} has {depth} signal(s) queued and has taken "
+                    f"nothing off the queue for {waited}. The loop is alive but "
+                    f"consuming nothing -- a handler is probably stuck on a broker call."
+                ))
+                continue
+
+            # Drained. Arm the alert again, so a second stall is reported.
+            self._alerted.pop(slave_id, None)
+
+    def _ended_message(self, slave_id: str, task: asyncio.Task, depth: int) -> str:
+        """The loop is gone. Name what killed it if the task will say."""
+        cause = "no exception -- the loop returned"
+        if task.cancelled():
+            cause = "cancelled"
+        else:
+            try:
+                exc = task.exception()
+            except Exception:  # pragma: no cover - only if still pending
+                exc = None
+            if exc is not None:
+                cause = f"{type(exc).__name__}: {exc}"
+                # Logged with the stack here because this is the one
+                # moment it can be: retrieving it is what makes it
+                # visible at all.
+                logger.error(
+                    "slave=%s consume loop died", slave_id, exc_info=exc,
+                )
+        return (
+            f"Slave {slave_id} HAS STOPPED CONSUMING SIGNALS and will not start "
+            f"again on its own ({cause}). {depth} signal(s) are queued; every "
+            f"signal from now on is dropped. Restart the hub."
+        )
+
+    async def _alert_once(self, slave_id: str, condition: str, message: str) -> None:
+        if self._alerted.get(slave_id) == condition:
+            return
+        self._alerted[slave_id] = condition
+        logger.error(message)
+        await self.events.emit({
+            "type": "slave_consume_stalled",
+            "slave_id": slave_id,
+            "condition": condition,
+            "message": message,
+        })
+        await self.notifier.notify(
+            "slave_consume_stalled", message, slave_id=slave_id, condition=condition
+        )

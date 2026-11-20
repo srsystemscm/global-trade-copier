@@ -67,6 +67,25 @@ class OrderRequest:
     # priced the same way as the entry. Without it the adapter would have to
     # guess, and a market exit cannot fill outside regular hours.
     limit_offset_pct: float = 0.0
+    # Time in force for the ENTRY, and how long to wait for it. None on
+    # either means "use the adapter's own default", which is what every
+    # route did before these existed.
+    #
+    # The case they are for: an ETF leg opened from a CFD signal at 18:00
+    # ET, or over a weekend. A DAY order expires at that session's close, so
+    # it can never reach Monday's pre-market -- and the adapter-wide 900s
+    # abandon timer cancelled it a quarter of an hour in regardless.
+    tif: Optional[str] = None
+    entry_timeout: Optional[float] = None
+    # When a GTD entry expires at the broker. Seconds from now, or a
+    # session boundary like "rth_open" (app/order_timing.py); the adapter
+    # resolves it at placement, because "the next open" has no answer at
+    # config-load time.
+    #
+    # Required when `tif` is GTD. GTD used to be accepted and sent with no
+    # date, so a route asking to expire at the open got an order that never
+    # expires -- an entry resting days past the signal that justified it.
+    good_till: Optional[object] = None
     # Whether to place broker-side stop/target orders at all. ETF legs set
     # this false: those orders do not execute in extended hours, so resting
     # them achieves nothing while leaving GTC orders to strand. Those legs
@@ -79,6 +98,33 @@ class OrderRequest:
     # An exact contract to trade, overriding month_slot. Set when rolling: the
     # destination is a specific contract, not "whatever slot N is right now".
     contract_id: Optional[int] = None
+    # Place this entry as N orders `split_interval` seconds apart instead
+    # of one, for a size the book cannot absorb in a single print. All of
+    # them are the SAME instrument and direction and collapse into one
+    # tracked position: one row, one pair of protective legs, one thing to
+    # roll.
+    #
+    # None on either means "use the adapter's own default", like tif and
+    # entry_timeout above. An adapter that cannot split ignores these, and
+    # the engine says so rather than letting it pass unnoticed.
+    split_slices: Optional[int] = None
+    split_interval: Optional[float] = None
+
+
+@dataclass
+class WorkingOrder:
+    """An order live at the broker with nothing filled against it yet.
+
+    `order_ref` is the join that matters: it is the string WE chose, so a
+    registry row can be matched to a working order without trusting the
+    broker to hand back an id we can recognise. Same reference the Flex
+    reconciliation keys on.
+    """
+
+    order_ref: Optional[str]
+    symbol: str
+    broker_order_id: Optional[str] = None
+    status: str = ""
 
 
 @dataclass
@@ -100,6 +146,14 @@ class OrderResult:
     # Echoed back so the caller records exactly what reached the broker,
     # rather than rebuilding the string and hoping the two agree.
     broker_order_ref: Optional[str] = None
+    # How many broker orders this ONE position's entry is going out in:
+    # 1 normally, N when split over a window. None from an adapter that
+    # does not split, which the caller reads as 1.
+    #
+    # Reported rather than recomputed by the caller, because the adapter
+    # is what decided it -- a size too small to go round comes back as
+    # fewer, larger slices than the config asked for.
+    slices: Optional[int] = None
 
 
 @dataclass
@@ -308,3 +362,24 @@ class BrokerAdapter(abc.ABC):
 
     @abc.abstractmethod
     async def get_open_positions(self, account_type: str) -> List[Position]: ...
+
+    async def get_working_orders(self) -> List["WorkingOrder"]:
+        """Orders live at the broker that have not filled.
+
+        A third state, and the one reconciliation had no way to see. It
+        compared registry rows against POSITIONS, so a resting limit
+        answered "no position" and the row was marked CLOSED -- while the
+        order was still working. It then filled into a position nothing
+        was tracking.
+
+        That window used to be 15 minutes, the adapter's abandon timer. A
+        route carrying `tif: GTC` and a 26-hour wait, which is what an
+        evening ETF entry needs, makes it a day.
+
+        NotImplementedError by default: only a broker that can answer this
+        should, and reconciliation degrades to its old behaviour for the
+        rest rather than guessing.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot report working orders"
+        )

@@ -72,6 +72,12 @@ CREATE TABLE IF NOT EXISTS slave_trades (
     filled_at           REAL,   -- adapter came back with a ticket
     master_close_price  REAL,
     slave_close_price   REAL,
+    -- How many orders this ONE position's entry went out in. 1, or NULL on
+    -- a row written before the splitter existed. A split entry is one
+    -- position by design -- one row, one pair of protective legs, one
+    -- thing to roll -- which also made it invisible: nothing on any screen
+    -- said whether 33 MGC arrived in one print or three.
+    entry_slices        INTEGER,
     -- The BROKER's own id for the order, where it has one distinct from
     -- the handle this hub trades by.
     --
@@ -93,6 +99,41 @@ CREATE TABLE IF NOT EXISTS slave_trades (
     -- a stop fill recognisable instead of looking like drift.
     broker_order_ref    TEXT,
     UNIQUE (slave_id, master_account, master_ticket, slave_symbol)
+);
+
+-- The ORDERS a split entry went out in. One row per slice, all of them
+-- belonging to the single slave_trades row above.
+--
+-- Why they are kept at all, when the whole point of the splitter is that
+-- N orders become ONE position: the reason to split a 33-lot entry is
+-- market impact, and the only way to know whether it worked is to
+-- compare what slice 1 filled at against slice 3. The position's single
+-- average price cannot answer that -- it is the number the splitting was
+-- supposed to improve.
+--
+-- Deliberately NOT the thing anything trades from. The position, its
+-- size, its protective legs and its exit all come off slave_trades;
+-- these rows are a measurement, and nothing downstream should ever have
+-- to assemble a position out of them.
+CREATE TABLE IF NOT EXISTS slave_trade_slices (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    slave_id        TEXT    NOT NULL,
+    master_account  TEXT    NOT NULL DEFAULT '',
+    master_ticket   INTEGER NOT NULL,
+    slave_symbol    TEXT    NOT NULL,
+    -- The POSITION's ticket -- slice 1's order id, which is what the
+    -- slave_trades row is keyed by. Every slice of one entry carries it.
+    slave_ticket    INTEGER,
+    n               INTEGER NOT NULL,   -- 1-based, in the order they went out
+    broker_order_id TEXT,               -- this slice's OWN order id
+    size            REAL,               -- what the slice was placed for
+    filled          REAL,               -- what it actually filled; may be less
+    fill_price      REAL,
+    placed_at       REAL,
+    -- One row per slice per position, so a re-report corrects rather than
+    -- duplicates. A slice that was cancelled before filling still gets a
+    -- row: "placed 11 and filled nothing" is a measurement too.
+    UNIQUE (slave_id, master_account, master_ticket, slave_symbol, n)
 );
 
 CREATE TABLE IF NOT EXISTS engine_positions (
@@ -321,6 +362,7 @@ _ADDED_COLUMNS = {
         ("filled_at", "REAL"),
         ("master_close_price", "REAL"),
         ("slave_close_price", "REAL"),
+        ("entry_slices", "INTEGER"),
     ],
     "engine_positions": [
         ("atr_period", "INTEGER"),

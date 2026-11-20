@@ -9,7 +9,7 @@
  * it last sent a signal. They are different questions: a terminal can be
  * alive and flat for hours.
  */
-export default function MasterPanel({ status, trades, wsConnected }) {
+export default function MasterPanel({ status, trades }) {
   if (!status) {
     return <div className="panel">Loading master status...</div>;
   }
@@ -37,25 +37,6 @@ export default function MasterPanel({ status, trades, wsConnected }) {
 
   return (
     <section className="masters">
-      <div className="panel hub-strip">
-        <div className="master-stat">
-          <span className="label">Hub uptime</span>
-          <span className="value">{formatUptime(status.uptime_seconds)}</span>
-        </div>
-        <div className="master-stat">
-          <span className="label">Signal ports</span>
-          <span className="value">
-            SUB :{status.master.sub_port} / PULL :{status.master.pull_port}
-          </span>
-        </div>
-        <div className="master-stat">
-          <span className="label">Live feed</span>
-          <span className={`badge ${wsConnected ? "badge-ok" : "badge-error"}`}>
-            {wsConnected ? "connected" : "disconnected"}
-          </span>
-        </div>
-      </div>
-
       <h2>Masters</h2>
       {accounts.length === 0 && (
         <p className="muted">
@@ -87,12 +68,31 @@ export default function MasterPanel({ status, trades, wsConnected }) {
                 <span className="value">
                   {sig ? (
                     <>
-                      {sig.symbol} {sig.action}{" "}
+                      <span className="master-sig">
+                        {sig.symbol} {sig.action}
+                      </span>{" "}
                       <span className="muted">{formatAge(now - sig.received_at)}</span>
                     </>
                   ) : (
                     <span className="muted">none this session</span>
                   )}
+                </span>
+              </div>
+              {/* WHAT THIS MASTER'S SIGNALS ARRIVE THROUGH, inside the
+                  card they belong to. Hub-wide facts, so they repeat on
+                  every card -- which is the point: with four masters,
+                  reading one card tells you the whole path for that
+                  master without looking anywhere else, and a card is
+                  what gets screenshotted when one of them goes quiet.
+                  Kept to a footer rule and the smallest type on the
+                  page so repetition costs nothing. */}
+              <div className="master-card-foot">
+                <span>
+                  <span className="k">Uptime</span> {formatUptime(status.uptime_seconds)}
+                </span>
+                <span>
+                  <span className="k">Ports</span> SUB :{status.master.sub_port} / PULL :
+                  {status.master.pull_port}
                 </span>
               </div>
             </div>
@@ -103,14 +103,6 @@ export default function MasterPanel({ status, trades, wsConnected }) {
   );
 }
 
-function formatUptime(seconds) {
-  const s = Math.floor(seconds);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  return `${h}h ${m}m ${sec}s`;
-}
-
 function formatAge(seconds) {
   const s = Math.max(0, Math.round(seconds));
   if (s < 90) return `${s}s ago`;
@@ -119,4 +111,11 @@ function formatAge(seconds) {
   const h = Math.round(m / 60);
   if (h < 48) return `${h}h ago`;
   return `${Math.round(h / 24)}d ago`;
+}
+
+function formatUptime(seconds) {
+  const s = Math.floor(seconds || 0);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return `${h}h ${m}m ${s % 60}s`;
 }

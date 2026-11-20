@@ -22,30 +22,118 @@
 //|   1.01 2026-09-10 fixes from the first real terminal shakeout      |
 //|   1.02 2026-10-29 magic number carried through the signal          |
 //|   1.03 2026-11-11 CLOSE publishes the exit price, not the entry    |
+//|   1.04 2026-11-14 publish what the order actually staked, and     |
+//|                   report this build on the heartbeat               |
+//|   1.10 2026-11-20 the heartbeat goes FIRST and cannot block. Sent  |
+//|                   last, after the snapshot and the publish, it was |
+//|                   starved by the very activity that most needs a   |
+//|                   live master: a test burst left a 98s gap against |
+//|                   a 30s staleness threshold, so the hub called the |
+//|                   master disconnected while it was busiest.        |
+//|   1.09 2026-11-20 the ZMQ context is UNNAMED. A named one is      |
+//|                   reference counted through MT4 GLOBAL VARIABLES,  |
+//|                   which survive a terminal restart -- so a count   |
+//|                   leaked by any kill that skips OnDeinit left the  |
+//|                   next attach reading a handle from a dead process |
+//|                   (or 0), forever. Nothing could clear it: not     |
+//|                   reattaching, not restarting, not recompiling.    |
+//|   1.08 2026-11-20 the ZMQ context and sockets are built in OnInit  |
+//|                   and CHECKED. Built at global scope they ran      |
+//|                   before OnInit with nothing watching: on a        |
+//|                   terminal restart one wedged, and the EA sat on   |
+//|                   the chart for 20 minutes logging NOTHING. Worse, |
+//|                   OnInit then printed "connected" without reading  |
+//|                   either connect()'s result, so a reattach that    |
+//|                   opened no socket at all still said connected.    |
+//|   1.06 2026-11-16 the ATR is measured on the last CLOSED bar,     |
+//|                   which is the bar the EA sized from. Shift 0 was  |
+//|                   the forming one, stretching every slave stop --  |
+//|                   7% on H1 -- and making a run unrepeatable.       |
+//|   1.05 2026-11-15 the ATR follows the MAGIC, not this EA's chart.  |
+//|                   Until now every signal carried iATR() on         |
+//|                   PERIOD_CURRENT -- one figure for every strategy  |
+//|                   -- so an H4 stop arrived at the slave measured   |
+//|                   in daily ATRs. See AtrTimeframeForMagic().       |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.04"
+#property version   "1.10"
 // MUST match #property version above. MQL has no way to read that from
 // code, so the two are kept in step by hand -- and they had already
 // drifted once: the property said 1.04 while this said 1.03, which would
 // have had every master reporting the wrong build through the very
 // handshake added to stop that happening.
-#define   BRIDGE_VERSION "1.04"
+#define   BRIDGE_VERSION "1.10"
 
 #include <Zmq/Zmq.mqh>
 
 input string HubHost              = "127.0.0.1";
 input int    HubPubPort           = 5555;   // hub SUB socket - we PUB/connect here
 input int    HubPushPort          = 5557;   // hub PULL socket - we PUSH/connect here
-input int    PollIntervalMs       = 500;    // how often to diff open orders
+//--- HOW WIDE THE RACE IS. This EA has no trade event to hook: MT4 has
+//--- no OnTradeTransaction, so an order is only ever noticed by polling.
+//--- If an order is opened AND modified between two polls, the first
+//--- sighting already carries the modified stop and is published as the
+//--- OPEN -- with no MODIFY to follow, because by then nothing has
+//--- changed.
+//---
+//--- That is not cosmetic. The hub sizes a copy from the staked risk the
+//--- OPEN reports, so a widened stop arriving as the opening one asks
+//--- every slave to stake roughly twice what the master did. On
+//--- 2026-11-17 it put USTEC, XTIUSD and XNGUSD over mt5-icm-1's 2.50%
+//--- ceiling and all three were refused -- correctly, on a signal that
+//--- was not true.
+//---
+//--- 100ms rather than 500 narrows the window five-fold. It cannot close
+//--- it: nothing on MT4 can, short of a trade event that does not exist.
+//--- What is left is reported instead -- see the late-sighting warning
+//--- in DiffAndPublish.
+input int    PollIntervalMs       = 100;    // how often to diff open orders
 input int    HeartbeatIntervalMs  = 5000;   // how often to send a heartbeat
 input double SlTpEpsilon          = 0.00001; // ignore SL/TP deltas smaller than this (float noise)
 input int    AtrPeriod            = 14;      // iATR() period used for the "atr" field
-input int    AtrTimeframe         = PERIOD_CURRENT; // iATR() timeframe used for the "atr" field
+input int    AtrTimeframe         = PERIOD_CURRENT; // fallback when the magic names no timeframe
+//--- A magic's LEADING DIGIT names the timeframe its strategy runs on:
+//--- 1 daily, 2 H4, 3 H1, 4 weekly. The hub applies this rule to the
+//--- SLAVE's ATR already; without it here, only half the translation
+//--- happens. See the comment above PublishSignal's atr line.
+input bool   AtrTimeframeFromMagic = true;   // leading digit of the magic picks the ATR timeframe
+//--- Which bar the ATR is measured on. 1 is the last CLOSED bar, which is
+//--- what the fxDreema EAs size from (ACTIVE_BAR_ENTRY_ID resolves to 1
+//--- under EXEC_MODE 1) and what the FxdMaeEntryTest scripts use.
+//---
+//--- IT WAS 0 -- the FORMING bar -- so the ATR published alongside a
+//--- signal was not the ATR the EA had sized that signal with. The hub
+//--- divides the stop distance by this figure to get the multiple it
+//--- sends on, so the two disagreeing stretches every slave's stop by
+//--- whatever the forming bar happens to differ by. Measured on
+//--- 2026-11-16, the MAE step should produce exactly 3.0 ATR on every
+//--- timeframe and produced 3.0172 / 3.1145 / 3.2200 on D1 / H4 / H1:
+//--- the shorter the bar, the larger the part of it still forming, and
+//--- H1 came out 7% wide.
+//---
+//--- Shift 1 also makes a run REPEATABLE. The forming bar changes tick
+//--- by tick, so two identical signals a minute apart published two
+//--- different ATRs and sized differently for no reason a reader could
+//--- see.
+input int    AtrShift             = 1;       // 1 = last closed bar, 0 = the forming one
 
-Context zmqContext("bridge_ea_master");
-Socket  pubSocket(zmqContext, ZMQ_PUB);
-Socket  pushSocket(zmqContext, ZMQ_PUSH);
+//--- BUILT IN OnInit, not here, and that is the point.
+//---
+//--- A global object's constructor runs before OnInit, outside any code
+//--- that could check it or log it. zmq_ctx_new() and zmq_socket() are
+//--- DLL calls, so when libzmq cannot load -- or loads and wedges --
+//--- there is no return value anyone reads and no line in the Experts
+//--- tab. Seen on 2026-11-20: the terminal restarted, the EA loaded,
+//--- printed its inputs, and then nothing at all for twenty minutes.
+//--- No error, no socket, no heartbeat, and a master that simply looked
+//--- absent.
+//---
+//--- As pointers the construction moves into OnInit, where every step
+//--- is checked and named, and a failure returns INIT_FAILED instead of
+//--- leaving a dead EA sitting on the chart looking attached.
+Context *zmqContext = NULL;
+Socket  *pubSocket  = NULL;
+Socket  *pushSocket = NULL;
 
 struct OrderSnapshot
   {
@@ -58,6 +146,10 @@ struct OrderSnapshot
    double tp;
    int    magic;    // OrderMagicNumber() -- identifies which strategy opened it
    string comment;  // OrderComment() -- secondary identifier, free-form
+   //--- Server time the order was filled. Only used to notice that this
+   //--- EA is seeing it LATE, which means the stop it is carrying may
+   //--- already have been modified -- see DiffAndPublish.
+   datetime opened;
   };
 
 OrderSnapshot knownOrders[];
@@ -74,16 +166,85 @@ int OnInit()
    string pubAddr  = StringFormat("tcp://%s:%d", HubHost, HubPubPort);
    string pushAddr = StringFormat("tcp://%s:%d", HubHost, HubPushPort);
 
+   // Each step says it happened. If the EA dies between two of these
+   // lines, the last one printed is the step that killed it -- which is
+   // the whole diagnosis, available immediately in the Experts tab.
+   // UNNAMED, and that is the fix for a day lost on 2026-11-20.
+   //
+   // Context(name) is reference counted across EAs through MT4 GLOBAL
+   // VARIABLES -- "<name>_Count" and "<name>_Ref". The constructor only
+   // calls zmq_ctx_new() when the count is ZERO; otherwise it trusts
+   // "_Ref" and reuses it:
+   //
+   //     if(long(GlobalVariable::get(m_counterName))==0)
+   //        m_ref = m_hm.create();
+   //     else
+   //        m_ref = (T)(GlobalVariable::get(m_refName));
+   //
+   // The count is only decremented by the DESTRUCTOR. Any exit that
+   // skips it -- terminal killed, crash, abrupt close -- leaks the
+   // count, and MT4's "temporary" globals only clear on a CLEAN exit.
+   // So the next attach takes the else branch and adopts a handle from
+   // a process that no longer exists, or 0 where "_Ref" went. Dead
+   // context, dead sockets, no connection. The stale state lives in
+   // gvariables.dat, which outlives the terminal, so reattaching,
+   // restarting and recompiling all fail identically and forever.
+   //
+   // Unnamed makes CriticalSection::isValid() false, which takes the
+   // direct path: m_ref = m_hm.create(), no globals touched at all.
+   // Sharing bought nothing here -- this EA is the only user of the
+   // context in this terminal -- and cost exactly one whole failure
+   // mode, invisible in every log.
+   zmqContext = new Context();
+   if(zmqContext == NULL || zmqContext.ref() == 0)
+     {
+      Print("FATAL: ZMQ context could not be created. libzmq.dll is missing ",
+            "from the MQL4 Libraries folder, or 'Allow DLL imports' is off for this EA. ",
+            "Nothing can leave this terminal -- no signals, no heartbeat.");
+      return(INIT_FAILED);
+     }
+   Print("TradeCopierBridge ", BRIDGE_VERSION, ": ZMQ context created");
+
+   pubSocket  = new Socket(zmqContext, ZMQ_PUB);
+   pushSocket = new Socket(zmqContext, ZMQ_PUSH);
+   if(pubSocket == NULL || !pubSocket.valid())
+     {
+      Print("FATAL: the PUB socket could not be created -- signals cannot be published.");
+      return(INIT_FAILED);
+     }
+   if(pushSocket == NULL || !pushSocket.valid())
+     {
+      Print("FATAL: the PUSH socket could not be created -- no heartbeat can be sent.");
+      return(INIT_FAILED);
+     }
+   Print("TradeCopierBridge ", BRIDGE_VERSION, ": PUB and PUSH sockets created");
+
    // LINGER=0 so OnDeinit can't block MT4's shutdown trying to flush queued
    // frames to a hub that isn't there. Observed as "shutdown by timeout" in
    // the Experts log (uninit reason 9) when closing the terminal.
    pubSocket.setLinger(0);
    pushSocket.setLinger(0);
 
-   pubSocket.connect(pubAddr);
-   pushSocket.connect(pushAddr);
+   // READ, not ignored. Ignoring these is how 1.07 came to print
+   // "connected" while the terminal held no socket to the hub at all --
+   // the log said one thing and netstat said another, and the log was
+   // the one being believed.
+   if(!pubSocket.connect(pubAddr))
+     {
+      Print("FATAL: PUB could not connect to ", pubAddr, " -- signals would go nowhere.");
+      return(INIT_FAILED);
+     }
+   if(!pushSocket.connect(pushAddr))
+     {
+      Print("FATAL: PUSH could not connect to ", pushAddr, " -- no heartbeat can be sent.");
+      return(INIT_FAILED);
+     }
 
-   Print("TradeCopierBridge ", BRIDGE_VERSION, " connected: PUB->", pubAddr, "  PUSH->", pushAddr);
+   // Still only "accepted": zmq_connect is asynchronous, so this says the
+   // addresses were taken, not that the hub answered. The hub showing a
+   // heartbeat is the proof, and it is five seconds away.
+   Print("TradeCopierBridge ", BRIDGE_VERSION, " connect accepted: PUB->", pubAddr,
+         "  PUSH->", pushAddr, " -- the hub's heartbeat is the confirmation");
 
    TakeSnapshot(knownOrders);
    EventSetMillisecondTimer(PollIntervalMs);
@@ -94,23 +255,58 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    EventKillTimer();
-   pubSocket.disconnect(StringFormat("tcp://%s:%d", HubHost, HubPubPort));
-   pushSocket.disconnect(StringFormat("tcp://%s:%d", HubHost, HubPushPort));
+   // Guarded, because OnDeinit also runs after an OnInit that returned
+   // INIT_FAILED -- the case where some of these were never created.
+   if(pubSocket != NULL)
+     {
+      pubSocket.disconnect(StringFormat("tcp://%s:%d", HubHost, HubPubPort));
+      delete pubSocket;
+      pubSocket = NULL;
+     }
+   if(pushSocket != NULL)
+     {
+      pushSocket.disconnect(StringFormat("tcp://%s:%d", HubHost, HubPushPort));
+      delete pushSocket;
+      pushSocket = NULL;
+     }
+   // After the sockets, never before: closing the context first leaves
+   // zmq_close with a handle to something already gone.
+   if(zmqContext != NULL)
+     {
+      delete zmqContext;
+      zmqContext = NULL;
+     }
   }
 
 //+------------------------------------------------------------------+
 void OnTimer()
   {
+   //--- FIRST, and it used to be last.
+   //---
+   //--- Below this line is the snapshot, the diff and the publishing --
+   //--- all of which get slower exactly when the master is busy, which
+   //--- is exactly when "is the master alive?" matters most. MT4 does
+   //--- not re-enter a timer either, so a slow pass does not merely
+   //--- delay the heartbeat, it SKIPS the ticks it overran.
+   //---
+   //--- Seen on 2026-11-20: a four-signal test burst left a 98 second
+   //--- gap, against watchdog_stale_heartbeat_seconds = 30. The hub
+   //--- reported the master disconnected in the middle of the one run
+   //--- that proved it was working. Sent first, the gap can only be as
+   //--- long as a single pass rather than however many piled up.
+   if(GetTickCount() - lastHeartbeatSent >= (uint)HeartbeatIntervalMs)
+     {
+      //--- Only on success. A failed send that still stamped the clock
+      //--- would wait the full interval before trying again, turning one
+      //--- dropped frame into a reported outage.
+      if(SendHeartbeat())
+         lastHeartbeatSent = GetTickCount();
+     }
+
    OrderSnapshot current[];
    TakeSnapshot(current);
    DiffAndPublish(knownOrders, current);
    CopySnapshots(knownOrders, current);
-
-   if(GetTickCount() - lastHeartbeatSent >= (uint)HeartbeatIntervalMs)
-     {
-      SendHeartbeat();
-      lastHeartbeatSent = GetTickCount();
-     }
   }
 
 //+------------------------------------------------------------------+
@@ -141,6 +337,7 @@ void TakeSnapshot(OrderSnapshot &out[])
       // on it -- without this every strategy's signals are indistinguishable.
       out[n].magic   = OrderMagicNumber();
       out[n].comment = OrderComment();
+      out[n].opened  = OrderOpenTime();
      }
   }
 
@@ -175,6 +372,26 @@ void DiffAndPublish(OrderSnapshot &prev[], OrderSnapshot &curr[])
       int prevIdx = FindByTicket(prev, curr[i].ticket);
       if(prevIdx < 0)
         {
+         //--- SEEN LATE? Then the stop on it may not be the one it opened
+         //--- with, and this OPEN is about to tell the hub a staked risk
+         //--- the master never staked.
+         //---
+         //--- Said here, at the source, because the alternative is what
+         //--- happened on 2026-11-17: three symbols refused by a slave's
+         //--- risk ceiling, and an hour of comparing OPEN and MODIFY
+         //--- stops across two runs to work out why.
+         //---
+         //--- One second is the resolution of these clocks, so this
+         //--- catches the terminal being wedged rather than a tight
+         //--- race. That is the case worth catching: at 100ms polls a
+         //--- genuine race needs the terminal to be in trouble anyway.
+         int lateBy = (int)(TimeCurrent() - curr[i].opened);
+         if(curr[i].opened > 0 && lateBy >= 2)
+            Print("TradeCopierBridge: WARNING ticket ", curr[i].ticket,
+                  " (", curr[i].symbol, ") was first seen ", lateBy,
+                  "s after it opened -- if it was modified in that time, the",
+                  " stop below is NOT the one it opened with and every copy",
+                  " will be sized from it");
          PublishSignal("OPEN", curr[i]);
         }
       else if(MathAbs(curr[i].sl - prev[prevIdx].sl) > SlTpEpsilon ||
@@ -213,10 +430,70 @@ void DiffAndPublish(OrderSnapshot &prev[], OrderSnapshot &curr[])
   }
 
 //+------------------------------------------------------------------+
+//| The ATR timeframe a magic names, by its LEADING DIGIT.             |
+//|                                                                    |
+//| 1 daily, 2 H4, 3 H1, 4 weekly -- Chris's structural magic scheme.  |
+//| 121003 is a daily system; 221003 would be H4.                      |
+//|                                                                    |
+//| Kept deliberately identical to the hub's own                       |
+//| bar_size_for_magic_prefix() in app/sizing.py. The two run on       |
+//| opposite sides of the wire and must agree: the master divides the  |
+//| stop by this ATR, the slave multiplies by its own. Disagree, and   |
+//| the error is silent -- sizing still reports the intended dollar    |
+//| risk while the position is a multiple of the intended size.        |
+//|                                                                    |
+//| A magic outside 1-4 falls back to AtrTimeframe, which is what      |
+//| every signal used before this existed.                             |
+//+------------------------------------------------------------------+
+int AtrTimeframeForMagic(int magic)
+  {
+   if(!AtrTimeframeFromMagic)
+      return(AtrTimeframe);
+
+   //--- The leading digit, however many digits the magic has. MathAbs
+   //--- first: a negative magic is not expected, but reading '-' as the
+   //--- leading character would silently fall back for the whole strategy.
+   string asText = IntegerToString(MathAbs(magic));
+   if(StringLen(asText) == 0)
+      return(AtrTimeframe);
+
+   string firstChar = StringSubstr(asText, 0, 1);
+   if(firstChar == "1") return(PERIOD_D1);
+   if(firstChar == "2") return(PERIOD_H4);
+   if(firstChar == "3") return(PERIOD_H1);
+   if(firstChar == "4") return(PERIOD_W1);
+
+   return(AtrTimeframe);
+  }
+
+//+------------------------------------------------------------------+
 void PublishSignal(string action, OrderSnapshot &o)
   {
    string direction = (o.type == OP_BUY) ? "BUY" : "SELL";
-   double atr = iATR(o.symbol, AtrTimeframe, AtrPeriod, 0);
+
+   //--- THE OTHER HALF OF THE MAGIC -> ATR RULE.
+   //---
+   //--- This was iATR(o.symbol, AtrTimeframe, ...) with AtrTimeframe at
+   //--- PERIOD_CURRENT -- the chart THIS EA happens to sit on. Every
+   //--- signal from every strategy therefore carried the same ATR, and
+   //--- the hub divides the stop distance by it to get the multiple it
+   //--- sends on. So an H4 strategy's stop, 1.5 H4-ATRs wide, arrived at
+   //--- the slave as 0.5 DAILY-ATRs, and the slave -- which does read the
+   //--- magic and measures its own ATR on H4 -- multiplied that 0.5 by
+   //--- its H4 figure. Stop three times too tight, position three times
+   //--- too large, dollar risk still reading correct.
+   //---
+   //--- Measured on 2026-11-15 with FxdMaeEntryTest _D and _H4 on XAUUSD:
+   //---   hub ATR     94.42 (D) vs 94.41 (H4)  -- identical, the bug
+   //---   slave ATR   81.60 (D) vs 42.34 (H4)  -- correctly different
+   //--- H4 opened 46 MGC where it should have opened about 15, and the
+   //--- H1 run was refused outright on margin at 223 contracts.
+   //---
+   //--- The rule is the hub's, matched exactly so the two halves cannot
+   //--- drift: leading digit 1 daily, 2 H4, 3 H1, 4 weekly, anything else
+   //--- falls back to AtrTimeframe as before.
+   int    atrTf = AtrTimeframeForMagic(o.magic);
+   double atr   = iATR(o.symbol, atrTf, AtrPeriod, AtrShift);
 
    // What this order actually put at risk, and what it was risked against.
    //
@@ -311,7 +588,7 @@ string JsonEscape(string raw)
   }
 
 //+------------------------------------------------------------------+
-void SendHeartbeat()
+bool SendHeartbeat()
   {
    // The build each master is running, said by the master itself.
    //
@@ -330,6 +607,11 @@ void SendHeartbeat()
       "{\"account\":\"%d\",\"bridge_version\":\"%s\",\"ts\":%.3f}",
       AccountNumber(), BRIDGE_VERSION, (double)TimeGMT());
    ZmqMsg msg(json);
-   pushSocket.send(msg);
+   //--- NOWAIT. A PUSH socket blocks once its queue fills with no one
+   //--- draining it, and blocking here would freeze OnTimer -- so a hub
+   //--- that went away would stop the master from publishing signals
+   //--- too, turning a reporting outage into a trading one. A dropped
+   //--- heartbeat costs nothing; the next is a few seconds away.
+   return(pushSocket.send(msg, true));
   }
 //+------------------------------------------------------------------+

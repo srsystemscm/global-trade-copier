@@ -197,6 +197,15 @@ TYPES: Dict[str, Reported] = {
     "kill_switch_blocked": Reported(None, ALERT, REFUSED, {}),
     "deferred_open_abandoned": Reported(None, ALERT, FAILED, _ABANDONED),
     "deferred_close_abandoned": Reported(None, ALERT, FAILED, _ABANDONED),
+    # The closing order was accepted and filled nothing, while the registry
+    # row already says CLOSED -- so this hub reads flat over a position the
+    # broker still holds, with nothing trailing or re-closing it. An ALERT
+    # rather than a notice for that reason: an unknown type arrives at the
+    # ops hub as info, and this is the one event that says a live position
+    # has stopped being managed.
+    "exit_never_filled": Reported(None, ALERT, FAILED, {
+        "slave_symbol": "slave_symbol", "slave_ticket": "slave_ticket",
+    }),
     "entry_unfilled": Reported(None, ALERT, FAILED, {
         "slave_symbol": "slave_symbol", "limit_price": "limit_price",
         "waited_s": _waited,

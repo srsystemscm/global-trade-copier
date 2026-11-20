@@ -61,6 +61,31 @@ class Route:
     # the spread is the point -- a limit sitting at the bid in a thin
     # evening book is a signal that quietly never becomes a position.
     limit_offset_pct: float = 0.0
+    # How long the entry stays alive at the broker, and how long this engine
+    # waits for it. Both were adapter-wide, which is what stopped a Sunday
+    # evening ETF entry from ever working: DAY expires at that session's
+    # close, so an order placed at 18:00 ET cannot survive to Monday's
+    # pre-market, and the 900s abandon timer cancelled it long before the
+    # TIF mattered anyway.
+    #
+    # They are a pair. GTC without a longer wait is still cancelled by this
+    # engine; a longer wait without GTC leaves the engine watching an order
+    # the broker already expired. Setting one and not the other is the
+    # configuration that looks right and does nothing.
+    tif: Optional[str] = None
+    # Seconds, or a session boundary like "rth_open" -- see
+    # app/order_timing.py. A boundary is resolved when the order is placed,
+    # which is the only time "the next open" has an answer.
+    entry_timeout: Optional[Any] = None
+    # The BROKER's deadline, used when `tif` is GTD: the same grammar as
+    # entry_timeout, resolved to IBKR's goodTillDate.
+    #
+    # GTD was accepted by the adapter's TIF list and then sent with no date
+    # at all, which IBKR either rejects or treats as GTC. So a route could
+    # ask for "expire at the open" and get "never expires" -- the failure
+    # mode being an entry that rests indefinitely, long after the signal
+    # that justified it has gone.
+    good_till: Optional[Any] = None
     # Which way this route trades. None takes both, which is right for a
     # futures leg that can be short as easily as long. An ETF leg usually
     # cannot: the long-side proxies here have no inverse twin, so without
@@ -92,6 +117,44 @@ class Route:
     # strategy may stack three legs where everything else on the slave
     # stacks none.
     netting: Optional[Dict[str, Any]] = None
+    # Place this route's entry as N orders over a window instead of one,
+    # collapsing into ONE tracked position -- one instrument, one row, one
+    # pair of protective legs, one thing to roll. For a size the book
+    # cannot absorb in a single print.
+    #
+    # None on either falls back to the slave's own entry_split_slices /
+    # entry_split_interval, then to off. Only the IBKR adapter acts on
+    # them; a route that asks for a split on an adapter that cannot do one
+    # is logged rather than quietly ignored.
+    split_slices: Optional[int] = None
+    split_interval: Optional[float] = None
+
+
+def _deadline(value: Any) -> Optional[Any]:
+    """A deadline as written: seconds, or a session-boundary spec.
+
+    DELIBERATELY DOES NOT VALIDATE. The first version of this resolved the
+    spec here to reject a typo early, which was wrong twice over: this
+    function runs on the SIGNAL path -- resolve_routes() is called per
+    signal, not at startup -- so a bad spec in one route would have raised
+    out of routing and stopped every signal to that slave from routing at
+    all. One mistyped word in one route, and the whole slave goes quiet.
+
+    A bad spec now costs exactly one order: the adapter refuses it with an
+    AdapterError naming the route's symbol, and the other routes are
+    unaffected. The typo is caught earlier anyway, at the API, where the
+    config is saved and someone is there to read the message -- see
+    _validated_route_deadlines in api_routes.py.
+
+    A number still becomes a float, as it always did.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+
+    text = str(value).strip()
+    return text or None
 
 
 def routing_is_strict(slave_config: Dict[str, Any]) -> bool:
@@ -187,6 +250,16 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                     order_type=entry.get("order_type", "market"),
                     outside_rth=bool(entry.get("outside_rth", False)),
                     limit_offset_pct=float(entry.get("limit_offset_pct", 0.0)),
+                    tif=(None if entry.get("tif") is None
+                         else str(entry["tif"]).upper()),
+                    # NOT float() any more. A timeout may be written as the
+                    # session boundary it means -- "rth_open" -- and
+                    # float("rth_open") is a ValueError that takes the whole
+                    # routing table down on load. A number still becomes a
+                    # float, so every existing `entry_timeout: 93600` parses
+                    # to exactly what it did before.
+                    entry_timeout=_deadline(entry.get("entry_timeout")),
+                    good_till=_deadline(entry.get("good_till")),
                     direction=(None if entry.get("direction") is None
                                else str(entry["direction"]).upper()),
                     target_direction=(None if entry.get("target_direction") is None
@@ -196,6 +269,10 @@ def resolve_routes(slave_config: Dict[str, Any], signal: Signal) -> List[Route]:
                     broker_brackets=bool(entry.get("broker_brackets", True)),
                     candidates=list(group),
                     netting=entry.get("netting"),
+                    split_slices=(None if entry.get("split_slices") is None
+                                  else int(entry["split_slices"])),
+                    split_interval=(None if entry.get("split_interval") is None
+                                    else float(entry["split_interval"])),
                 )
             )
     return matched

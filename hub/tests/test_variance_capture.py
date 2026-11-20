@@ -276,6 +276,12 @@ def test_a_late_fill_is_written_into_the_row():
     engine = object.__new__(AutonomousCopyEngine)
     engine.slave_id = SLAVE
     engine._fill_tasks = set()
+    # __init__ is bypassed on purpose -- these exercise one method, not a
+    # whole engine -- so what that method touches is set by hand. Recording
+    # a fill also clears entry_pending now: a filled entry IS a position,
+    # and trailing has to resume in the same run rather than at the next
+    # restart.
+    engine._positions = {}
 
     class _Adapter:
         async def await_entry_fill(self, slave_ticket):
@@ -306,6 +312,12 @@ def test_a_fill_that_never_arrives_leaves_the_row_alone():
     engine = object.__new__(AutonomousCopyEngine)
     engine.slave_id = SLAVE
     engine._fill_tasks = set()
+    # __init__ is bypassed on purpose -- these exercise one method, not a
+    # whole engine -- so what that method touches is set by hand. Recording
+    # a fill also clears entry_pending now: a filled entry IS a position,
+    # and trailing has to resume in the same run rather than at the next
+    # restart.
+    engine._positions = {}
 
     class _Adapter:
         async def await_entry_fill(self, slave_ticket):
@@ -329,6 +341,12 @@ def test_a_collector_that_raises_does_not_take_the_engine_down():
     engine = object.__new__(AutonomousCopyEngine)
     engine.slave_id = SLAVE
     engine._fill_tasks = set()
+    # __init__ is bypassed on purpose -- these exercise one method, not a
+    # whole engine -- so what that method touches is set by hand. Recording
+    # a fill also clears entry_pending now: a filled entry IS a position,
+    # and trailing has to resume in the same run rather than at the next
+    # restart.
+    engine._positions = {}
 
     class _Adapter:
         async def await_entry_fill(self, slave_ticket):
@@ -353,6 +371,12 @@ def test_a_synchronous_adapter_needs_no_collector():
     engine = object.__new__(AutonomousCopyEngine)
     engine.slave_id = SLAVE
     engine._fill_tasks = set()
+    # __init__ is bypassed on purpose -- these exercise one method, not a
+    # whole engine -- so what that method touches is set by hand. Recording
+    # a fill also clears entry_pending now: a filled entry IS a position,
+    # and trailing has to resume in the same run rather than at the next
+    # restart.
+    engine._positions = {}
     engine.adapter = object()  # no await_entry_fill attribute
 
     engine._capture_fill("entry", ACCT, 7004, "XAUUSD", 1)

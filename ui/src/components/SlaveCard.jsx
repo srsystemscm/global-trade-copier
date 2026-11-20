@@ -1,6 +1,19 @@
+import { adapterLabel, slaveFacts, slaveRouting } from "../slaveFacts.js";
+
 export default function SlaveCard({ slave, onTogglePause, onRemove }) {
-  const statusBadge = slave.paused ? "paused" : slave.running ? "running" : "stopped";
-  const statusClass = slave.paused ? "badge-warn" : slave.running ? "badge-ok" : "badge-error";
+  // "running" describes the engine OBJECT, and a stalled engine is still
+  // an object. On 2026-11-16 four of them read running and connected
+  // while consuming nothing at all, and this card said so for 37
+  // minutes. `consume` is the only field that can tell the two apart, so
+  // it OVERRIDES the badge rather than sitting quietly beside it.
+  const consume = slave.consume;
+  const stalled = slave.running && consume?.stalled;
+  const statusBadge = stalled
+    ? "NOT CONSUMING"
+    : slave.paused ? "paused" : slave.running ? "running" : "stopped";
+  const statusClass = stalled
+    ? "badge-error"
+    : slave.paused ? "badge-warn" : slave.running ? "badge-ok" : "badge-error";
 
   const connBadge = slave.connected === true ? "connected" : slave.connected === false ? "disconnected" : "checking...";
   const connClass = slave.connected === true ? "badge-ok" : slave.connected === false ? "badge-error" : "badge-warn";
@@ -10,8 +23,12 @@ export default function SlaveCard({ slave, onTogglePause, onRemove }) {
       <div className="slave-card-header">
         <div>
           <div className="slave-name">{slave.name}</div>
-          <div className="slave-meta">
-            {slave.broker_type} &middot; {slave.mode}
+          {/* The broker and what this slave trades on. It used to carry
+              describe_mode()'s whole sentence -- "own stops from ATR, 10
+              routed instruments" -- which wrapped to three lines on a
+              tile and repeated the mode the name already gives. */}
+          <div className="slave-meta" title="The adapter driving this slave. The MT4 adapter drives MT4 and MT5 terminals alike -- the bridge does not say which.">
+            {adapterLabel(slave.broker_type)} &middot; {slaveRouting(slave)}
           </div>
         </div>
         <span className={`badge ${statusClass}`}>{statusBadge}</span>
@@ -23,14 +40,21 @@ export default function SlaveCard({ slave, onTogglePause, onRemove }) {
         </div>
       )}
 
-      {/* What this slave stakes per signal. It decides every size on the
-          card below, and used to appear on no screen at all for a mirror
-          slave -- which is most of them. */}
-      {slave.sizing_summary && (
-        <div className="slave-sizing" title="Risk per signal">
-          {slave.sizing_summary}
+      {/* Said in words, because the badge alone does not tell a reader
+          that signals are being lost rather than merely delayed. */}
+      {stalled && (
+        <div className="slave-stalled" style={{ marginBottom: 8 }}>
+          {consume.alive === false
+            ? "This slave's copy loop has stopped and will not restart on its own. Every signal is being dropped. Restart the hub."
+            : `${consume.queue_depth} signal(s) queued and nothing taken off the queue for ${consume.seconds_since_consumed ?? "?"}s.`}
         </div>
       )}
+
+      {/* What this slave stakes per signal, as three facts rather than
+          the sentence that used to run to four wrapped lines here. See
+          slaveFacts.js -- the hub decides these, so the tile, the list
+          and the Risk tab cannot drift apart. */}
+      <SlaveFactRows slave={slave} />
       {/* Which masters this slave follows. With one master it reads
           "every master" and is noise; with four to eight it is the first
           thing worth knowing about a slave. */}
@@ -85,6 +109,34 @@ export default function SlaveCard({ slave, onTogglePause, onRemove }) {
         <button className="btn btn-small btn-danger" onClick={onRemove}>
           Remove
         </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * MODE / RISK / CAP, in that order, on three rows.
+ *
+ * Ordered the way the question is asked: where the size comes from, what
+ * it is measured against, and where it stops. A value the hub does not
+ * report reads "--" rather than being dropped, so a row that is missing
+ * on one slave and present on another is visible as a difference.
+ */
+function SlaveFactRows({ slave }) {
+  const facts = slaveFacts(slave);
+  return (
+    <div className="slave-facts" title="Where the size comes from, what it is measured against, and the refusal ceiling">
+      <div className="slave-fact">
+        <span className="slave-fact-k">Mode</span>
+        <span className="slave-fact-v">{facts.mode || "--"}</span>
+      </div>
+      <div className="slave-fact">
+        <span className="slave-fact-k">Risk</span>
+        <span className="slave-fact-v">{facts.risk || "--"}</span>
+      </div>
+      <div className="slave-fact">
+        <span className="slave-fact-k">Cap</span>
+        <span className="slave-fact-v">{facts.cap || "--"}</span>
       </div>
     </div>
   );

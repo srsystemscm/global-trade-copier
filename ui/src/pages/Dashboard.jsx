@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api.js";
 import ActivityFeed from "../components/ActivityFeed.jsx";
-import ConnectionWizard from "../components/ConnectionWizard.jsx";
 import MasterPanel from "../components/MasterPanel.jsx";
 import SlaveCard from "../components/SlaveCard.jsx";
 import SlaveRow from "../components/SlaveRow.jsx";
-import { useEvents } from "../useEvents.js";
+import { useHub } from "../hub.jsx";
 
 export default function Dashboard() {
-  const [status, setStatus] = useState(null);
+  // Status and the event socket are shared with the header, which shows
+  // hub state on every tab. See hub.jsx: /status asks every adapter for
+  // its positions, so a second poller here would have doubled that.
+  const { status, error: statusError, refresh: refreshStatus, events } = useHub();
   const [trades, setTrades] = useState([]);
-  const [wizardOpen, setWizardOpen] = useState(false);
+  const [error, setError] = useState(null);
   // Remembered per browser. Which view suits depends on how many slaves
   // someone runs, which is a property of the person, not of the data.
   const [view, setView] = useState(() => {
@@ -20,14 +22,11 @@ export default function Dashboard() {
       return "tiles";
     }
   });
-  const [error, setError] = useState(null);
-  const { events, connected } = useEvents();
 
-  const refresh = useCallback(async () => {
+  const refreshTrades = useCallback(async () => {
     try {
-      const [statusRes, tradesRes] = await Promise.all([api.getStatus(), api.getTrades(100)]);
-      setStatus(statusRes);
-      setTrades(tradesRes.trades);
+      const res = await api.getTrades(100);
+      setTrades(res.trades);
       setError(null);
     } catch (err) {
       setError(err.message);
@@ -35,15 +34,15 @@ export default function Dashboard() {
   }, []);
 
   useEffect(() => {
-    refresh();
-    const interval = setInterval(refresh, 5000);
+    refreshTrades();
+    const interval = setInterval(refreshTrades, 5000);
     return () => clearInterval(interval);
-  }, [refresh]);
+  }, [refreshTrades]);
 
-  // live events imply state changed (a trade landed, a slave errored) --
-  // refresh the polled data so positions/activity stay in sync
+  // A live event means a trade landed or a slave errored, so the feed
+  // below is stale the moment it arrives rather than five seconds later.
   useEffect(() => {
-    if (events.length > 0) refresh();
+    if (events.length > 0) refreshTrades();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [events.length]);
 
@@ -59,27 +58,31 @@ export default function Dashboard() {
 
   async function togglePause(slave) {
     await api.patchSlave(slave.id, { paused: !slave.paused });
-    refresh();
+    refreshStatus();
   }
 
   async function removeSlave(slave) {
     if (!window.confirm(`Remove slave "${slave.name}"?`)) return;
     await api.deleteSlave(slave.id);
-    refresh();
+    refreshStatus();
   }
+
+  const shown = error || statusError;
 
   return (
     <div className="dashboard">
+      {/* NO ADD-SLAVE BUTTON. Adding one is a Settings job done once per
+          account, and it sat on the dashboard's title row costing a
+          band of space on the page watched all day. The wizard is on
+          Settings -> Slaves, which is where the rest of a slave's
+          configuration already lives. */}
       <div className="dashboard-header">
         <h1>Dashboard</h1>
-        <button className="btn btn-primary" onClick={() => setWizardOpen(true)}>
-          + Add Slave
-        </button>
       </div>
 
-      {error && <div className="banner banner-error">{error}</div>}
+      {shown && <div className="banner banner-error">{shown}</div>}
 
-      <MasterPanel status={status} trades={trades} wsConnected={connected} />
+      <MasterPanel status={status} trades={trades} />
 
       <section>
         <div className="section-head">
@@ -124,7 +127,10 @@ export default function Dashboard() {
                     <th>Link</th>
                     <th>Masters</th>
                     <th>Sizing</th>
-                    <th>Risk scale</th>
+                    {/* Risk calibration, named as Chris names it. It is
+                        not a size -- it is the ratio between what the EA
+                        signalled and what this slave takes of it. */}
+                    <th title="Risk calibration: what this slave takes of what the EA signalled">RC</th>
                     <th>Signals</th>
                     <th>Positions</th>
                     <th />
@@ -150,16 +156,6 @@ export default function Dashboard() {
         <h2>Activity</h2>
         <ActivityFeed liveEvents={events} trades={trades} />
       </section>
-
-      {wizardOpen && (
-        <ConnectionWizard
-          onClose={() => setWizardOpen(false)}
-          onCreated={() => {
-            setWizardOpen(false);
-            refresh();
-          }}
-        />
-      )}
     </div>
   );
 }

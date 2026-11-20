@@ -25,6 +25,23 @@ export const api = {
   getConfig: () => request("/config"),
   patchConfig: (payload) => request("/config", { method: "PATCH", body: JSON.stringify(payload) }),
   getLogs: (lines = 200) => request(`/logs?lines=${lines}`),
+  // A Portfolio Manager export, applied to one slave. DRY RUN BY
+  // DEFAULT: an import replaces that slave's whole strategy selection,
+  // so the screen asks what it would change before it changes anything.
+  // See docs/portfolio-import.md.
+  importPortfolio: (id, document, dryRun = true) =>
+    request(`/slaves/${id}/import/portfolio?dry_run=${dryRun ? "true" : "false"}`, {
+      method: "POST",
+      body: JSON.stringify(document),
+    }),
+  // Taking it back off. DRY RUN BY DEFAULT like the import, because
+  // removing a selection means the slave takes EVERY strategy again --
+  // and because the import writes two keys, only one of which is
+  // visible, so this is the only way to clear both together.
+  removePortfolio: (id, dryRun = true) =>
+    request(`/slaves/${id}/import/portfolio?dry_run=${dryRun ? "true" : "false"}`, {
+      method: "DELETE",
+    }),
   getRisk: () => request("/risk"),
   patchRisk: (payload) => request("/risk", { method: "PATCH", body: JSON.stringify(payload) }),
 };

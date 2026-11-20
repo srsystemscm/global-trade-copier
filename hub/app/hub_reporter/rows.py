@@ -122,6 +122,25 @@ def _fold_order(signals: List[Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _slices_for(row: Any, slave_id: str) -> Optional[List[Dict[str, Any]]]:
+    """One entry's slices, or None where it was not split.
+
+    None rather than a one-element list: every leg on the page would
+    otherwise carry one, which reads as though something were going on.
+    """
+    try:
+        if (row["entry_slices"] or 0) <= 1:
+            return None
+    except (KeyError, IndexError):
+        return None
+    from app.trade_registry import entry_slices_for
+
+    found = entry_slices_for(
+        slave_id, str(row["master_account"]), row["master_ticket"],
+        row["slave_symbol"])
+    return found or None
+
+
 def _leg(row: Any, facts: Any) -> Dict[str, Any]:
     """One slave leg.
 
@@ -160,6 +179,22 @@ def _leg(row: Any, facts: Any) -> Dict[str, Any]:
         "slave_direction": None,
         "size": row["slave_lots"],
         "size_unit": facts.size_unit(slave_id, row["slave_symbol"]),
+        # How many orders this ONE position's entry went out in. 1 or null
+        # for an ordinary entry; 3 for a split one. `size` is the whole
+        # position either way, which is the point -- without this the hub
+        # cannot tell a 33-lot print from 33 lots assembled over a window,
+        # and the slippage it computes means a different thing in each case.
+        "entry_slices": None if row["entry_slices"] is None else int(row["entry_slices"]),
+        # What each of those orders was and what it filled, in the order
+        # they went out. Present only where there was more than one.
+        #
+        # `size` and `fill_price` above are the POSITION's -- one number,
+        # which is what the splitter exists to produce. These are the only
+        # thing that can say whether splitting did its job: the reason to
+        # spread a 33-lot entry is impact, and the position's single
+        # average is the figure that was meant to improve, so it cannot
+        # be the figure that judges it. Slice 1 against slice 3 can.
+        "slices": _slices_for(row, slave_id),
         "master_price": row["master_price"],
         "requested_price": None,
         "fill_price": row["slave_price"],

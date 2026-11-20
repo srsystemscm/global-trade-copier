@@ -59,6 +59,14 @@ def test_modify_rounds_and_stamps_too():
     rounding to the tick nor setting TIF, so a trailing stop would have
     reintroduced both bugs on a position that started out correct."""
     import inspect
-    src = inspect.getsource(IBKRAdapter.modify)
-    assert src.count("_protective(") == 2
-    assert src.count("_round_to_tick(") == 2
+    import re
+
+    src = re.sub(r"\s+", " ", inspect.getsource(IBKRAdapter.modify))
+    assert src.count("_protective(") == 2, "both legs must carry the bracket TIF"
+    # Asserted PER LEG rather than by counting calls. modify() also stores
+    # the rounded levels now, so the order splitter can re-place the legs
+    # at a larger size without asking the orders it just cancelled what
+    # price they were at -- and a count of _round_to_tick calls would
+    # break on that while saying nothing about either leg.
+    assert 'StopOrder(closing_action, pos[\'size\'], self._round_to_tick(' in src         or 'StopOrder(closing_action, pos["size"], self._round_to_tick(' in src,         "the stop price is not rounded to the tick"
+    assert 'LimitOrder(closing_action, pos[\'size\'], self._round_to_tick(' in src         or 'LimitOrder(closing_action, pos["size"], self._round_to_tick(' in src,         "the target price is not rounded to the tick"

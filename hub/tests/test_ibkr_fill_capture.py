@@ -198,15 +198,73 @@ def test_entry_tif_defaults_to_day():
 
 
 def test_entry_and_close_state_a_tif():
-    """Both placements, not just the entry: the closing order hit 10349 too."""
+    """Both placements, not just the entry: the closing order hit 10349 too.
+
+    What matters here is that a TIF is STATED rather than left to IBKR's
+    account-level order preset, which supplies DAY and reports it as error
+    10349 -- cancelling and re-creating the order before it fills, so
+    anything watching order state sees a failure that is not one.
+
+    The entry's value became per-route on 2026-11-15, so it is now a local
+    resolved from the route and the slave default. The requirement is
+    unchanged: something is assigned, and it is never left unset.
+
+    Moved again later the same day, into _stamp_entry_timing(), when GTD
+    gained a deadline -- that decision needs more than one line and is
+    worth testing without a broker connection. open() delegates, which is
+    asserted below so the call cannot quietly go missing.
+    """
     import inspect
     import re
     from app.adapters.ibkr import IBKRAdapter
 
     open_src = re.sub(r"\s+", " ", inspect.getsource(IBKRAdapter.open))
+    stamp_src = re.sub(r"\s+", " ", inspect.getsource(IBKRAdapter._stamp_entry_timing))
     close_src = re.sub(r"\s+", " ", inspect.getsource(IBKRAdapter.close))
-    assert "entry.tif = self.entry_tif" in open_src
+    assert "self._stamp_entry_timing(entry, order)" in open_src, (
+        "open() no longer stamps the entry at all, so IBKR's account preset "
+        "supplies DAY and reports it as error 10349"
+    )
+    assert "entry.tif = tif" in stamp_src
+    assert "order.tif or self.entry_tif" in stamp_src, (
+        "the route's value no longer reaches the order, so every entry is "
+        "back to the slave-wide default"
+    )
     assert "closing_order.tif = self.entry_tif" in close_src
+
+
+def test_an_entry_tif_the_adapter_cannot_place_is_refused():
+    """A TIF IBKR rejects is a position that silently never opens -- and
+    the setting exists precisely for orders placed when nobody is
+    watching.
+
+    THE RAISE IS NOW EXECUTED, not just reasoned about. This test checked
+    the membership of ENTRY_TIFS and imported AdapterError without ever
+    reaching the line that raises it -- and that line referred to a name
+    the module had never imported. The refusal came out as NameError,
+    which the engine does not recognise as a broker refusal and does not
+    report as one. Nothing failed, because nothing ran it.
+    """
+    import pytest
+
+    from app.adapters.base import AdapterError, OrderRequest
+    from app.adapters.ibkr import IBKRAdapter
+
+    assert "GTC" in IBKRAdapter.ENTRY_TIFS
+    assert "DAY" in IBKRAdapter.ENTRY_TIFS
+    # Meaningless for an entry this engine places: accepting them would let
+    # a route be written that never fills.
+    assert "OPG" not in IBKRAdapter.ENTRY_TIFS
+    assert "FOK" not in IBKRAdapter.ENTRY_TIFS
+
+    class _Entry:
+        tif = None
+        goodTillDate = ""
+
+    with pytest.raises(AdapterError):
+        _adapter()._stamp_entry_timing(
+            _Entry(), OrderRequest(symbol="MGC", direction="BUY", size=1, tif="OPG")
+        )
 
 
 def test_brackets_keep_their_own_tif():
@@ -336,7 +394,18 @@ def test_collected_trades_are_not_retained():
 
 def test_a_second_close_places_no_second_order():
     """Closing twice must not send another closing order -- that would open
-    an unintended short on a flat account."""
+    an unintended short on a flat account.
+
+    THE PROPERTY IS THE ORDER COUNT, not how the second call declines.
+    This used to require the second close to RAISE, which was true only
+    of how it was implemented: the first close deleted the position, so
+    the second could not find it. Since 2026-11-18 the position is kept
+    and marked (a close that never filled was otherwise unrecoverable --
+    789 ETHT stranded for 24 hours), so a repeat is declined by seeing
+    that a close is already working, and declining by doing nothing is a
+    fair answer to "close this" when it is already being closed.
+
+    Both shapes are accepted here; a SECOND ORDER is not."""
     a = _prepared(_adapter(), _Trade(price=1.0, fills_after=1))
     a._positions[35] = {"direction": "BUY", "size": 1.0,
                         "contract": object(), "sl_order_id": None,
@@ -344,8 +413,10 @@ def test_a_second_close_places_no_second_order():
 
     async def two_closes():
         await a.close(35)
-        with pytest.raises(Exception):
+        try:
             await a.close(35)
+        except AdapterRejectedError:
+            pass        # the other fair answer: refused outright
 
     asyncio.run(two_closes())
     assert len(a.ib.placed) == 1
@@ -519,6 +590,11 @@ def test_a_limit_entry_is_closed_with_a_limit_in_the_same_session():
 
 
 def test_a_market_entry_is_still_closed_at_market():
+    """MGC is a listed FUTURE, and that is why the market order stays.
+    It trades nearly round the clock, IBKR accepts a market order in the
+    overnight session, and a market order is the surest exit there is --
+    so the equity limit introduced for ETHT is deliberately not extended
+    here. See _closing_order."""
     a = _prepared(_adapter(), _Trade(price=3988.4, fills_after=1),
                   _Trade(price=1.0, fills_after=1))
     req = OrderRequest(symbol="MGC", direction="BUY", size=1.0, sl=None,
@@ -527,7 +603,12 @@ def test_a_market_entry_is_still_closed_at_market():
     a.ib._all[0].poll()
     asyncio.run(a.close(res.slave_ticket))
     assert a.ib.placed[1].orderType == "MKT"
-    assert a.ib.placed[1].outsideRth is False
+    # Was `is False`, taken from the entry, and that flag is the whole
+    # defect: this position was opened inside regular hours, so the SELL
+    # that closed it at 19:51 asked not to trade outside them and was
+    # PARKED until the next open. A future's own session is nearly
+    # round the clock; the exit has to be allowed to use it.
+    assert a.ib.placed[1].outsideRth is True
 
 
 def test_no_quote_falls_back_to_market_rather_than_leaving_it_open():

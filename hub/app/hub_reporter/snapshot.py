@@ -19,6 +19,7 @@ from app.config import settings
 from app.contract_specs import get_contract_spec
 from app.db import db_cursor, get_config_value
 from app.hub_reporter.catalogue import iso
+from app.order_split import resolve_split
 from app.sizing import resolve_balance_adjustment
 from app.slaves import SlaveConfig, list_all_slaves
 
@@ -297,8 +298,77 @@ def _slaves(engines: List[Any], facts: SlaveFacts) -> List[Dict[str, Any]]:
             ),
             "last_error": error.get("message"),
             "last_error_at": iso(error.get("at")),
+            # Whether this slave's loop is still DRAINING its queue.
+            # `running` and `connected` describe the object and the
+            # adapter; on 2026-11-16 four engines reported both while
+            # consuming nothing and dropping every signal for 37 minutes.
+            # This is the only field that can tell those apart, and the
+            # hub is the thing watching when nobody is at the dashboard.
+            "consume": _consume(engine),
+            # How entries reach the market on this slave: one order, or
+            # slices over a window. null when nothing is configured.
+            "order_split": _split(slave),
         })
     return out
+
+
+def _consume(engine: Any) -> Optional[Dict[str, Any]]:
+    """The consume loop's own health. See api_routes._consume_health."""
+    if engine is None:
+        return None
+    queue = getattr(engine, "queue", None)
+    task = (getattr(engine, "_consume_task", None)
+            or getattr(engine, "_task", None))
+    last = float(getattr(engine, "last_consumed_at", 0.0) or 0.0)
+    depth = queue.qsize() if queue is not None else None
+    idle = round(time.time() - last, 1) if last else None
+    return {
+        "queue_depth": depth,
+        "last_consumed_at": iso(last) if last else None,
+        "seconds_since_consumed": idle,
+        # false means the loop has ENDED: every signal from now on is
+        # dropped, and nothing else in this block would say so.
+        "alive": None if task is None else not task.done(),
+        "stalled": bool(
+            (task is not None and task.done())
+            or (depth and (idle is None or idle > 60.0))),
+    }
+
+
+def _split(slave: SlaveConfig) -> Optional[Dict[str, Any]]:
+    """The order splitter's setting, per slave and per route.
+
+    Reported because it changes WHAT REACHES THE BROKER for one signal --
+    three orders over ten seconds instead of one -- while leaving the
+    position, its size and its row exactly as they were. The leg rows
+    carry entry_slices for what actually happened; this is what was asked
+    for.
+    """
+    slices, interval = resolve_split(
+        None, None,
+        slave.config.get("entry_split_slices"),
+        slave.config.get("entry_split_interval"),
+    )
+    routes = {}
+    for entry in slave.config.get("routes") or []:
+        r_slices, r_interval = resolve_split(
+            entry.get("split_slices"), entry.get("split_interval"),
+            slave.config.get("entry_split_slices"),
+            slave.config.get("entry_split_interval"),
+        )
+        if not r_slices:
+            continue
+        target = entry.get("target") or entry.get("targets") or "?"
+        if isinstance(target, list):
+            target = target[0] if target else "?"
+        routes[str(target)] = {"slices": r_slices, "interval_s": r_interval}
+    if not slices and not routes:
+        return None
+    return {
+        "slices": slices or None,
+        "interval_s": interval or None,
+        "by_target": routes or None,
+    }
 
 
 def _risk(slaves: List[SlaveConfig]) -> Dict[str, Any]:

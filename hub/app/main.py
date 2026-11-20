@@ -19,7 +19,7 @@ from app.notifier import Notifier
 from app.schwab_routes import router as schwab_router
 from app.signal_bus import SignalBus
 from app.slaves import load_enabled_slaves, seed_slaves_if_empty
-from app.watchdog import MasterWatchdog
+from app.watchdog import ConsumeWatchdog, MasterWatchdog
 from app.ws_routes import router as ws_router
 from app.zmq_receiver import ZmqReceiver
 
@@ -67,6 +67,16 @@ async def lifespan(app: FastAPI):
     app.state.flex = flex
     app.state.start_time = START_TIME
 
+    # Watches that each engine is still DRAINING its queue, which no
+    # other check covered: SlaveWatchdog watches the adapter and
+    # MasterWatchdog watches the feed, and on 2026-11-16 four consume
+    # loops died while both of those stayed green. Reads app.state for
+    # the same reason the reporter does -- POST /slaves adds engines
+    # after this point.
+    consume_watchdog = ConsumeWatchdog(app.state, events, notifier)
+    consume_watchdog.start()
+    app.state.consume_watchdog = consume_watchdog
+
     # Last, and reading app.state rather than holding its own copy: the
     # engines list grows while the copier runs (POST /slaves), and a
     # snapshot built from a list captured here would stop mentioning new
@@ -82,6 +92,7 @@ async def lifespan(app: FastAPI):
     # Stopped first, so a report in flight cannot be holding the event bus
     # open while the engines are being torn down beneath it.
     await reporter.stop()
+    await consume_watchdog.stop()
     await flex.stop()
     await master_watchdog.stop()
     for engine in engines:

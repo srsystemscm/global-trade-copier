@@ -81,6 +81,28 @@ def create_adapter(slave: SlaveConfig) -> BrokerAdapter:
             exit_chase_steps=int(slave.config.get("exit_chase_steps", 4)),
             exit_chase_pct=float(slave.config.get("exit_chase_pct", 0.002)),
             entry_timeout=float(slave.config.get("entry_timeout", 900.0)),
+            # The slave-wide GTD deadline. No default: a GTD route with no
+            # deadline anywhere is refused at placement rather than sent to
+            # IBKR as an order that never expires.
+            good_till=slave.config.get("good_till"),
+            # "strict" (default) or "last_close". See IBKRAdapter._sample_quote:
+            # only a slave whose entries are resting limits should price off a
+            # stale figure.
+            quote_fallback=slave.config.get("quote_fallback", "strict"),
+            # A resting entry follows the quote. 0 steps = off, which is
+            # how every slave behaves until it is configured.
+            entry_chase_steps=int(slave.config.get("entry_chase_steps", 0)),
+            entry_chase_interval=float(
+                slave.config.get("entry_chase_interval", 300.0)),
+            entry_chase_max_pct=float(
+                slave.config.get("entry_chase_max_pct", 0.01)),
+            # An entry too large for one print goes out in slices. The
+            # slave-level default; a route may set its own, and 0 or 1
+            # slices is off -- which is how every slave behaves until it
+            # is configured.
+            entry_split_slices=int(slave.config.get("entry_split_slices", 0)),
+            entry_split_interval=float(
+                slave.config.get("entry_split_interval", 0.0)),
             account=slave.config.get("account"),
         )
 

@@ -6,11 +6,13 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from app import magic_filter, master_filter, trade_registry
+from app import magic_filter, master_filter, portfolio_import, trade_registry
 from app.adapters.base import AdapterError
 from app.config import settings
 from app.db import db_cursor, get_config_value, list_logs, set_config_value
 from app.engine_manager import start_engine_for_slave, stop_engine
+from app.contract_specs import get_contract_spec
+from app.sizing import resolve_margin_cap
 from app.slaves import (
     delete_slave,
     get_slave,
@@ -69,6 +71,60 @@ def _validated_magic_filter(config: Optional[Dict[str, Any]]):
         raise HTTPException(400, str(exc)) from exc
 
 
+def _validated_route_deadlines(config) -> None:
+    """Refuse a route whose entry_timeout or good_till cannot be read.
+
+    HERE is config-load time -- somebody is saving, and is there to read
+    the message. Routing does not validate, on purpose: it runs per
+    signal, so raising there would take a whole slave's routing down over
+    one mistyped word in one route.
+
+    The specs are strings like "rth_close" or "26h" (app/order_timing.py).
+    A typo in one is invisible until the evening a signal actually needs
+    it, which for an ETF leg means the one moment nobody is watching.
+    """
+    if not isinstance(config, dict):
+        return
+    routes = config.get("routes")
+    if not isinstance(routes, list):
+        return
+
+    from app.order_timing import OrderTimingError, resolve
+
+    for index, entry in enumerate(routes):
+        if not isinstance(entry, dict):
+            continue
+        for field in ("entry_timeout", "good_till"):
+            value = entry.get(field)
+            if value is None or isinstance(value, (int, float)):
+                continue
+            text = str(value).strip()
+            if not text:
+                continue
+            try:
+                resolve(text)
+            except OrderTimingError as exc:
+                where = entry.get("target") or entry.get("symbol") or f"#{index}"
+                raise HTTPException(
+                    400, f"route {where}: {field} {text!r} is not a deadline "
+                         f"this hub can resolve -- {exc}"
+                ) from exc
+
+        # GTD without a deadline is the specific misconfiguration that
+        # used to go out as an order that never expires.
+        tif = entry.get("tif")
+        if (isinstance(tif, str) and tif.strip().upper() == "GTD"
+                and entry.get("good_till") is None
+                and config.get("good_till") is None):
+            where = entry.get("target") or entry.get("symbol") or f"#{index}"
+            raise HTTPException(
+                400, f"route {where}: tif GTD needs good_till -- a session "
+                     f"boundary such as 'rth_close', or a number of seconds. "
+                     f"Without one the broker is sent an order with no expiry, "
+                     f"which is GTC by another name"
+            )
+
+
 def _validated_master_filter(config: Optional[Dict[str, Any]]):
     """Parse a config's master selection, or answer 400 saying what is wrong.
 
@@ -115,9 +171,22 @@ def _describe_sizing(sizing: Optional[Dict[str, Any]]) -> str:
         pct = sizing.get("risk_pct")
         base = sizing.get("capital_base", "balance")
         ceiling = sizing.get("max_risk_pct")
-        text = f"{pct:.2%} of {base}" if isinstance(pct, (int, float)) else f"pct_risk of {base}"
+        # LED WITH risk_pct UNTIL 2026-11-16, and that figure is not used.
+        # apply_master_risk() replaces it with what the master's order
+        # actually staked on every signal a modern bridge sends, so the
+        # line read "1.00% of balance" while 2% arrived -- a number on
+        # screen that nothing honours. Chris: "the sizing display is
+        # stale".
+        #
+        # What actually decides the size is said instead, with risk_pct
+        # named as the fallback it has become: a master too old to
+        # publish its own risk still sizes from it, so it is not dead,
+        # just no longer the headline.
+        text = f"the master's staked risk, against {base}"
         if isinstance(ceiling, (int, float)):
             text += f", capped {ceiling:.2%}"
+        if isinstance(pct, (int, float)):
+            text += f" ({pct:.2%} if the master cannot say)"
         return text
     if mode == "dollar_notional":
         return f"${sizing.get('notional')} notional"
@@ -154,6 +223,43 @@ def _per_target_sizing(config: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in sizing.items() if isinstance(v, dict)}
 
 
+def _split_summary(config: Dict[str, Any]) -> Optional[str]:
+    """How this slave's entries reach the market, if not in one print.
+
+    None when nothing is configured, which is every slave until one is.
+    Reported because the splitter changes WHAT ARRIVES AT THE BROKER for a
+    signal -- four orders over two minutes instead of one -- and a setting
+    that does that while appearing on no screen is how a surprise gets
+    built into a money-moving system.
+    """
+    from app.order_split import resolve_split
+
+    slave_slices = config.get("entry_split_slices")
+    slave_interval = config.get("entry_split_interval")
+    lines = []
+    slices, interval = resolve_split(None, None, slave_slices, slave_interval)
+    if slices:
+        lines.append(f"entries split into {slices} over {interval:g}s")
+
+    # Per route, because a route's own setting wins and a slave-level line
+    # alone would describe something that is not happening.
+    for entry in config.get("routes") or []:
+        r_slices, r_interval = resolve_split(
+            entry.get("split_slices"), entry.get("split_interval"),
+            slave_slices, slave_interval,
+        )
+        if not r_slices or (r_slices, r_interval) == (slices, interval):
+            continue
+        # `target` may be a PREFERENCE LIST -- ["GC", "MGC"] is one
+        # position, first tradeable wins -- so the first candidate is the
+        # name for it. Printing the list itself reads like two routes.
+        target = entry.get("target") or entry.get("targets") or "?"
+        if isinstance(target, list):
+            target = target[0] if target else "?"
+        lines.append(f"{target}: {r_slices} over {r_interval:g}s")
+    return "; ".join(lines) or None
+
+
 def _sizing_summary(config: Dict[str, Any]) -> str:
     """How this slave sizes, in one line, in all three shapes it takes.
 
@@ -173,6 +279,121 @@ def _sizing_summary(config: Dict[str, Any]) -> str:
     if not routes:
         return _describe_sizing(None)
     return _tally((r.get("sizing") for r in routes), "routes")
+
+
+def _cap(blocks: List[Optional[Dict[str, Any]]]) -> Any:
+    """The refusal ceiling in force, which on a routed slave is a RANGE.
+
+    "mixed" was accurate and useless. ibkr-paper-1 carries 20% at the
+    slave level, nine routes inherit it, and the ETHUSDRR/MET route
+    overrides it to 3.5% -- so the card asserted 20% of a slave where one
+    route is nearly six times tighter, and then asserted nothing at all.
+    The two numbers that bound it are what a reader wants, and they fit
+    in the same space. Chris, 2026-11-18: "show the cap as a range".
+
+    `unbounded` is the case worth keeping separate: a block with no
+    max_risk_pct refuses nothing, and folding that into a maximum would
+    report a ceiling where there is none.
+    """
+    values = [(b or {}).get("max_risk_pct") for b in blocks]
+    numbers = sorted(
+        v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)
+    )
+    if not numbers:
+        return None
+
+    unbounded = len(numbers) != len(values)
+    if not unbounded and numbers[0] == numbers[-1]:
+        return numbers[0]
+    return {"min": numbers[0], "max": numbers[-1], "unbounded": unbounded}
+
+
+def _sizing_blocks(config: Dict[str, Any]) -> List[Optional[Dict[str, Any]]]:
+    """Every sizing block actually in force on this slave.
+
+    One block for a slave that carries one, a block per target for the
+    {"MGC": {...}} form, and a block per route where routes carry their
+    own -- merged over the slave block, because merge_sizing lets a route
+    name only the keys it changes and reading such a route alone reports
+    the slave's own ceiling as absent.
+    """
+    per_target = _per_target_sizing(config)
+    if per_target:
+        return list(per_target.values())
+
+    slave_block = config.get("sizing") or None
+    routes = config.get("routes") or []
+    if routes and any(r.get("sizing") for r in routes):
+        return [{**(slave_block or {}), **(r.get("sizing") or {})} for r in routes]
+    return [slave_block]
+
+
+def _sizing_facts(config: Dict[str, Any]) -> Dict[str, Any]:
+    r"""The same facts as `sizing_summary`, as values rather than a sentence.
+
+    Every screen that shows a slave was folding its own line out of that
+    sentence, and a sentence drifts. When the pct_risk wording changed on
+    2026-11-16 the Risk tab's own test for it (/\d+\.\d+% of/) stopped
+    matching, so the card printed the raw summary where a calibration line
+    belonged -- and the dashboard went on reading a ceiling back out with
+    a regex over "capped 2.50%". Chris, looking at the slave column:
+    "stale info".
+
+    Four values, decided here once, so the tiles, the list, the Risk tab
+    and the ops hub cannot answer differently:
+
+      mode    where the SIZE comes from -- the master's staked risk, or
+              the master's lot count carried across unchanged
+      basis   what a percentage is a percentage OF
+      cap     the ceiling past which a signal is refused
+      scale   this slave's calibration against what the EA signalled
+
+    "mixed" rather than one of the values means the blocks in force do
+    not agree, which on a twenty-route slave is a real state and reading
+    it as any single answer would be a lie about nineteen of them.
+    """
+    blocks = _sizing_blocks(config)
+
+    def agreed(read):
+        seen = []
+        for block in blocks:
+            value = read(block or {})
+            if value not in seen:
+                seen.append(value)
+        return seen[0] if len(seen) == 1 else "mixed"
+
+    def mode_of(block: Dict[str, Any]) -> str:
+        mode = block.get("mode")
+        # The two live shapes, named for what they DO. pct_risk stakes
+        # what the master staked -- apply_master_risk replaces risk_pct on
+        # every signal a modern bridge sends -- and no block at all sends
+        # the master's lot count across unchanged. The other three modes
+        # are their own answer and are returned as they are.
+        if not mode:
+            return "mirror"
+        return "master" if mode == "pct_risk" else mode
+
+    def basis_of(block: Dict[str, Any]) -> Optional[str]:
+        if not block.get("mode"):
+            return None
+        # compute_size reads balance when nothing says otherwise, so a
+        # pct_risk block without the key is sized against balance and the
+        # screen should say balance rather than nothing.
+        return block.get("capital_base", "balance") if block["mode"] == "pct_risk" else None
+
+    return {
+        "mode": agreed(mode_of),
+        "basis": agreed(basis_of),
+        "cap_pct": _cap(blocks),
+        # 1.0 is a SETTING, not an absence: it means this slave takes the
+        # EA's signalled risk unscaled. Reported as a number so no screen
+        # has to decide what a null means.
+        "risk_scale": float(config.get("risk_scale") or 1.0),
+        # How many strategies are off that headline figure. The figures
+        # themselves are on the Risk calibration row; this is the count
+        # that says to go and look.
+        "scale_overrides": len(config.get("risk_scale_by_magic") or {}),
+    }
 
 
 def _describe_route_sizing(block: Optional[Dict[str, Any]]) -> str:
@@ -219,19 +440,42 @@ def _route_rows(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         rows.append({
             "symbol": route.get("symbol"),
             "magic": route.get("magic"),
-            # A route may name several targets and take the first that
-            # resolves, so this is a list as often as a string.
+            # A route may name several targets. The first that resolves is
+            # taken -- and, since 2026-11-15, the next one is tried when a
+            # book is at its leg or aggregate-risk capacity, which is what
+            # the extra names are for.
             "target": target if isinstance(target, list) else [target],
             "direction": route.get("direction"),
             "target_direction": route.get("target_direction"),
             "order_type": route.get("order_type") or "market",
             "outside_rth": bool(route.get("outside_rth")),
+            # How long the entry lives at the broker, and how long this
+            # engine waits for it. Shown because the pair is what decides
+            # whether a leg opened in the evening can still be open at the
+            # next session -- and because setting one without the other is
+            # the configuration that looks right and does nothing.
+            "tif": route.get("tif"),
+            "entry_timeout": route.get("entry_timeout"),
+            # Only meaningful with GTD, and the one thing that makes GTD
+            # different from GTC. Shown beside them so "GTD" with nothing
+            # here is visible as the misconfiguration it is.
+            "good_till": route.get("good_till"),
             # False means the copier holds the stop itself and the broker
             # has no resting order -- worth seeing, because it decides
             # whether the position is protected while the hub is down.
             "broker_brackets": route.get("broker_brackets"),
             "month_slot": route.get("month_slot"),
             "sizing": _describe_route_sizing(route.get("sizing")),
+            # This route's OWN order splitter, which WINS over the
+            # slave-level one. Shown because it was not: the gold route
+            # carried "3 over 5s" while the slave card said nothing, so
+            # clearing the slave-level setting left a split running that
+            # no screen would own up to.
+            #
+            # 0 is not absent. It is a route opting OUT of a slave-wide
+            # split, which is a decision and reads as one.
+            "split_slices": route.get("split_slices"),
+            "split_interval": route.get("split_interval"),
             "atr_period": route.get("atr_period"),
             "risk_management": route.get("risk_management") or None,
         })
@@ -330,6 +574,109 @@ async def _positions_within(engine, account_types):
     return task.result()
 
 
+def describe_mode(config: Dict[str, Any]) -> str:
+    """What this slave actually does with a signal, in words.
+
+    The raw value is "mirror" or "autonomous" and both have stopped being
+    true descriptions of anything. "mirror" is read as "copies the master's
+    lots", and that is what it meant when a mirror slave had no sizing of
+    its own. Two of the four live slaves are mode=mirror with a pct_risk
+    block: they size from their own capital through the same compute_size
+    the autonomous engines use, and mirror nothing but the stop LEVEL. A
+    word on screen that means the opposite of what it says is worse than no
+    word, because somebody sizes a position against it.
+
+    What the mode genuinely decides is two things, so say those:
+
+      where the stop comes from   the master's level, or this slave's ATR
+      what gets traded            the same symbol, or a routed instrument
+
+    Returned from here rather than built in the UI so the dashboard, the
+    slave cards and the ops hub cannot drift into three different answers.
+    """
+    mode = (config or {}).get("mode", "mirror")
+    routes = (config or {}).get("routes") or []
+
+    if mode == "autonomous":
+        stop = "own stops from ATR"
+        # "routed" WAS SAID EVEN WITH NO ROUTES, which is the opposite of
+        # true: routing_is_strict() is false without a `routes` key, so
+        # such a slave takes every signal on its own symbol through
+        # symbol_map. mt5-dwx-futures-1 read "own stops from ATR, routed"
+        # while routing nothing at all.
+        if routes:
+            where = (f"{len(routes)} routed instrument"
+                     f"{'' if len(routes) == 1 else 's'}")
+        elif (config or {}).get("symbol_map"):
+            where = "the master's symbols, mapped"
+        else:
+            where = "the master's own symbols"
+        return f"{stop}, {where}"
+
+    # Mirror. The stop is the master's either way; the size is the question.
+    if (config or {}).get("sizing"):
+        return "master's stops, own size"
+    return "master's stops and lots"
+
+
+def _trades_dated_contracts(config: Dict[str, Any]) -> bool:
+    """Does any target on this slave have an expiry to roll out of?
+
+    get_contract_spec() carries listed futures only, so a stock or ETF
+    answers None -- which is exactly the question being asked. A slave
+    with no routes at all trades the master's own symbols, and those are
+    CFDs, which do not roll either.
+    """
+    for route in (config or {}).get("routes") or []:
+        target = route.get("target")
+        for name in (target if isinstance(target, list) else [target]):
+            if name and get_contract_spec(name) is not None:
+                return True
+    return False
+
+
+# A loop that has stopped consuming looks, from every other field on
+# this page, exactly like a loop with nothing to do. These three numbers
+# are what tell them apart. STALL_WARN_S is only how long a queue may sit
+# untouched before the summary says so out loud -- the engine is not
+# restarted on the strength of it.
+STALL_WARN_S = 60.0
+
+
+def _consume_health(engine) -> Optional[Dict[str, Any]]:
+    """Whether this slave's consume loop is still draining its queue.
+
+    Four engines stopped consuming on 2026-11-16 and the only symptom was
+    an absence: signals that reached one slave and never reached another.
+    Every field the dashboard had -- connected, running, paused -- was
+    still true, because they describe the adapter and the object, not the
+    loop. `alive` is the task itself; `queue_depth` with an old
+    `last_consumed_at` is a stall in progress whatever the task says.
+    """
+    if engine is None:
+        return None
+    queue = getattr(engine, "queue", None)
+    task = getattr(engine, "_consume_task", None) or getattr(engine, "_task", None)
+    last = float(getattr(engine, "last_consumed_at", 0.0) or 0.0)
+    depth = queue.qsize() if queue is not None else None
+    idle = round(time.time() - last, 1) if last else None
+    # Backed up AND untouched. A depth on its own is normal -- signals
+    # arrive in bursts and are drained in milliseconds.
+    stalled = bool(
+        (task is not None and task.done())
+        or (depth and (idle is None or idle > STALL_WARN_S))
+    )
+    return {
+        "queue_depth": depth,
+        "last_consumed_at": round(last, 1) if last else None,
+        "seconds_since_consumed": idle,
+        # False here means the loop has ENDED: every signal from now on
+        # is dropped, and nothing else on this page would say so.
+        "alive": None if task is None else not task.done(),
+        "stalled": stalled,
+    }
+
+
 async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
     engine = _find_engine(request, slave.id)
     mode = slave.config.get("mode", "mirror")
@@ -339,6 +686,21 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         "name": slave.name,
         "broker_type": slave.broker_type,
         "mode": mode,
+        # The raw value stays -- the hub reporter sends it, and the ATR and
+        # contract-roll sections key off it. This is the line for a reader.
+        "mode_label": describe_mode(slave.config),
+        # Switchable, but only while the slave is flat. Changing it swaps
+        # CopyEngine for AutonomousCopyEngine, and position_store is keyed
+        # by slave, so the incoming engine would adopt open positions and
+        # protect them under rules they were never opened under -- one aims
+        # at the master's stop level, the other trails its own from ATR.
+        # Reported rather than left for the UI to guess, so the control is
+        # disabled for the same reason the API refuses.
+        "mode_editable": not held_position_count(slave.id),
+        "mode_locked_reason": (
+            f"holding {held_position_count(slave.id)} position(s)"
+            if held_position_count(slave.id) else None
+        ),
         "enabled": slave.enabled,
         "paused": engine.paused if engine is not None else slave.paused,
         "running": engine is not None,
@@ -358,15 +720,37 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         # decides what gets traded was live in the engine and absent from
         # every screen that shows the slave.
         "sizing": slave.config.get("sizing"),
+        # Which bars each strategy's ATR is measured on. Surfaced because
+        # a stop translated against the wrong timeframe is wrong by a
+        # multiple and nothing else on screen would show it -- and because
+        # a mirror slave has no routes, so this table is the only place it
+        # can be said at all.
+        "bar_size_by_magic": slave.config.get("bar_size_by_magic") or None,
+        "bar_size": slave.config.get("bar_size") or None,
         "risk_management": slave.config.get("risk_management") if mode == "autonomous" else None,
         # Both decide whether a signal becomes a trade at all, and both were
         # invisible: netting.allow_opposing is why a hedged leg copies or is
         # refused, and margin.max_pct_of_free is why a size gets reduced.
         "netting": slave.config.get("netting") or None,
         "margin": slave.config.get("margin") or None,
+        # The ceiling ACTUALLY IN FORCE, from whichever key carries it.
+        # The card used to read margin.max_pct_of_free directly and so
+        # showed no ceiling on the two slaves that had one, while showing
+        # one on the slave whose engine never read it.
+        "margin_cap_pct": resolve_margin_cap(slave.config),
+        # Whether anything this slave trades EXPIRES. Rolling is a futures
+        # idea: a share of UGL has no front month and no next one, so the
+        # contract-roll row on an ETF slave was offering to schedule two
+        # market orders for something that cannot happen. Chris: "ETFs do
+        # not need a contract roll either".
+        "rolls_contracts": _trades_dated_contracts(slave.config),
         # A line a reader can act on without opening the JSON, and the only
         # place the per-route case is represented at all.
         "sizing_summary": _sizing_summary(slave.config),
+        # The same facts as numbers. See _sizing_facts: the screens read
+        # these, so a change of wording above cannot quietly change what
+        # the slave column says it stakes.
+        "sizing_facts": _sizing_facts(slave.config),
         # Whether editing slave-level sizing would do anything. Routes carry
         # their own and win over the shared block, so offering a slave-level
         # control on a route-based slave is a setting that saves cleanly and
@@ -374,6 +758,35 @@ async def _slave_summary(request: Request, slave) -> Dict[str, Any]:
         "sizing_per_route": bool(
             _per_target_sizing(slave.config)
             or (not slave.config.get("sizing") and slave.config.get("routes"))),
+        # Is this slave's loop still taking signals off its queue? See
+        # _consume_health: nothing else on this page can answer that.
+        "consume": _consume_health(engine),
+        # Whether entries go out in one print or in slices over a window.
+        # None on every slave that has not configured it.
+        "split_summary": _split_summary(slave.config),
+        # How a RESTING entry follows the market: steps, how far apart,
+        # and how far it may drift from where it started. Reported as the
+        # three together, because any one of them alone decides nothing
+        # -- an interval longer than the trade means it never fires at
+        # all, which is what ibkr-etf-1 was doing with 60s against 30s
+        # trades.
+        "entry_chase": (
+            {"steps": int(slave.config.get("entry_chase_steps") or 0),
+             "interval_s": float(slave.config.get("entry_chase_interval") or 300.0),
+             "max_pct": float(slave.config.get("entry_chase_max_pct") or 0.01)}
+            if slave.config.get("entry_chase_steps") else None),
+        # Whether this slave's adapter can split an entry AT ALL. The
+        # fields travel on every OrderRequest and only IBKR acts on them,
+        # so offering the control on an MT slave would be a setting that
+        # saves cleanly and changes nothing -- the kind this file has had
+        # to go back and gate twice already.
+        #
+        # None when no engine is running, which is "not known yet" rather
+        # than "no".
+        "supports_order_split": (
+            bool(getattr(getattr(engine, "adapter", None),
+                         "supports_order_split", False))
+            if engine is not None else None),
         **_slave_summary_extras(slave),
     }
 
@@ -424,6 +837,7 @@ async def create_slave(payload: SlaveCreate, request: Request):
         raise HTTPException(409, f"slave id {payload.id!r} already exists")
     _validated_magic_filter(payload.config)
     _validated_master_filter(payload.config)
+    _validated_route_deadlines(payload.config)
 
     slave = insert_slave(payload.id, payload.name, payload.broker_type, payload.config, payload.enabled)
 
@@ -463,6 +877,122 @@ async def get_one_slave(slave_id: str):
     }
 
 
+def held_position_count(slave_id: str) -> int:
+    """Open rows the HUB holds for this slave. 0 when it holds none.
+
+    The registry, not an engine's in-memory dict. The first version of
+    this read `engine._positions` and was wrong in a way the UI displayed
+    as a green light: CopyEngine has no `_positions` at all and never
+    writes position_store, so every MIRROR slave counted 0 however much it
+    held. mt5-dwx-futures-1 reported "switchable" while holding eight
+    positions.
+
+    trade_registry is written by BOTH engines (copy_engine.py:452,
+    autonomous_copy_engine.py), so it is the one source that answers for
+    either -- and it is what the hub believes it holds, which is the thing
+    a switch puts at risk.
+    """
+    return len(trade_registry.get_all_open_for_slave(slave_id))
+
+
+def _refuse_switch_while_holding(slave_id: str, switching: tuple) -> None:
+    """A mode switch is only safe on a flat slave.
+
+    THE REASON WAS WRONG when this was written, and the correction makes
+    it worse rather than milder. It said the incoming engine would ADOPT
+    these positions and manage them under rules they were never opened
+    under. It does not adopt them: position_store is written only by the
+    autonomous engine, and CopyEngine ignores it entirely. So a switch
+    ABANDONS them.
+
+    Abandoned means the broker still holds the position and nothing in the
+    hub is tracking it. The master's CLOSE arrives, the new engine looks
+    for a position it has no record of, and the leg stays open -- the
+    shape of the untracked strays that already took hours to chase.
+
+    Refusing is the only answer. Not a warning: there is nothing the
+    operator could do about it afterwards except notice.
+    """
+    held = held_position_count(slave_id)
+    if not held:
+        return
+    raise HTTPException(409, (
+        f"{slave_id} is holding {held} position(s). Switching from "
+        f"{switching[0]} to {switching[1]} starts a different engine, and the new "
+        f"one would have no record of them -- the master's CLOSE would not reach "
+        f"them and they would sit open at the broker untracked. Close them, or "
+        f"wait for them to close, then switch."
+    ))
+
+
+def _mode_switch(slave, config) -> Optional[tuple]:
+    """(from, to) when this edit changes which engine runs, else None.
+
+    Pulled out because a mode change has to be decided before anything is
+    written: it is refused whole when the slave holds positions, and a
+    half-applied switch would leave the stored config describing an engine
+    that is not the one running.
+    """
+    if not config or "mode" not in config:
+        return None
+    before = (slave.config or {}).get("mode", "mirror")
+    after = config.get("mode") or "mirror"
+    if after not in ("mirror", "autonomous"):
+        raise HTTPException(400, (
+            f"{after!r} is not a mode -- it chooses the engine, and there are "
+            f"two: 'mirror' or 'autonomous'"
+        ))
+    return None if after == before else (before, after)
+
+
+# What the adapter reads from its OWN attributes every time it is used,
+# rather than from the config. Each is safe to change between orders --
+# none of them describes the connection, and none is remembered inside an
+# order already placed.
+#
+# THE CONNECTION DETAILS ARE DELIBERATELY NOT HERE. host, port, client_id
+# and account are read once, to open a session; rewriting them on a live
+# adapter would leave it connected to one place and labelled another.
+# Those still need a restart, and the UI says so.
+_LIVE_ADAPTER_TUNABLES = {
+    "entry_chase_steps": ("entry_chase_steps", int, 0),
+    "entry_chase_interval": ("entry_chase_interval", float, 300.0),
+    "entry_chase_max_pct": ("entry_chase_max_pct", float, 0.01),
+    "entry_split_slices": ("entry_split_slices", int, 0),
+    "entry_split_interval": ("entry_split_interval", float, 0.0),
+    "quote_fallback": ("quote_fallback", str, "strict"),
+}
+
+
+def _refresh_adapter_tunables(adapter, config: Dict[str, Any]) -> None:
+    """Push the per-use settings onto a running adapter.
+
+    The adapter reads these in its constructor, which runs once at
+    startup. PATCH live-updates the engine, so a route's setting took
+    effect immediately while a slave-level one sat in the config doing
+    nothing until the next restart -- the card reading "entries split
+    into 3 over 5s" while 831 MET went out in a single order.
+
+    That is a setting which saves cleanly and does nothing, and this file
+    has had to go back and gate three of them. Refreshing the adapter is
+    cheaper than adding a fourth.
+    """
+    if adapter is None:
+        return
+    for key, (attr, cast, default) in _LIVE_ADAPTER_TUNABLES.items():
+        if not hasattr(adapter, attr):
+            continue
+        try:
+            setattr(adapter, attr, cast(config.get(key, default)))
+        except (TypeError, ValueError):
+            # A value that will not cast is a config error, not a reason
+            # to abandon the rest of the refresh or fail the save.
+            logger.warning(
+                "slave config %s=%r cannot be applied to the adapter",
+                key, config.get(key),
+            )
+
+
 @router.patch("/slaves/{slave_id}")
 async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
     slave = get_slave(slave_id)
@@ -471,6 +1001,14 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
 
     takes = _validated_magic_filter(payload.config)
     from_masters = _validated_master_filter(payload.config)
+    _validated_route_deadlines(payload.config)
+
+    # A mode change is not a config edit; it is a different engine. Worked
+    # out before anything is written, because the switch has to be refused
+    # whole rather than half-applied.
+    switching = _mode_switch(slave, payload.config)
+    if switching is not None:
+        _refuse_switch_while_holding(slave_id, switching)
 
     if payload.name is not None or payload.config is not None:
         slave = update_slave(slave_id, name=payload.name, config=payload.config)
@@ -484,12 +1022,35 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
             engine.risk_config = slave.config.get("risk_management", {})
             if hasattr(engine, "roll_config"):
                 engine.roll_config = slave.config.get("contract_roll", {})
+            _refresh_adapter_tunables(getattr(engine, "adapter", None),
+                                      slave.config)
         if payload.config is not None:
             # Held by the bus, not the engine: the selection decides what
             # reaches this slave's queue in the first place. Updated even
             # when no engine is running, which is a no-op the bus ignores.
             request.app.state.bus.set_magic_filter(slave_id, takes)
             request.app.state.bus.set_master_filter(slave_id, from_masters)
+
+        if switching is not None:
+            # Same stop/start the enabled toggle does, in the same order and
+            # for the same reason: start_engine_for_slave reads the mode
+            # from the stored config, so the write above has to land first.
+            engine = _find_engine(request, slave_id)
+            if engine is not None:
+                await stop_engine(engine, request.app.state.bus)
+                request.app.state.engines.remove(engine)
+            slave = get_slave(slave_id)
+            if slave.enabled:
+                engine = await start_engine_for_slave(
+                    slave, request.app.state.bus, request.app.state.events,
+                    request.app.state.notifier,
+                )
+                request.app.state.engines.append(engine)
+            logger.warning(
+                "slave=%s switched from %s to %s -- %s engine now running",
+                slave_id, switching[0], switching[1],
+                switching[1] if slave.enabled else "no",
+            )
 
     if payload.paused is not None:
         set_paused(slave_id, payload.paused)
@@ -513,6 +1074,93 @@ async def patch_slave(slave_id: str, payload: SlaveUpdate, request: Request):
         slave = get_slave(slave_id)
 
     return await _slave_summary(request, slave)
+
+
+@router.post("/slaves/{slave_id}/import/portfolio")
+async def import_portfolio(
+    slave_id: str, document: Dict[str, Any], request: Request, dry_run: bool = True
+):
+    """Apply a Portfolio Manager export to this slave.
+
+    The file says which strategies a portfolio holds and what share of each
+    EA's signal to take; this writes those as the two keys the engine
+    already reads. The contract is docs/portfolio-import.md.
+
+    DRY RUN BY DEFAULT. An import replaces a slave's whole strategy
+    selection -- a magic the file does not mention is one the slave stops
+    taking -- so the question "what would this change" has to be
+    answerable without answering it by doing it. The same plan comes back
+    either way, so what was approved and what happened are the same words.
+
+    The write goes through patch_slave rather than around it. That route
+    validates the selection before anything is stored, updates the bus so
+    the change takes effect without a restart, and leaves the engine's
+    live tunables consistent -- reimplementing two of those three here is
+    how an import comes to be a slightly different kind of save.
+    """
+    slave = get_slave(slave_id)
+    if slave is None:
+        raise HTTPException(404, f"no slave with id={slave_id!r}")
+
+    try:
+        portfolio = portfolio_import.parse(document)
+    except portfolio_import.PortfolioImportError as exc:
+        # 400 with the reason in words: whoever is holding the file is the
+        # one who can fix it, and "invalid" would send them to the logs.
+        raise HTTPException(400, str(exc)) from exc
+
+    plan = portfolio_import.plan(slave.config, portfolio)
+    if dry_run:
+        return {"applied": False, "plan": plan}
+
+    # Read-modify-write: PATCH replaces config_json wholesale, so the new
+    # config is this slave's own config with two keys changed.
+    config = portfolio_import.apply(slave.config, portfolio)
+    await patch_slave(slave_id, SlaveUpdate(config=config), request)
+    logger.info(
+        "slave=%s imported portfolio %s (%s) rev=%s: %d strategies",
+        slave_id, portfolio.id, portfolio.name, portfolio.revision,
+        len(portfolio.strategies),
+    )
+    return {"applied": True, "plan": plan}
+
+
+@router.delete("/slaves/{slave_id}/import/portfolio")
+async def remove_portfolio(slave_id: str, request: Request, dry_run: bool = True):
+    """Take the portfolio back off this slave.
+
+    APPLYING ONE IS NOT ITS OWN INVERSE, which is why this exists. An
+    import writes the selection AND the per-strategy scales, and removing
+    only the selection -- the half that is visible on screen -- leaves the
+    scales in force over a slave that now takes every strategy again. On
+    mt5-icm-1 that happened minutes after the first live import: three
+    scales left behind, two of them halving a strategy, and the only sign
+    of it a "+3 EA" badge that read like a stale display.
+
+    Clears whatever is there rather than what an import would have left,
+    because the two drift: a selection can be edited or deleted by hand,
+    and the scales outlive it.
+
+    Dry run by default, like the import, and for the same reason: removing
+    a selection means the slave takes EVERY strategy again, which is the
+    largest change this can make and the one least visible afterwards.
+    """
+    slave = get_slave(slave_id)
+    if slave is None:
+        raise HTTPException(404, f"no slave with id={slave_id!r}")
+
+    plan = portfolio_import.removal_plan(slave.config)
+    if dry_run or plan["nothing_to_remove"]:
+        return {"removed": False, "plan": plan}
+
+    config = portfolio_import.remove(slave.config)
+    await patch_slave(slave_id, SlaveUpdate(config=config), request)
+    logger.info(
+        "slave=%s portfolio removed: %d magic(s) deselected, %d scale(s) cleared%s",
+        slave_id, len(plan["magics_dropped"]), len(plan["scales_dropped"]),
+        " -- it now takes EVERY strategy" if plan["widens_to_every_magic"] else "",
+    )
+    return {"removed": True, "plan": plan}
 
 
 @router.delete("/slaves/{slave_id}")

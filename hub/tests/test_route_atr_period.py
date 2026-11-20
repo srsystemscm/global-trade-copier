@@ -154,14 +154,38 @@ def test_the_open_requests_the_routes_bar_size():
 
 
 def test_no_bar_size_leaves_the_adapter_default():
-    """None, not a string -- the adapter owns the default, so that existing
-    configs keep asking for exactly what they asked for before."""
+    """None, not a string -- the adapter owns the default.
+
+    REWORKED on 2026-11-15, and the original guarantee is gone on
+    purpose. This read "existing configs keep asking for exactly what
+    they asked for before" with magic 2389. Under the leading-digit rule
+    2389 starts with 2 and therefore means H4, so a route naming no
+    bar_size no longer means daily -- it means whatever timeframe its
+    strategy runs on. That IS the change.
+
+    What still holds, and is what this now asks: a magic the scheme does
+    not name leaves the default alone. 9389 starts with 9.
+    """
+    b = FakeBroker()
+    e = _engine(b, [{"symbol": "XAUUSD", "magic": 9389, "target": "GC",
+                     "sizing": {"mode": "fixed_contracts", "contracts": 1}}])
+    asyncio.run(e._handle_open(_sig(magic=9389)))
+
+    assert b.history_calls[0]["bar_size"] is None
+
+
+def test_the_magic_names_the_timeframe_without_any_route_config():
+    """The superseding behaviour, asserted rather than merely implied.
+
+    2389 means H4 by its first digit, and nothing in this route says so.
+    This is what makes a weekly strategy measurable on a MIRROR slave,
+    which has no routes to carry a bar_size at all."""
     b = FakeBroker()
     e = _engine(b, [{"symbol": "XAUUSD", "magic": 2389, "target": "GC",
                      "sizing": {"mode": "fixed_contracts", "contracts": 1}}])
     asyncio.run(e._handle_open(_sig()))
 
-    assert b.history_calls[0]["bar_size"] is None
+    assert b.history_calls[0]["bar_size"] == "4 hours"
 
 
 def test_a_roll_re_measures_on_the_same_bars_as_the_entry():

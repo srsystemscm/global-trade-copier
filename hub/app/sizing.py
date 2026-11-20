@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional, Tuple
 
 from app.contract_specs import ContractSpec
@@ -195,6 +196,53 @@ def apply_master_risk(
     return out
 
 
+# Both keys mean "the ceiling on margin", and until 2026-11-16 each
+# engine read only its own.
+#
+#   netting.max_margin_pct   autonomous  -- refuses, and steps down the
+#                                           candidate chain
+#   margin.max_pct_of_free   mirror      -- trims the size to fit
+#
+# So mt5-dwx-futures-1 carried margin.max_pct_of_free 0.25, ran
+# AUTONOMOUS, and was not capped at all: a setting that saves cleanly
+# and is never read. Both IBKR slaves carried netting.max_margin_pct and
+# showed no ceiling on screen, because the card reads the other key.
+# Mode is switchable from that card in two clicks, so a slave could
+# change which cap applies without anyone touching the cap.
+#
+# One resolver now, read by all three sites. The two ENGINES keep their
+# own behaviour -- trimming and refusing are different answers to the
+# same question and changing either silently is not a rename -- but they
+# can no longer disagree about whether a ceiling exists.
+MARGIN_CAP_KEYS = ("max_margin_pct", "max_pct_of_free")
+
+
+def resolve_margin_cap(
+    slave_config: Optional[Dict[str, Any]],
+    route_netting: Optional[Dict[str, Any]] = None,
+) -> Optional[float]:
+    """The margin ceiling in force, as a fraction, or None for no cap.
+
+    Most specific first: a route's own netting block, then the slave's
+    netting, then the legacy `margin` block. Either key is accepted in
+    any of them, so existing configs keep working untouched and the UI
+    can write one canonical place.
+    """
+    sources = (
+        route_netting,
+        (slave_config or {}).get("netting"),
+        (slave_config or {}).get("margin"),
+    )
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for key in MARGIN_CAP_KEYS:
+            value = src.get(key)
+            if value is not None:
+                return float(value)
+    return None
+
+
 def resolve_risk_scale(
     slave_config: Dict[str, Any],
     route_scale: Optional[float] = None,
@@ -202,36 +250,159 @@ def resolve_risk_scale(
 ) -> float:
     """How much of the configured risk this leg carries.
 
-    Three places can say, most specific first:
+    A PRODUCT of three independent dials, each defaulting to 1.0:
 
-    1. the ROUTE, which already names a (symbol, magic) pair
-    2. `risk_scale_by_magic`, keyed by the EA's magic number
-    3. `risk_scale` on the slave
+        slave `risk_scale`  x  `risk_scale_by_magic[magic]`  x  route scale
 
-    1.0 is the default everywhere -- an absent setting must never quietly
-    resize anything.
+    Chris's model, in his own arithmetic: "most EA are going to send a 2%
+    risk of balance on signal. most slaves are going to be calibrated to
+    0.50 at the intake. on average each magic will then get a 1.0 risk
+    scale. some might get 0.50, which should effectively be 1/4 of the
+    original signal."
+
+        2% signal  x  0.50 slave intake  x  1.00 magic  =  1%
+        2% signal  x  0.50 slave intake  x  0.50 magic  =  0.5%  (a quarter)
+
+    They are different questions and that is why they compose. The slave
+    figure asks how much of ANY signal this venue should take, which is a
+    property of the venue's leverage. The per-magic figure asks how this
+    one strategy compares to the others, which is a property of the
+    strategy. Neither answer should erase the other.
+
+    THIS WAS FIRST-MATCH-WINS until 2026-11-15, and that gave 0.50 for the
+    last line above rather than 0.25: a strategy with its own figure never
+    saw the slave's intake calibration at all, so recalibrating a slave
+    silently skipped every strategy that had been individually tuned --
+    exactly the ones most likely to matter. Nothing live had either dial
+    set when this changed, so no position was resized by the change
+    itself.
+
+    ZERO still means "do not trade this here", and survives the product
+    intact: 0 times anything is 0, and a non-positive scale is refused
+    rather than sent.
 
     The per-magic table exists because leverage is not the same on every
-    venue. One EA sized for a CFD account is a different amount of risk
-    once its signal lands on a futures or ETF leg, and the knob that fixes
-    that belongs to the strategy rather than to the whole slave. Mirror
-    slaves have no routes at all, so without this they could only be
-    scaled wholesale.
+    venue. Mirror slaves have no routes at all, so without it they could
+    only be scaled wholesale.
 
     JSON object keys are strings, so an integer magic is looked up both
     ways rather than silently missing a table written by hand.
     """
-    if route_scale is not None:
-        return float(route_scale)
+    # `is None` rather than `or 1.0`, so an explicit 0 -- "do not trade
+    # anything here" -- is honoured rather than read as unset. A JSON null
+    # left by a form that cleared the field means unset, and must not
+    # reach float().
+    declared = slave_config.get("risk_scale")
+    scale = 1.0 if declared is None else float(declared)
 
     if magic is not None:
         by_magic = slave_config.get("risk_scale_by_magic") or {}
         if isinstance(by_magic, dict):
             for key in (str(magic), magic):
                 if key in by_magic:
-                    return float(by_magic[key])
+                    scale *= float(by_magic[key])
+                    break
 
-    return float(slave_config.get("risk_scale", 1.0))
+    if route_scale is not None:
+        scale *= float(route_scale)
+
+    return scale
+
+
+# The leading digit of a magic names the timeframe the strategy runs on.
+# Chris's scheme; the shipped default, overridable per slave by
+# `bar_size_by_magic_prefix`, and switched off by setting that to {}.
+DEFAULT_BAR_SIZE_BY_MAGIC_PREFIX = {
+    "1": "1 day",
+    "2": "4 hours",
+    "3": "1 hour",
+    "4": "1 week",
+}
+
+
+def bar_size_for_magic_prefix(
+    magic: Optional[int], table: Optional[Dict[str, Any]] = None
+) -> Optional[str]:
+    """The timeframe a magic's FIRST digit names, or None.
+
+    None for anything the table does not name. Never a guess: the test
+    magics 5555, 7001 and 9999 all start outside 1-4, and inventing a
+    timeframe for them would be worse than the default they get now.
+    """
+    if magic is None:
+        return None
+    if table is None:
+        table = DEFAULT_BAR_SIZE_BY_MAGIC_PREFIX
+    if not table:
+        return None      # explicitly disabled
+    digits = str(abs(int(magic)))
+    if not digits:
+        return None
+    value = table.get(digits[0])
+    return (str(value) or None) if value is not None else None
+
+
+def resolve_bar_size(
+    slave_config: Dict[str, Any],
+    route_bar_size: Optional[str] = None,
+    magic: Optional[int] = None,
+) -> Optional[str]:
+    """Which bars this leg's ATR is measured on.
+
+    Four places can say, most specific first:
+
+    1. the ROUTE, which already names a (symbol, magic) pair
+    2. `bar_size_by_magic`, keyed by the EA's whole magic number -- the
+       exception, for one strategy that does not follow the scheme
+    3. the magic's LEADING DIGIT: 1 daily, 2 H4, 3 H1, 4 weekly. A rule
+       rather than a list, so a strategy deployed today measures
+       correctly today. Set `bar_size_by_magic_prefix` to change the map
+       or to {} to switch it off
+    4. `bar_size` on the slave
+
+    None means the adapter's own default, which is daily -- what every
+    route meant before any of this existed.
+
+    THE PER-MAGIC TABLE IS THE POINT. A timeframe is a property of the
+    strategy that set the stop, not of the instrument it lands on or of
+    the account. A weekly system signals off weekly data and executes on
+    the daily bar at Monday's open, because MT4 has no weekly execution
+    bar -- but its stop was measured in weekly ATRs, so translating that
+    multiple against a DAILY ATR makes the stop roughly a fifth of its
+    intended width. Risk sizing divides by stop distance, so the position
+    comes out several times too large, and nothing on any screen says so.
+
+    Putting it on the route instead would need a route per magic, and
+    could not serve a mirror slave at all -- those have no routes and
+    still take a selection of strategies.
+
+    JSON object keys are strings, so an integer magic is looked up both
+    ways rather than silently missing a table written by hand.
+    """
+    if route_bar_size:
+        return route_bar_size
+
+    if magic is not None:
+        by_magic = slave_config.get("bar_size_by_magic") or {}
+        if isinstance(by_magic, dict):
+            for key in (str(magic), magic):
+                if key in by_magic:
+                    value = by_magic[key]
+                    # An empty string is not a timeframe. Returned as None
+                    # so it means "the default" rather than reaching an
+                    # adapter as a bar size it has to reject.
+                    return str(value) or None
+
+    # The scheme. Below the explicit table so one odd strategy can opt
+    # out, above the slave default so a slave-wide bar_size does not
+    # flatten every timeframe back to one.
+    from_prefix = bar_size_for_magic_prefix(
+        magic, slave_config.get("bar_size_by_magic_prefix")
+    )
+    if from_prefix:
+        return from_prefix
+
+    return slave_config.get("bar_size") or None
 
 
 def compute_size(
@@ -244,6 +415,8 @@ def compute_size(
     account_equity: float,
     contract_spec: Optional[ContractSpec],
     risk_scale: float = 1.0,
+    round_band: Optional[float] = None,
+    max_risk_error: Optional[float] = None,
 ) -> SizingResult:
     """Computes the slave order size (contracts for futures, shares for
     equities/ETFs).
@@ -349,6 +522,111 @@ def compute_size(
     if units <= 0:
         return SizingResult(size=0, skipped=True, reason=f"computed size {size} is not positive")
 
+    # NEAR A WHOLE CONTRACT, OR STEP DOWN TO A SMALLER ONE.
+    #
+    # Rounding is the whole problem, and its cost depends on WHERE the
+    # exact figure falls, not on how large it is. 1.61 GC floors to 1 and
+    # throws away 38% of the intended risk; 1.90 rounds to 2 at a cost of
+    # 5%. Count alone cannot tell those two apart, which is why the
+    # min_contracts threshold this replaces sent both to the micros.
+    #
+    # Chris's rule, in his own figures: "the GC exact was 1.61, for this
+    # I'd accept when >1.75, round up. when <1.25 round down. favoring
+    # the larger single contracts despite losing some risk (up and down)
+    # on the rounding."
+    #
+    # ROUNDING UP RAISES RISK ABOVE TARGET, deliberately -- 1.76 becomes
+    # 2, some 14% over. max_risk_pct is the backstop for anything
+    # genuinely oversized.
+    #
+    # NEVER ROUNDS UP TO ONE from below. At 0.9 the band would say "take
+    # 1", 11% over, while the micro takes 9 of its own at no cost at all.
+    # Below a whole contract the smaller instrument always fits better,
+    # so that case steps down like any other.
+    #
+    # Applied only where a smaller alternative exists: the caller passes
+    # None for the last candidate, or a signal landing mid-band on the
+    # micro would step down to nothing and fill nothing at all.
+    # HOW WRONG THE RISK WOULD BE, which is the question round_band was
+    # reaching for and could not ask.
+    #
+    # A band is a fraction of a contract, and a fraction of a contract is
+    # not a cost: the same 0.65 is +20.7% of the intended risk at 1
+    # contract and +5.2% at 6. Measured over 18 live decisions on
+    # 2026-11-16, no band width exists that takes the 3-contract signals
+    # and refuses the 1-contract ones -- it would have to be at least
+    # 0.419 and under 0.290 at the same time. The band was not too wide
+    # or too narrow. It was measuring the wrong thing.
+    #
+    # So: round to NEAREST, and step down to the smaller contract only
+    # when that rounding is wrong by more than the tolerance. One number
+    # with one meaning, and it reads as what it is -- "I will accept
+    # being 15% off to trade the full-size contract".
+    #
+    # Any tolerance in [12.2%, 19.5%) reproduces the behaviour Chris
+    # asked for on that day's signals; 0.15 sits in the middle.
+    #
+    # NEVER ROUNDS UP TO ONE from below, same as the band. Below a whole
+    # contract the smaller instrument always fits better -- and the
+    # arithmetic agrees, since 0.65 -> 1 is +53%, past any sane
+    # tolerance. Stated anyway rather than left to the numbers.
+    #
+    # Applied only where a smaller alternative exists: the caller passes
+    # None for the last candidate, or a signal the tolerance rejects on
+    # the micro would step down to nothing and fill nothing at all.
+    if max_risk_error is not None:
+        tol = float(max_risk_error)
+        down = math.floor(units)
+        nearest = down if (units - down) < 0.5 else down + 1
+        error = abs(nearest - units) / units if units else 1.0
+        # `down`, not `nearest`: at 0.9 the nearest whole contract IS 1
+        # and the rounding is only 11% off, so testing the rounded figure
+        # would let a generous tolerance talk a sub-contract signal into
+        # a full one. Below a whole contract the smaller instrument
+        # always fits better, whatever the arithmetic says.
+        if down < 1 or error > tol:
+            return SizingResult(
+                size=0, skipped=True,
+                reason=(
+                    f"wants {units:g} of them; the nearest whole contract is "
+                    f"{nearest:g}, which is {error * 100:.0f}% off the intended "
+                    f"risk and over the {tol * 100:g}% allowed -- so a smaller "
+                    f"contract is the better fit"
+                ),
+            )
+        final = _snap(nearest, min_size)
+        return _within_ceiling(
+            final, sizing_config=sizing_config, entry_price=entry_price,
+            stop_price=stop_price, account_balance=account_balance,
+            account_equity=account_equity, contract_spec=contract_spec,
+        )
+
+    if round_band is not None:
+        band = float(round_band)
+        down = math.floor(units)
+        frac = units - down
+        whole = None
+        if down >= 1 and frac <= band:
+            whole = down
+        elif down >= 1 and frac >= 1.0 - band:
+            whole = down + 1
+        if whole is None:
+            cost = (1 - down / units) * 100 if down >= 1 else 100.0
+            return SizingResult(
+                size=0, skipped=True,
+                reason=(
+                    f"wants {units:g} of them, not within {band:g} of a whole "
+                    f"contract -- rounding down would cost {cost:.0f}% of the "
+                    f"intended risk, so a smaller contract is the better fit"
+                ),
+            )
+        final = _snap(whole, min_size)
+        return _within_ceiling(
+            final, sizing_config=sizing_config, entry_price=entry_price,
+            stop_price=stop_price, account_balance=account_balance,
+            account_equity=account_equity, contract_spec=contract_spec,
+        )
+
     rounding = sizing_config.get("rounding", "nearest_min1")
     if rounding == "floor":
         whole = math.floor(units)
@@ -370,8 +648,64 @@ def compute_size(
     else:
         raise ValueError(f"unknown sizing rounding {rounding!r} (expected 'nearest_min1' or 'floor')")
 
-    final = whole * min_size
+    final = _snap(whole, min_size)
+    return _within_ceiling(
+        final, sizing_config=sizing_config, entry_price=entry_price,
+        stop_price=stop_price, account_balance=account_balance,
+        account_equity=account_equity, contract_spec=contract_spec,
+    )
 
+
+def _snap(units: float, step: float) -> float:
+    """`units` steps of `step`, without the noise the multiply adds.
+
+    82 * 0.01 is 0.8200000000000001 in IEEE754, and MT accounts trade in
+    hundredths of a lot, so most sizes this engine produces for them come
+    out carrying a tail. Measured live on 2026-11-16: an H1 XAUUSD signal
+    sized to 0.8200000000000001 lots.
+
+    That number is not cosmetic. It goes to the broker as a lot size, it
+    is compared against the risk ceiling, and it is read by a person in a
+    log line. It also made the engine report a split entry on an adapter
+    that cannot split, because the check for one was `placed !=
+    sizing_result.size` and a tail is a difference.
+
+    Rounded to the step's OWN precision: a step of 0.01 gives two
+    decimals, a step of 1 gives none. Decimal(str(step)) rather than
+    arithmetic on the float, because the question being asked is how the
+    step was WRITTEN, and 0.01 written as a float has seventeen digits.
+    """
+    try:
+        exponent = Decimal(str(step)).as_tuple().exponent
+        # A non-finite Decimal reports its exponent as a STRING -- 'F'
+        # for infinity, 'n' for NaN -- so this is not a tidiness guard.
+        # It is the difference between passing a nonsense step through
+        # and raising TypeError out of the sizing path.
+        decimals = max(0, -exponent) if isinstance(exponent, int) else None
+    except (InvalidOperation, ValueError):  # pragma: no cover - a bad step
+        decimals = None
+    if decimals is None:
+        return units * step
+    return round(units * step, decimals)
+
+
+def _within_ceiling(
+    final: float,
+    *,
+    sizing_config: Dict[str, Any],
+    entry_price: float,
+    stop_price: Optional[float],
+    account_balance: float,
+    account_equity: float,
+    contract_spec: Optional[ContractSpec],
+) -> SizingResult:
+    """The max_risk_pct gate, shared by every rounding path.
+
+    Extracted when round_band gained its own path to `final`. Leaving the
+    gate inline would have meant one rounding rule reaching the ceiling
+    check and another bypassing it -- the kind of split where the second
+    path quietly stops being guarded.
+    """
     # Ceiling check. The min-one-contract floor above can hand back more size
     # than the model asked for, and when volatility widens stops a single
     # contract alone can carry more risk than the account should take. This is

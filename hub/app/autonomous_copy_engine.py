@@ -12,7 +12,7 @@ from app.adapters.base import (
     AdapterError, BrokerAdapter, EntryNeverFilled, OrderRequest,
 )
 from app.atr import compute_atr
-from app.contract_specs import get_contract_spec
+from app.contract_specs import ContractSpec, get_contract_spec
 from app.events import EventBus
 from app.models import Signal
 from app.notifier import Notifier
@@ -21,9 +21,11 @@ from app.session_gate import SessionGateMixin
 from app.sizing import (
     resolve_balance_adjustment,
     apply_master_risk, capital_base_amount, compute_size, merge_sizing,
+    resolve_margin_cap,
     resolve_risk_scale,
     risk_figures,
     resolve_sizing_config,
+    resolve_bar_size,
 )
 from app.contract_roll import roll_sequence, volume_crossover
 from app import deferred_store, position_store
@@ -67,6 +69,29 @@ class Refusal:
 
     reason: str
     overflowable: bool = False
+
+
+class Unavailable(str):
+    """A rejection reason meaning "could not", not "declined".
+
+    The difference decides whether a signal is retried or dropped, and
+    getting it the wrong way round is bad in both directions: dropping a
+    "could not" throws away a trade the master is still in, while
+    retrying a "declined" argues with a policy every thirty seconds until
+    the ceiling.
+
+    A str subclass ON PURPOSE. These reasons are joined into log lines
+    and events all over this module; subclassing means none of that has
+    to know this type exists, and a reason that loses its marker degrades
+    to today's behaviour rather than crashing.
+
+    Marked where the reason is PRODUCED rather than matched by text
+    later. The text here is ours, but it embeds the broker's wording, and
+    pinning behaviour to IBKR's phrasing for a closed market is exactly
+    the sort of thing that works until the day it does not.
+    """
+
+    __slots__ = ()
 
 
 class AutonomousCopyEngine(SessionGateMixin):
@@ -141,6 +166,10 @@ class AutonomousCopyEngine(SessionGateMixin):
         self.defer_poll_seconds = defer.get("poll_seconds", 5)
         # keyed (master_account, master_ticket, target, month_slot)
         self._deferred: Dict[tuple, dict] = {}
+        # symbol -> ContractSpec, or False for "asked, cannot answer".
+        # An instrument's contract size does not change under a running
+        # hub, and the SYMBOLS round trip is on the signal path.
+        self._broker_specs: Dict[str, Any] = {}
         # background fill collectors; held so they aren't garbage collected
         # mid-flight and so stop() can cancel them
         self._fill_tasks: set = set()
@@ -185,6 +214,11 @@ class AutonomousCopyEngine(SessionGateMixin):
         # or two masters' positions collide in here as well as in the tables.
         self._positions: Dict[Tuple[str, int, str], dict] = {}
         self._consume_task: Optional[asyncio.Task] = None
+        # When this engine last took a signal off its queue. A stalled
+        # loop is otherwise invisible from outside -- the only symptom
+        # is an absence, and an absence looks exactly like a quiet
+        # master. Surfaced on /status.
+        self.last_consumed_at: float = 0.0
         self._monitor_task: Optional[asyncio.Task] = None
         self._deferred_task: Optional[asyncio.Task] = None
         # Declared here and not only in start(), because stop() reads it.
@@ -217,6 +251,15 @@ class AutonomousCopyEngine(SessionGateMixin):
                 )
             self._positions[key] = pos
             restored += 1
+
+        # Which of those have an entry still resting at the broker. Kept in
+        # memory only: it describes this run, not the position, and
+        # persisting it would outlive the fact.
+        #
+        # Asked once, here, rather than per monitor pass -- a position read
+        # every fifteen seconds for every leg is a cost paid for a state
+        # that changes once.
+        await self._mark_pending_entries()
         if restored:
             logger.info("slave=%s restored %d open position(s) across the restart",
                         self.slave_id, restored)
@@ -455,8 +498,36 @@ class AutonomousCopyEngine(SessionGateMixin):
         return round((at - (signal.received_at or signal.ts)) * 1000)
 
     async def _run(self) -> None:
+        """Drain this slave's signal queue for the life of the engine.
+
+        THIS LOOP MUST NOT END. It caught only AdapterError, so anything
+        else escaped, finished the task, and was never written down:
+        asyncio reports an un-retrieved task exception when the task is
+        garbage collected, and self._consume_task holds a reference for
+        the life of the engine, so it never is. The result is a live
+        engine with a dead loop -- connected, reporting healthy, and
+        dropping every signal from then on.
+
+        That happened four times on 2026-11-16. Eight signals reached
+        mt5-icm-1 and never reached ibkr-paper-1, and nothing anywhere
+        said so. A dropped signal is indistinguishable from one that was
+        never sent, which is the worst failure mode this system has.
+
+        The background fill-capture task already catches Exception and
+        logs it. The consume loop is the place where swallowing is less
+        dangerous than crashing, and it was the one place that did not.
+
+        CancelledError is deliberately NOT caught: it inherits from
+        BaseException, so shutdown still stops this loop. An engine that
+        could not be stopped would be a worse bug than the one this
+        fixes.
+        """
         while True:
             signal = await self.queue.get()
+            # Recorded BEFORE handling, and on every signal including the
+            # paused and refused ones: the question this answers is "is
+            # this loop alive", not "did it trade".
+            self.last_consumed_at = time.time()
             if self.paused:
                 logger.debug("slave=%s paused, dropping %s ticket=%s", self.slave_id, signal.action, signal.ticket)
                 continue
@@ -472,6 +543,26 @@ class AutonomousCopyEngine(SessionGateMixin):
                 await self._emit(
                     "slave_error", signal=signal, action=signal.action, message=str(exc)
                 )
+            except Exception as exc:  # noqa: BLE001 - see the docstring
+                # Loud, with a stack, and the loop carries on. One signal
+                # the handler could not cope with must not take the slave
+                # out for the rest of the session.
+                logger.exception(
+                    "slave=%s UNEXPECTED failure handling %s ticket=%s: %s -- "
+                    "the signal is dropped and this slave keeps consuming",
+                    self.slave_id, signal.action, signal.ticket, exc,
+                )
+                try:
+                    await self._emit(
+                        "slave_error", signal=signal, action=signal.action,
+                        message=f"unexpected {type(exc).__name__}: {exc}",
+                    )
+                except Exception:  # noqa: BLE001
+                    # Even the report failing must not end the loop.
+                    logger.exception(
+                        "slave=%s could not report the failure above",
+                        self.slave_id,
+                    )
 
     async def _handle(self, signal: Signal) -> None:
         if signal.action == "MODIFY":
@@ -659,9 +750,87 @@ class AutonomousCopyEngine(SessionGateMixin):
                 self.slave_id, self.preflight_wait_seconds,
             )
 
+    async def _broker_contract_spec(self, symbol: str):
+        """A ContractSpec built from what the BROKER says this symbol is.
+
+        For every symbol the static registry does not carry -- which is
+        every MT symbol there is. Without one, compute_size treats a lot
+        as a single unit of quote currency and oversizes by the contract
+        size: 100x on XAUUSD, and five figures on a forex pair.
+
+        Only tick_size and tick_value are used for risk. contract_size is
+        deliberately NOT multiplied in: MT's tick value is already per
+        one lot, so doing both would reintroduce the same error in the
+        other direction.
+
+        volume_min becomes min_size, so rounding happens in the broker's
+        own volume steps -- 0.01 lots, not 1.
+
+        Cached per symbol. The spec is a property of the instrument and
+        the SYMBOLS round trip is on the signal path, where an extra
+        request per candidate is paid on every signal.
+
+        Returns None when the adapter cannot answer, and the caller then
+        behaves exactly as it did before this existed. That is the safe
+        direction only because the alternative -- guessing a contract
+        size -- is how a plausible wrong number survives unnoticed.
+        """
+        cached = self._broker_specs.get(symbol)
+        if cached is not None:
+            return cached or None     # False means "asked, cannot answer"
+
+        ask = getattr(self.adapter, "get_symbol_spec", None)
+        if ask is None:
+            self._broker_specs[symbol] = False
+            return None
+        try:
+            broker = await ask(symbol)
+        except (AdapterError, NotImplementedError) as exc:
+            logger.warning(
+                "slave=%s %s: the broker could not describe this symbol (%s); "
+                "sizing falls back to one unit of quote currency per lot, "
+                "which is wrong for any contract larger than that",
+                self.slave_id, symbol, exc,
+            )
+            self._broker_specs[symbol] = False
+            return None
+
+        tick_size = float(getattr(broker, "tick_size", 0.0) or 0.0)
+        tick_value = float(getattr(broker, "tick_value", 0.0) or 0.0)
+        if tick_size <= 0 or tick_value <= 0:
+            # Refused rather than defaulted. A zero here would divide by
+            # zero or size infinitely; a made-up 1.0 is the bug this
+            # method exists to fix, wearing a different hat.
+            logger.warning(
+                "slave=%s %s: broker reports tick_size=%s tick_value=%s, "
+                "neither usable for sizing",
+                self.slave_id, symbol, tick_size, tick_value,
+            )
+            self._broker_specs[symbol] = False
+            return None
+
+        min_size = float(getattr(broker, "volume_min", 0.0) or 0.0) or 0.01
+        spec = ContractSpec(
+            symbol=symbol,
+            tick_size=tick_size,
+            tick_value=tick_value,
+            point_value=tick_value / tick_size,
+            min_size=min_size,
+        )
+        logger.info(
+            "slave=%s %s sized from the broker's own spec: tick %s = %s, "
+            "min volume %s (contract_size %s)",
+            self.slave_id, symbol, tick_size, tick_value, min_size,
+            getattr(broker, "contract_size", "?"),
+        )
+        self._broker_specs[symbol] = spec
+        return spec
+
     async def _size_candidate(
         self, signal: Signal, route: Route, target_symbol: str,
         sl_mult: Optional[float], tp_mult: Optional[float],
+        has_smaller_alternative: bool = False,
+        accounts: Optional[Dict[str, Any]] = None,
     ):
         """Price, measure and size one candidate contract.
 
@@ -671,12 +840,18 @@ class AutonomousCopyEngine(SessionGateMixin):
         a smaller contract's lower risk per unit is the entire point of
         offering it as an alternative.
         """
+        if accounts is None:
+            accounts = {}
         blocked = self.blocked_targets.get(target_symbol)
         if blocked:
             return None, blocked
 
         atr_period = route.atr_period or self.atr_period
-        bar_size = route.bar_size
+        # Route first, then this slave's per-magic table, then its
+        # default. A weekly strategy's stop was measured in weekly ATRs;
+        # translating that against a daily ATR would make the stop a fifth
+        # of its width and the position several times too large.
+        bar_size = resolve_bar_size(self.slave_config, route.bar_size, signal.magic)
 
         try:
             bars = await self.adapter.get_price_history(
@@ -684,9 +859,11 @@ class AutonomousCopyEngine(SessionGateMixin):
                 bar_size=bar_size)
             slave_atr = compute_atr(bars, atr_period)
         except ValueError as exc:
-            return None, f"no usable ATR ({exc})"
+            # Transient: not enough bars YET is a different thing
+            # from a symbol whose bars will never arrive.
+            return None, Unavailable(f"no usable ATR ({exc})")
         except AdapterError as exc:
-            return None, f"no price history ({exc})"
+            return None, Unavailable(f"no price history ({exc})")
 
         try:
             quote = await self.adapter.get_quote(
@@ -701,7 +878,7 @@ class AutonomousCopyEngine(SessionGateMixin):
                 "so this target cannot be sized",
                 self.slave_id, target_symbol, exc,
             )
-            return None, f"no quote ({exc})"
+            return None, Unavailable(f"no quote ({exc})")
 
         traded_direction = route.target_direction or signal.direction
         sign = 1 if traded_direction == "BUY" else -1
@@ -709,11 +886,56 @@ class AutonomousCopyEngine(SessionGateMixin):
         slave_tp = quote + sign * tp_mult * slave_atr if tp_mult is not None else None
 
         spec = get_contract_spec(target_symbol)
+        # ACCOUNT TYPE IS DECIDED BY THE STATIC REGISTRY ALONE, before any
+        # broker spec is fetched below. The registry is what says "this is
+        # a listed future"; an MT symbol having a contract size does not
+        # make the slave's futures account the right one to size against.
         account_type = "futures" if spec else "brokerage"
-        real_account = await self.adapter.get_account_summary(account_type)
+        if spec is None:
+            # THE 100x. Without a spec, compute_size falls back to
+            # `risk_per_unit = stop_distance` -- one unit risks one unit of
+            # quote currency, which is true for a share and wrong for every
+            # MT symbol there is. XAUUSD is 100oz a lot, so a stop 125 wide
+            # risks $12,554 per lot and was being read as $125. The D run
+            # on 2026-11-15 opened 13.00 lots against the master's 0.13:
+            # exactly 100x, exactly the contract size.
+            #
+            # The figures were already in the hub -- the bridge reports
+            # contract_size, tick_size and tick_value per symbol, and
+            # MT4Adapter.get_symbol_spec has returned them for a while.
+            # Nothing asked. Taken from the BROKER rather than a table
+            # because a CFD's contract size is the broker's choice: the
+            # same XAUUSD is 100oz at one and 10oz at another, and a table
+            # would be a second place to be wrong.
+            spec = await self._broker_contract_spec(target_symbol)
+        # ONE SNAPSHOT PER SIGNAL, shared by every candidate on the route.
+        #
+        # This fetched per candidate, and the two IBKR slaves share account
+        # DUR314653. On 2026-11-16 the ETF slave's fill landed BETWEEN the
+        # GC and MGC lookups and the fallback sized against a balance the
+        # first candidate never saw:
+        #
+        #   D   ETF filled 3,282 UGL a second before  -> MGC 16.5% short
+        #   H4  ETF filled 7,646 UGL two seconds before -> MGC 35.1% short
+        #   H1  ETF refused, nothing filled            -> MGC 1.0%, exact
+        #
+        # The shortfall tracked the size of the fill each time. A chain is
+        # one decision about one signal, so it has to be priced against one
+        # view of the account; candidates differ by instrument, not by when
+        # they happened to ask.
+        #
+        # Keyed by account_type because a chain may mix a futures contract
+        # with a brokerage one, and those are genuinely different accounts.
+        if account_type in accounts:
+            real_account = accounts[account_type]
+        else:
+            real_account = await self.adapter.get_account_summary(account_type)
+            accounts[account_type] = real_account
         account, reason = self._risk_account(real_account)
         if account is None:
-            return None, reason
+            # The broker could not be asked what the account holds. That
+            # is a connection problem, not a decision about this trade.
+            return None, Unavailable(reason)
 
         sizing_config = merge_sizing(
             resolve_sizing_config(self.slave_config, target_symbol), route.sizing)
@@ -732,9 +954,31 @@ class AutonomousCopyEngine(SessionGateMixin):
             account_equity=account.equity,
             contract_spec=spec,
             risk_scale=risk_scale,
+            # Only where a smaller contract is next in the list. On the
+            # LAST candidate this is None, or a size landing mid-band
+            # would step down to nothing and fill nothing at all.
+            round_band=(sizing_config.get("round_band")
+                        if has_smaller_alternative else None),
+            # Wins over round_band where both are set, and the resolver
+            # below says so rather than letting a stale band sit in a
+            # config looking like it decides something.
+            max_risk_error=(sizing_config.get("max_risk_error")
+                            if has_smaller_alternative else None),
         )
         if sizing_result.skipped:
-            return None, sizing_result.reason
+            # THE MEASUREMENT, not just the verdict. Each candidate reads
+            # its OWN contract's bars -- GCZ6 and MGCZ6 are different
+            # instruments -- so a micro's ATR is not exactly a tenth of
+            # its parent's, and the step-down target is not exactly ten
+            # times. On 2026-11-16 "GC: wants 0.729226 of them" was
+            # followed by MGC taking 6 where 7.29 would floor to 7, and
+            # nothing in the log could say why. Now it can.
+            return None, (
+                f"{sizing_result.reason} "
+                f"[atr {slave_atr:.4f} on {bar_size or 'default'}, "
+                f"stop {abs(quote - slave_sl):.4f}]"
+                if slave_sl is not None else sizing_result.reason
+            )
 
         return {
             "symbol": target_symbol, "spec": spec, "atr": slave_atr,
@@ -759,8 +1003,8 @@ class AutonomousCopyEngine(SessionGateMixin):
         would cost alone, and a cached total would be stale exactly while
         positions were moving.
         """
-        policy = route.netting or self.netting_policy
-        cap_pct = policy.get("max_margin_pct")
+        # Either key, wherever it is carried -- see resolve_margin_cap.
+        cap_pct = resolve_margin_cap(self.slave_config, route.netting)
         if cap_pct is None:
             return None
 
@@ -895,16 +1139,31 @@ class AutonomousCopyEngine(SessionGateMixin):
             )
             ceiling = capital * float(cap_pct)
             if total > ceiling:
-                # Not overflowable. The cap exists because several systems on
-                # one symbol are a single correlated bet, and a sibling
-                # product on the same underlying is the same bet -- escaping
-                # the cap by changing ticker would defeat it while looking
-                # like compliance.
-                return Refusal(overflowable=False, reason=(
+                # OVERFLOWABLE, and the reasoning here was wrong until
+                # 2026-11-15. It read the candidate list as an escape hatch:
+                # a sibling product on the same underlying is the same bet,
+                # so letting a full book fall through to another ticker
+                # would defeat the cap while looking like compliance.
+                #
+                # That misreads what the list is for. A route names several
+                # instruments because of ACCESS and CAPACITY, not conviction
+                # -- 2-3 futures contracts plus an ETF leg is how a weekly
+                # and a daily system stack safely once one book is full, and
+                # US margin is running out around the same point anyway. The
+                # cap is a bottleneck on one instrument, not a budget for
+                # the underlying.
+                #
+                # It is not an escape hatch, because the next candidate gets
+                # its OWN aggregate check against its OWN positions: it can
+                # only be taken if that book genuinely has room. What this
+                # refuses is stacking past the ceiling on THIS instrument,
+                # which is exactly what it still does.
+                return Refusal(overflowable=True, reason=(
                     f"{len(existing)} leg(s) already risk {sum(held_risks):.2f} on "
                     f"{symbol}; adding {new_risk:.2f} would make {total:.2f}, over "
                     f"the {float(cap_pct):.2%} aggregate ceiling of {ceiling:.2f}. "
-                    f"These net into ONE position, so the limit is across them."
+                    f"These net into ONE position on {symbol}, so the limit is across "
+                    f"them -- trying the next instrument on this route."
                 ))
         return None
 
@@ -919,12 +1178,18 @@ class AutonomousCopyEngine(SessionGateMixin):
         await self._await_preflight()
 
         candidates = route.candidates or [route.target]
+        # One account snapshot for the whole chain -- see _size_candidate.
+        accounts: Dict[str, Any] = {}
         rejected = []
         refused = []
         chosen = None
         for candidate in candidates:
             sized, reason = await self._size_candidate(
-                signal, route, candidate, sl_mult, tp_mult)
+                signal, route, candidate, sl_mult, tp_mult,
+                # Candidates run largest first by convention, so anything
+                # before the last has a smaller one to fall through to.
+                has_smaller_alternative=(candidate is not candidates[-1]),
+                accounts=accounts)
             if sized is None:
                 rejected.append((candidate, reason))
                 continue
@@ -952,6 +1217,26 @@ class AutonomousCopyEngine(SessionGateMixin):
             break
 
         if chosen is None:
+            # COULD NOT, versus DECLINED. Every candidate failed; if none
+            # of them failed on policy and at least one simply could not
+            # be priced, this is a signal to hold rather than discard.
+            # Raised, not handled here, so it lands in the deferral the
+            # route loop already owns -- with its retry schedule, its disk
+            # persistence across restarts, and its rule that a master
+            # CLOSE drops whatever is still held.
+            #
+            # `not refused` is deliberately strict: if ANY candidate was
+            # turned away by a rule, this keeps the old behaviour rather
+            # than retrying a decision on the chance that a sibling
+            # instrument starts quoting.
+            unavailable = [r for _, r in rejected if isinstance(r, Unavailable)]
+            if unavailable and not refused:
+                raise AdapterError(
+                    "nothing tradeable among %s yet -- %s"
+                    % (", ".join(candidates),
+                       "; ".join("%s: %s" % r for r in rejected))
+                )
+
             logger.warning(
                 "slave=%s skipping OPEN ticket=%s: nothing tradeable among "
                 "%s -- %s",
@@ -987,8 +1272,10 @@ class AutonomousCopyEngine(SessionGateMixin):
         if rejected:
             # "Why did it take MNG today" has to be answerable afterwards.
             logger.info(
-                "slave=%s chose %s over %s -- %s",
-                self.slave_id, chosen["symbol"],
+                "slave=%s chose %s (atr %.4f, stop %.4f, size %g) over %s -- %s",
+                self.slave_id, chosen["symbol"], chosen["atr"],
+                abs(chosen["quote"] - chosen["sl"]) if chosen.get("sl") is not None else 0.0,
+                chosen["sizing_result"].size,
                 ", ".join(c for c, _ in rejected),
                 "; ".join("%s: %s" % r for r in rejected),
             )
@@ -1047,8 +1334,48 @@ class AutonomousCopyEngine(SessionGateMixin):
             limit_price=limit_price,
             outside_rth=route.outside_rth,
             limit_offset_pct=route.limit_offset_pct,
+            # Only the ENTRY carries these. A contract roll below builds its
+            # own OrderRequest and deliberately does not: a roll is a market
+            # order on a futures contract, where the session the ETF legs
+            # need to outlive does not apply.
+            tif=route.tif,
+            entry_timeout=route.entry_timeout,
+            good_till=route.good_till,
             broker_brackets=route.broker_brackets,
+            # Place this entry in slices over a window instead of in one
+            # print. One position comes out of it either way.
+            #
+            # RESOLVED HERE, not left to the adapter's own default. The
+            # adapter reads entry_split_slices once, in its constructor,
+            # at hub startup -- while PATCH /slaves/{id} live-updates
+            # self.slave_config. So a slave-level split set through the
+            # UI saved cleanly, showed on the card as "entries split into
+            # 3 over 5s", and did nothing at all until the next restart.
+            #
+            # Measured on 2026-11-17: five routes with their own override
+            # split, and ETHUSD -- which had none and was relying on the
+            # slave's -- placed 831 MET in a single order.
+            #
+            # A route still wins over the slave, and 0 on a route is
+            # still an opt-out rather than "no opinion", so `is not None`
+            # does the choosing rather than truthiness.
+            split_slices=(
+                route.split_slices if route.split_slices is not None
+                else self.slave_config.get("entry_split_slices")),
+            split_interval=(
+                route.split_interval if route.split_interval is not None
+                else self.slave_config.get("entry_split_interval")),
         )
+        if (route.split_slices or route.split_interval) and not getattr(
+                self.adapter, "supports_order_split", False):
+            # Said once, here, rather than left as a config key that looks
+            # live and does nothing. The fields travel on every
+            # OrderRequest and only the IBKR adapter acts on them.
+            logger.warning(
+                "slave=%s route %s asks to split its entry, but the %s adapter "
+                "places one order per entry -- the whole size goes out at once",
+                self.slave_id, target_symbol, type(self.adapter).__name__,
+            )
         requested_at = time.time()
         result = await self.adapter.open(order)
         filled_at = time.time()
@@ -1116,10 +1443,28 @@ class AutonomousCopyEngine(SessionGateMixin):
         position_store.save(
             self.slave_id, signal.account, signal.ticket, target_symbol, self._positions[key]
         )
-        logger.info(
-            "slave=%s opened %s master_ticket=%s -> slave_ticket=%s size=%s sl=%s tp=%s",
-            self.slave_id, target_symbol, signal.ticket, result.slave_ticket, sizing_result.size, slave_sl, slave_tp,
-        )
+        placed = result.lots if result.lots is not None else sizing_result.size
+        # ON THE SLICE COUNT, not on whether two floats differ. This asked
+        # `placed != sizing_result.size`, and on 2026-11-16 an MT5 leg
+        # sized 0.8200000000000001 was opened at 0.82 -- a difference of
+        # one ULP -- so the engine announced "the rest in slices" on an
+        # adapter that places one order per entry and has no slices to
+        # send. The adapter is what knows, and it says so.
+        if (result.slices or 1) > 1:
+            # A split entry: this much is at the broker and the rest is on
+            # a schedule. Said here because this is the line a reader
+            # checks the size against, and it used to report the intention.
+            logger.info(
+                "slave=%s opened %s master_ticket=%s -> slave_ticket=%s size=%s "
+                "of an intended %s, the rest in slices, sl=%s tp=%s",
+                self.slave_id, target_symbol, signal.ticket, result.slave_ticket,
+                placed, sizing_result.size, slave_sl, slave_tp,
+            )
+        else:
+            logger.info(
+                "slave=%s opened %s master_ticket=%s -> slave_ticket=%s size=%s sl=%s tp=%s",
+                self.slave_id, target_symbol, signal.ticket, result.slave_ticket, placed, slave_sl, slave_tp,
+            )
         if route.month_slot:
             logger.info("slave=%s   (magic=%s -> month_slot=%s)", self.slave_id, signal.magic, route.month_slot)
         await self._emit(
@@ -1128,7 +1473,18 @@ class AutonomousCopyEngine(SessionGateMixin):
             slave_symbol=target_symbol,
             slave_ticket=result.slave_ticket,
             # What actually went on, where the broker says so.
-            size=result.lots if result.lots is not None else sizing_result.size,
+            # THE POSITION's size, which `legs` below says how many
+            # broker orders it is being assembled from. Deliberately not
+            # result.lots: that is the FIRST SLICE of a split entry, and
+            # size paired with legs has to describe one thing -- "15
+            # contracts in 3 orders", not "5 contracts in 3 orders".
+            #
+            # What actually ended up on is the leg ROW, which record_fill
+            # corrects to the aggregate across slices and stamps with
+            # entry_slices. Three readers, three questions: the log says
+            # what went out now, this event says what was placed, the row
+            # says how it finished.
+            size=sizing_result.size,
             # The sizing engine's own sentence. It names the mode, the stop
             # distance, the capital it measured and the size that came out,
             # which is the whole of "why is this leg this big".
@@ -1142,9 +1498,16 @@ class AutonomousCopyEngine(SessionGateMixin):
             fill_price=result.price,
             sl=slave_sl,
             tp=slave_tp,
-            # One broker order per leg. A size that had to be split across
-            # several would be reported as the number it became.
-            legs=1,
+            # One broker order per leg -- or N, for an entry the splitter
+            # is spreading over a window. This field was written for that
+            # case before the splitter existed ("a size that had to be
+            # split across several would be reported as the number it
+            # became"), so it is filled in rather than added to.
+            #
+            # The PLANNED count. A CLOSE arriving mid-window calls off the
+            # slices still to come, and what actually went out is on the
+            # leg row as entry_slices.
+            legs=result.slices or 1,
             # The BROKER's own ids, not the client-side handle. IBKR's
             # slave_ticket is TWS's order number and appears in no
             # statement: joining on it matched 0 of 109 rows on
@@ -1417,8 +1780,24 @@ class AutonomousCopyEngine(SessionGateMixin):
         key = (account, master_ticket, slave_symbol)
         self._positions.pop(key, None)
         position_store.delete(self.slave_id, account, master_ticket, slave_symbol)
-        trade_registry.record_entry_cancelled(
-            self.slave_id, account, master_ticket, slave_symbol)
+        if not trade_registry.record_entry_cancelled(
+                self.slave_id, account, master_ticket, slave_symbol):
+            # Already reported. _handle_close reaches this for an entry
+            # the master closed before it filled, and the background
+            # fill-capture task reaches it again when its own wait runs
+            # out -- on UGL 1193 those were 30 seconds apart, and the
+            # second one raised the alert and sent the notification a
+            # second time for one event.
+            #
+            # The cleanup above still runs: it is idempotent, and the
+            # first path through may have been the one that did not get
+            # as far as the position_store row.
+            logger.debug(
+                "slave=%s unfilled entry for master_ticket=%s was already "
+                "reported; not raising it twice",
+                self.slave_id, master_ticket,
+            )
+            return
 
         msg = (
             f"Slave {self.slave_id} never filled {slave_symbol} for "
@@ -1461,6 +1840,20 @@ class AutonomousCopyEngine(SessionGateMixin):
                     self.slave_id, which, slave_ticket,
                 )
                 return
+            # HOW the entry arrived, which only the adapter knows and
+            # only this moment can record: one order or several over a
+            # window. A split entry is one position with one size by
+            # design, which is also what made it invisible -- nothing on
+            # any screen said whether 33 MGC came in one print or three.
+            slices = None
+            slice_detail = None
+            if which == "entry":
+                counter = getattr(self.adapter, "entry_slices_placed", None)
+                if counter is not None:
+                    slices = counter(slave_ticket)
+                detail = getattr(self.adapter, "entry_slice_detail", None)
+                if detail is not None:
+                    slice_detail = detail(slave_ticket)
             if price is None:
                 if which == "entry":
                     # Not just "no price captured": there is no position, and
@@ -1468,12 +1861,34 @@ class AutonomousCopyEngine(SessionGateMixin):
                     # broker.
                     await self._abandon_unfilled_entry(
                         account, master_ticket, slave_symbol, slave_ticket)
+                else:
+                    # NOR IS THIS. The row was marked CLOSED when the
+                    # closing order was accepted, so a close that never
+                    # fills leaves this hub saying flat over a position the
+                    # broker still holds -- unmanaged, because nothing
+                    # trails or re-closes a row that reads CLOSED.
+                    await self._exit_never_filled(
+                        account, master_ticket, slave_symbol, slave_ticket)
                 return
             if which == "entry":
+                # It filled, so it is a position now. Cleared here rather
+                # than left to the next restart, so trailing resumes within
+                # this run.
+                for pos in self._positions.values():
+                    if pos.get("slave_ticket") == slave_ticket:
+                        pos.pop("entry_pending", None)
                 trade_registry.record_fill(
                     self.slave_id, account, master_ticket, slave_symbol,
                     slave_price=price, slave_lots=size, filled_at=time.time(),
+                    entry_slices=slices,
                 )
+                # Only when there was more than one. A single slice is an
+                # ordinary entry and its "slice" is the position itself,
+                # already recorded above.
+                if slices and slices > 1:
+                    trade_registry.record_entry_slices(
+                        self.slave_id, account, master_ticket, slave_symbol,
+                        slave_ticket, slice_detail)
             else:
                 trade_registry.record_close(
                     self.slave_id, account, master_ticket, slave_symbol,
@@ -1488,6 +1903,49 @@ class AutonomousCopyEngine(SessionGateMixin):
             run(), name=f"fill-{which}-{self.slave_id}-{slave_ticket}")
         self._fill_tasks.add(task)
         task.add_done_callback(self._fill_tasks.discard)
+
+    async def _exit_never_filled(self, account: str, master_ticket: int,
+                                 slave_symbol: str, slave_ticket: int) -> None:
+        """A close that was accepted and never filled.
+
+        The registry row already says CLOSED -- _finish_close marks it when
+        the adapter accepts the order, before any fill -- so this is the
+        one moment that can say the hub and the broker disagree. It used to
+        `return` here, on the reasoning that an uncaptured fill "simply
+        leaves the column NULL". For an ENTRY that is true. For an exit it
+        is a live position nobody is managing.
+
+        Measured 2026-11-18, ETHT on ibkr-etf-1: the close was sent at
+        19:51 ET as a DAY market order with outsideRth unset, and IBKR
+        answered warning 399 -- "your order will not be placed at the
+        exchange until 2026-11-19 09:30:00 US/Eastern". Status
+        PreSubmitted, filled 0 of 789. The engine logged "closed deferred
+        ETHT after 93109s and 1055 attempt(s)", marked the row CLOSED with
+        a null close price, and said nothing further. 789 shares, no stop,
+        nothing watching.
+
+        DELIBERATELY PLACES NOTHING. The closing order is usually still
+        live -- that is the whole reason it has not filled -- and a second
+        one would sell a position twice at tomorrow's open. The fix for
+        the silence is not another order; it is saying so.
+        """
+        logger.error(
+            "slave=%s EXIT NEVER FILLED for %s slave_ticket=%s "
+            "(master_ticket=%s): the closing order was accepted but filled "
+            "nothing, and the registry row already says CLOSED. THE POSITION "
+            "IS STILL OPEN AT THE BROKER and nothing in this hub is managing "
+            "it -- check the order by hand. Outside regular hours an exit "
+            "rests until the next open rather than failing, which is what "
+            "this usually is",
+            self.slave_id, slave_symbol, slave_ticket, master_ticket,
+        )
+        await self._emit(
+            "exit_never_filled",
+            slave_symbol=slave_symbol,
+            slave_ticket=slave_ticket,
+            master_account=account,
+            master_ticket=master_ticket,
+        )
 
     async def _defer_close(self, signal, mapping, exc) -> None:
         """Hold an exit the broker refused, to execute at the next open.
@@ -1913,8 +2371,66 @@ class AutonomousCopyEngine(SessionGateMixin):
                 to_contract=nxt.local_symbol,
             )
 
+    async def _mark_pending_entries(self) -> None:
+        """Flag restored positions whose entry is still working.
+
+        reconcile_slave now leaves such a row OPEN with its state intact,
+        which is what keeps a later CLOSE able to find the leg. The cost
+        is that restore() loads a position the broker does not hold yet,
+        and the trailing monitor must not act on one.
+
+        Conservative on every failure: an entry that cannot be confirmed
+        filled is treated as pending, because declining to move a stop is
+        recoverable and moving the wrong one is not.
+        """
+        if not self._positions:
+            return
+        read_orders = getattr(self.adapter, "get_working_orders", None)
+        if read_orders is None:
+            return      # the broker's entries never rest; nothing to mark
+        try:
+            working = await read_orders()
+        except NotImplementedError:
+            return
+        except Exception as exc:  # noqa: BLE001 -- any adapter or socket fault
+            logger.warning(
+                "slave=%s could not read working orders at restore (%s) -- "
+                "trailing is held off for every restored position until the "
+                "next restart, rather than risk moving a stop for an entry "
+                "that never filled",
+                self.slave_id, exc,
+            )
+            for pos in self._positions.values():
+                pos["entry_pending"] = True
+            return
+
+        refs = {str(o.order_ref) for o in working if o.order_ref}
+        symbols = {o.symbol for o in working if o.symbol}
+        held = 0
+        for key, pos in self._positions.items():
+            master_account, master_ticket, slave_symbol = key
+            ref = order_ref(master_account, master_ticket, slave_symbol)
+            if ref in refs or slave_symbol in symbols:
+                pos["entry_pending"] = True
+                held += 1
+        if held:
+            logger.warning(
+                "slave=%s %d restored position(s) still have an unfilled entry "
+                "at the broker -- tracked so a CLOSE reaches them, but not "
+                "trailed until the fill is seen",
+                self.slave_id, held,
+            )
+
     async def _check_risk(self, key: Tuple[str, int, str], pos: dict) -> None:
         _master_account, _master_ticket, target_symbol = key
+
+        # The entry has not filled, so there is no position to protect.
+        # Moving a stop here would act on whatever sl_order_id happens to
+        # hold -- None on an unbracketed route, a live order on a
+        # bracketed one.
+        if pos.get("entry_pending"):
+            return
+
         quote = await self.adapter.get_quote(target_symbol, month_slot=pos.get("month_slot", 0))
         sign = 1 if pos["direction"] == "BUY" else -1
         favorable_move = sign * (quote - pos["entry_price"])

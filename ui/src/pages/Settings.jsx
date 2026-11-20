@@ -1,19 +1,25 @@
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
 import ConnectionWizard from "../components/ConnectionWizard.jsx";
+import { useHub } from "../hub.jsx";
+import { adapterLabel, slaveFacts, slaveRouting } from "../slaveFacts.js";
 
 const TABS = ["General", "Master", "Slaves", "Risk", "Notifications", "Logs", "Export"];
 
 export default function Settings() {
   const [tab, setTab] = useState("General");
-  const [status, setStatus] = useState(null);
+  // Status comes from the shared poller the header uses -- see hub.jsx.
+  // This page used to fetch it once on mount and after each save, which
+  // meant a slave that reconnected while someone sat on the Risk tab
+  // went on reading disconnected until they saved something.
+  const { status, error: statusError, refresh: refreshStatus } = useHub();
   const [config, setConfig] = useState({});
   const [error, setError] = useState(null);
 
   async function refresh() {
+    refreshStatus();
     try {
-      const [statusRes, configRes] = await Promise.all([api.getStatus(), api.getConfig()]);
-      setStatus(statusRes);
+      const configRes = await api.getConfig();
       setConfig(configRes.config);
       setError(null);
     } catch (err) {
@@ -23,12 +29,15 @@ export default function Settings() {
 
   useEffect(() => {
     refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
     <div className="settings">
       <h1>Settings</h1>
-      {error && <div className="banner banner-error">{error}</div>}
+      {(error || statusError) && (
+        <div className="banner banner-error">{error || statusError}</div>
+      )}
 
       <div className="settings-tabs">
         {TABS.map((t) => (
@@ -45,6 +54,47 @@ export default function Settings() {
       {tab === "Notifications" && <NotificationsTab config={config} onChanged={refresh} />}
       {tab === "Logs" && <LogsTab />}
       {tab === "Export" && <ExportTab />}
+    </div>
+  );
+}
+
+/**
+ * RC, MODE, RISK, CAP on one row.
+ *
+ * Chris's four, in his own shorthand. They replace a built sentence --
+ * "risk calibration x1.00 of what the master staked, against this
+ * balance" -- which said the same four things at ten times the width,
+ * and which had already gone stale once: its test for the pct_risk case
+ * was a regex over wording that changed underneath it on 2026-11-16, so
+ * the card quietly printed the raw summary where the calibration line
+ * belonged.
+ *
+ * Same values and same source as the dashboard's slave column, so the
+ * two screens cannot disagree about what a slave stakes.
+ */
+function SlaveFactsRow({ slave }) {
+  const facts = slaveFacts(slave);
+  return (
+    <div className="slave-risk-facts">
+      <span className="slave-fact" title="Risk calibration: what this slave takes of what the EA signalled">
+        <span className="slave-fact-k">RC</span>
+        <span className="slave-fact-v">
+          x{facts.rc}
+          {facts.overrides > 0 && ` +${facts.overrides} EA`}
+        </span>
+      </span>
+      <span className="slave-fact" title="Where the size comes from: the master's staked risk, or its lot count unchanged">
+        <span className="slave-fact-k">Mode</span>
+        <span className="slave-fact-v">{facts.mode || "--"}</span>
+      </span>
+      <span className="slave-fact" title="What the percentage is measured against">
+        <span className="slave-fact-k">Risk</span>
+        <span className="slave-fact-v">{facts.risk || "--"}</span>
+      </span>
+      <span className="slave-fact" title="The share of capital above which a signal is refused outright">
+        <span className="slave-fact-k">Cap</span>
+        <span className="slave-fact-v">{facts.cap || "--"}</span>
+      </span>
     </div>
   );
 }
@@ -117,8 +167,6 @@ function GeneralTab({ config, onChanged }) {
 
 function MasterTab({ status }) {
   if (!status) return <div className="panel">Loading...</div>;
-  const autonomousSlaves = status.slaves.filter((s) => s.mode === "autonomous");
-
   return (
     <div className="panel">
       <h2 style={{ marginTop: 0 }}>ZMQ</h2>
@@ -135,33 +183,24 @@ function MasterTab({ status }) {
         </tbody>
       </table>
 
-      <h2>ATR config by slave</h2>
-      <table className="data-table">
-        <thead>
-          <tr>
-            <th>Slave</th>
-            <th>ATR period</th>
-          </tr>
-        </thead>
-        <tbody>
-          {autonomousSlaves.map((s) => (
-            <tr key={s.id}>
-              <td>{s.name}</td>
-              <td>{s.atr_period ?? "--"}</td>
-            </tr>
-          ))}
-          {autonomousSlaves.length === 0 && (
-            <tr>
-              <td colSpan={2} className="muted">
-                No autonomous-mode slaves configured.
-              </td>
-            </tr>
-          )}
-        </tbody>
-      </table>
-      <p className="muted small">
-        ATR period is set per-slave (autonomous mode only) -- edit it from the Slaves tab or the Add Slave wizard.
-      </p>
+      {/* "ATR CONFIG BY SLAVE" WAS REMOVED on 2026-11-18, because a
+          slave does not have an ATR period -- an EA does.
+          Chris: "ATR is set per EA which runs on a certain timeframe
+          and corresponding magic."
+
+          The linkage, written down so the next change to this screen
+          starts from it: a signal carries a magic; the magic is one EA;
+          that EA runs on one timeframe; the stop is an ATR measured on
+          THAT timeframe's bars. So the two fields that decide a
+          translated stop are `bar_size_by_magic` (which bars) and the
+          period, both keyed by magic -- not by slave.
+
+          `config.atr_period` is the slave-wide fallback for a magic
+          with no entry of its own, and that is all it ever was. Shown
+          here as "ATR period" per slave it read as a setting each slave
+          holds, and it showed "--" for the two MT5 slaves that simply
+          have no fallback stored. A number that is a fallback, labelled
+          as a setting, on a screen about the master. */}
     </div>
   );
 }
@@ -192,8 +231,10 @@ function SlavesTab({ status, onChanged }) {
         <thead>
           <tr>
             <th>Name</th>
-            <th>Broker</th>
-            <th>Mode</th>
+            {/* ADAPTER, not broker: the value selects the adapter class,
+                and the mt4 one drives MT4 and MT5 terminals alike. */}
+            <th title="Which adapter drives this slave">Adapter</th>
+            <th>How it copies</th>
             <th>Status</th>
             <th></th>
           </tr>
@@ -201,9 +242,23 @@ function SlavesTab({ status, onChanged }) {
         <tbody>
           {status?.slaves.map((s) => (
             <tr key={s.id}>
-              <td>{s.name}</td>
-              <td>{s.broker_type}</td>
-              <td>{s.mode}</td>
+              <td>
+                <SlaveName slave={s} onSaved={onChanged} />
+                <div className="slave-meta">{slaveRouting(s)}</div>
+              </td>
+              <td title="The MT4 adapter drives MT4 and MT5 terminals alike -- the bridge does not report which">
+                {adapterLabel(s.broker_type)}
+              </td>
+              {/* The engine selector, and under it the four facts that
+                  say what this slave actually does with a signal. The
+                  cell used to print describe_mode()'s sentence above the
+                  control -- "own stops from ATR, 10 routed instruments"
+                  -- which repeated the route count now in the column to
+                  its left and said nothing about size. */}
+              <td>
+                <ModeCell slave={s} onChanged={onChanged} compact />
+                <SlaveFactsRow slave={s} />
+              </td>
               <td>{s.paused ? "paused" : s.running ? "running" : "stopped"}</td>
               <td>
                 <button className="btn btn-small" onClick={() => togglePause(s)}>
@@ -217,6 +272,12 @@ function SlavesTab({ status, onChanged }) {
           ))}
         </tbody>
       </table>
+      <p className="muted small">
+        How a slave copies selects the engine, so switching it stops one and starts the other.
+        Only possible while the slave is flat: the incoming engine would otherwise adopt open
+        positions and protect them under rules they were never opened under -- mirror aims at
+        the master&apos;s own stop, autonomous trails its own from ATR.
+      </p>
 
       {wizardOpen && (
         <ConnectionWizard
@@ -227,6 +288,85 @@ function SlavesTab({ status, onChanged }) {
           }}
         />
       )}
+    </div>
+  );
+}
+
+/**
+ * A slave's name, editable where it is read.
+ *
+ * The name is stored on the slave and shown verbatim; nothing derives
+ * it. So "IBKR Paper (Autonomous)", "IBKR Paper ETF (evening session)"
+ * and "Darwinex MT5 Futures (mirror)" are not the screen describing a
+ * slave -- they are what each slave is called, written when it was
+ * added and never since. Two of those three now say the wrong thing:
+ * every slave runs the autonomous engine today, so one is redundant and
+ * one is the opposite of true. Chris, 2026-11-18: "those are a mix of
+ * incorrect."
+ *
+ * There was no field for it anywhere in this UI, which is why they
+ * drifted -- correcting one meant a PATCH against the API by hand.
+ *
+ * `name` is a column of its own, so this sends the name ALONE: a
+ * name-only patch leaves config_json exactly as it was, and this editor
+ * has no business carrying a whole config across to change one string.
+ */
+function SlaveName({ slave, onSaved }) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(slave.name);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  async function save() {
+    const next = value.trim();
+    if (!next || next === slave.name) { setEditing(false); return; }
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.patchSlave(slave.id, { name: next });
+      setEditing(false);
+      onSaved && onSaved();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!editing) {
+    return (
+      <div className="slave-name slave-name-edit">
+        {slave.name}{" "}
+        <button
+          className="btn btn-tiny"
+          title="Rename this slave. The name is stored, not derived -- nothing else changes."
+          onClick={() => { setValue(slave.name); setErr(null); setEditing(true); }}
+        >
+          Rename
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="slave-name-edit">
+      <input
+        value={value}
+        autoFocus
+        disabled={busy}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") save();
+          if (e.key === "Escape") setEditing(false);
+        }}
+      />
+      <button className="btn btn-tiny" disabled={busy} onClick={save}>
+        {busy ? "..." : "Save"}
+      </button>
+      <button className="btn btn-tiny" disabled={busy} onClick={() => setEditing(false)}>
+        Cancel
+      </button>
+      {err && <div className="banner banner-error">{err}</div>}
     </div>
   );
 }
@@ -274,11 +414,38 @@ function RiskTab({ status, onChanged }) {
 
   return (
     <>
-      {/* Two hub-wide switches on one row. Both are "stop trading"
-          controls and both are read at a glance rather than configured
-          often, so a panel each was mostly whitespace. The explanations
-          move to title text -- they matter when you reach for the
-          control, not every time you pass it. */}
+      {/* The heading is OUTSIDE the panel and the explanation is at the
+          foot of it. Both sat on top of the slaves, so the first thing
+          in the block someone opened to read a slave was three lines
+          about the block. The note still earns its place -- it is what
+          tells a reader why a mirror slave is listed at all -- just not
+          ahead of the thing it describes. */}
+      <h2 className="section-title">Per-slave sizing &amp; risk</h2>
+      <div className="panel">
+        {slaves.length === 0 && <p className="muted">No slaves configured.</p>}
+        {slaves.map((s) => (
+          <SlaveRisk
+            key={s.id}
+            slave={s}
+            knownAccounts={knownAccounts}
+            onSaved={onChanged}
+          />
+        ))}
+        <p className="muted small slave-risk-note">
+          How much each slave stakes per signal, and what would stop it trading at all.
+          Every slave is listed -- mirror slaves size from their own balance too when they
+          carry a sizing block. RC is risk calibration: what this slave takes of what the
+          EA signalled. Cap is the share of capital above which a signal is refused outright.
+        </p>
+      </div>
+
+      {/* Two hub-wide switches on one row, AT THE FOOT OF THE TAB.
+          Both are "stop trading" controls, neither is touched in normal
+          work, and at the top they were the first thing on a screen
+          whose subject is the slaves below them. A panel each was mostly
+          whitespace, so they share a row; the explanations are title
+          text, because they matter when you reach for the control and
+          not every time you pass it. */}
       <div className="panel hub-risk-row">
         {error && <div className="banner banner-error">{error}</div>}
         <div className="hub-risk-cell">
@@ -326,23 +493,6 @@ function RiskTab({ status, onChanged }) {
         </div>
       </div>
 
-      <div className="panel">
-        <h2 style={{ marginTop: 0 }}>Per-slave sizing &amp; risk</h2>
-        <p className="muted small">
-          How much each slave stakes per signal, and what would stop it trading at all.
-          Every slave is listed -- mirror slaves size from their own balance too when they
-          carry a sizing block.
-        </p>
-        {slaves.length === 0 && <p className="muted">No slaves configured.</p>}
-        {slaves.map((s) => (
-          <SlaveRisk
-            key={s.id}
-            slave={s}
-            knownAccounts={knownAccounts}
-            onSaved={onChanged}
-          />
-        ))}
-      </div>
     </>
   );
 }
@@ -360,9 +510,16 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
     }
   });
   const [editing, setEditing] = useState(false);
+  const [editingScale, setEditingScale] = useState(false);
+  const [editingBasis, setEditingBasis] = useState(false);
+  const [editingRoutes, setEditingRoutes] = useState(false);
   const [editingMagic, setEditingMagic] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [removing, setRemoving] = useState(false);
   const [editingMasters, setEditingMasters] = useState(false);
   const [editingRoll, setEditingRoll] = useState(false);
+  const [editingSplit, setEditingSplit] = useState(false);
+  const [editingChase, setEditingChase] = useState(false);
   const [showRoutes, setShowRoutes] = useState(false);
 
   function toggle() {
@@ -379,69 +536,239 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
     <div className={`slave-risk ${open ? "is-open" : ""}`}>
       <div className="slave-risk-head" onClick={toggle} role="button" tabIndex={0}
            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") toggle(); }}>
-        <div>
+        <div className="slave-risk-ident">
           <span className="fold-caret">{open ? "\u25be" : "\u25b8"}</span>{" "}
           <strong>{slave.name}</strong>{" "}
-          <span className="muted small">
-            {slave.broker_type} &middot; {slave.mode}
+          <span className="muted small" title="The adapter driving this slave">
+            {adapterLabel(slave.broker_type)}
           </span>
-          {/* The one line worth seeing folded: what it stakes and what
-              it stakes it against. */}
-          <div className="slave-risk-sizing">
-            {describeHeadline(slave)}
-            {describeBasis(slave) !== "the broker's own balance" && (
-              <span className="muted"> &middot; {describeBasis(slave)}</span>
-            )}
-          </div>
+          {/* The four worth seeing folded, on one row. What this slave
+              takes of a signal, where the size comes from, what it is
+              measured against, and where it refuses. An adjusted or
+              floored capital basis is said after them, because it is
+              the uncommon case and changes what "balance" means. */}
+          <SlaveFactsRow slave={slave} />
+          {describeBasis(slave) !== "the broker's own balance" && (
+            <div className="slave-risk-sizing muted small">{describeBasis(slave)}</div>
+          )}
         </div>
-        {!slave.sizing_per_route && open && (
-          <button
-            className="btn btn-small"
-            onClick={(e) => { e.stopPropagation(); setEditing((v) => !v); }}
-          >
-            {editing ? "Cancel" : "Edit"}
-          </button>
+        {/* NO LONGER GATED ON sizing_per_route. This form holds the leg
+            cap, the combined-risk cap, opposing legs and the margin
+            ceiling -- none of which are sizing -- so hiding it on a
+            route-sized slave made four limits unreachable on
+            ibkr-etf-1. Chris, twice: "max lex and refusal % arent
+            editable again". The SIZING half hides itself below. */}
+        {/* THE TWO DECISIONS THAT SAY WHAT THIS SLAVE IS, on the name's
+            own row: which engine runs it, and which strategies reach it.
+            They were rows in the body, a scroll apart from each other
+            and from the name they belong to, each drawn differently --
+            one a dropdown, one a sentence with an Edit button. Presented
+            alike here, so the head reads as one statement about one
+            slave.
+
+            The head toggles the fold on click, so the whole control
+            block stops the event: a select that folded the card as it
+            opened would be unusable. */}
+        {open && (
+          <div className="slave-risk-headctl" onClick={(e) => e.stopPropagation()}>
+            <div className="headctl">
+              <span className="headctl-k">Engine</span>
+              <div className="headctl-v" title={slave.mode_label || slave.mode}>
+                <ModeCell slave={slave} onChanged={onSaved} compact />
+              </div>
+            </div>
+            <div className="headctl">
+              <span className="headctl-k">Strategies</span>
+              <div className="headctl-v">
+                <span className="headctl-text" title={describeSelection(slave)}>
+                  {describeSelection(slave)}
+                </span>
+                <button className="btn btn-tiny" onClick={() => setEditingMagic((v) => !v)}>
+                  {editingMagic ? "Cancel" : "Edit"}
+                </button>
+                {/* The same decision, taken from the Portfolio Manager
+                    instead of typed in. It sits beside Edit because it
+                    writes exactly what Edit writes. */}
+                <button
+                  className="btn btn-tiny"
+                  title="Apply a portfolio exported from the Portfolio Manager: its strategies and their risk scales"
+                  onClick={() => setImporting((v) => !v)}
+                >
+                  {importing ? "Cancel" : "Import"}
+                </button>
+                {/* Beside Import, because it is the half of it that was
+                    missing. Deleting the selection by hand leaves the
+                    per-strategy scales in force over a slave that now
+                    takes everything -- seen live on mt5-icm-1. */}
+                <button
+                  className="btn btn-tiny"
+                  title="Take the portfolio back off this slave: its strategy selection AND the per-strategy risk scales"
+                  onClick={() => setRemoving((v) => !v)}
+                >
+                  {removing ? "Cancel" : "Remove"}
+                </button>
+              </div>
+            </div>
+          </div>
         )}
       </div>
 
       {!open ? null : (
       <>
 
-      <div className="slave-risk-flags">
-        {slave.netting?.allow_opposing && (
-          <span className="badge badge-warn" title="A signal opposing what this account already holds is copied rather than refused">
-            opposing legs allowed
-          </span>
-        )}
-        {slave.netting?.max_legs != null && (
-          <span className="badge">max {slave.netting.max_legs} legs/symbol</span>
-        )}
-        {slave.netting?.max_aggregate_risk_pct != null && (
-          <span className="badge">
-            {(slave.netting.max_aggregate_risk_pct * 100).toFixed(1)}% aggregate/symbol
-          </span>
-        )}
-        {slave.margin?.max_pct_of_free != null && (
-          <span className="badge">
-            margin ceiling {(slave.margin.max_pct_of_free * 100).toFixed(0)}% of free
-          </span>
-        )}
-      </div>
-
-      {slave.sizing_per_route && (
-        <p className="muted small">
-          Sizing is set on each of those individually, not on the slave as a whole, so there is
-          nothing to edit here -- a slave-level value would save cleanly and never be read.
-        </p>
+      {/* "How it copies" and "Strategy selection" MOVED INTO THE HEAD on
+          2026-11-17, onto the name's own row. The editor each one opens
+          still lands here, under the control that opened it. */}
+      {editingMagic && (
+        <StrategyForm
+          slave={slave}
+          onDone={() => { setEditingMagic(false); onSaved && onSaved(); }}
+        />
+      )}
+      {importing && (
+        <PortfolioImportForm
+          slave={slave}
+          onDone={() => { setImporting(false); onSaved && onSaved(); }}
+        />
+      )}
+      {removing && (
+        <PortfolioRemoveForm
+          slave={slave}
+          onDone={() => { setRemoving(false); onSaved && onSaved(); }}
+        />
       )}
 
-      {editing && <SlaveRiskForm slave={slave} onDone={() => { setEditing(false); onSaved && onSaved(); }} />}
+      {/* The folded headline reads "risk scale x1.00 of what the master
+          staked" and there was NOWHERE on this card to change it. The only
+          field for it sat inside Strategy selection, labelled "All
+          strategies on this slave", and only appeared once a selection mode
+          other than Accept none was chosen -- so the number the card leads
+          with had no visible control at all. Chris, twice: "there is no
+          field to adjust the slave level risk scale. there is text claiming
+          whats staked, but no adjustment field still."
+
+          Shown unconditionally, INCLUDING for a route-sized slave. Risk
+          scale is read off the slave config even when every route carries
+          its own sizing -- resolve_risk_scale() takes slave_config -- so
+          "sizing is per route, nothing to edit here" was never true of
+          this one value. ibkr-etf-1 is exactly that slave. */}
+      <div className="slave-risk-row">
+        <div>
+          <span className="row-k">Risk calibration</span>
+          <div className="slave-risk-sizing">{describeScale(slave)}</div>
+        </div>
+        <button className="btn btn-small" onClick={() => setEditingScale((v) => !v)}>
+          {editingScale ? "Cancel" : "Edit"}
+        </button>
+      </div>
+      {editingScale && (
+        <RiskScaleForm
+          slave={slave}
+          onDone={() => { setEditingScale(false); onSaved && onSaved(); }}
+        />
+      )}
+
+      {/* CAPITAL LIMITS, under the calibration they bound. This was an
+          "Edit" in the card head beside the engine and the strategies,
+          which are what the slave IS; these are what stops it, and they
+          are read straight after the figure they cap. The form holds the
+          leg cap, the combined-risk cap, opposing legs and the margin
+          ceiling -- none of which are sizing, which is why it shows on a
+          route-sized slave too. */}
+      <div className="slave-risk-row">
+        <div>
+          <span className="row-k">Capital limits</span>
+          <div className="slave-risk-sizing muted">
+            what stops this slave trading, short of the kill switch
+          </div>
+        </div>
+        <button className="btn btn-small" onClick={() => setEditing((v) => !v)}>
+          {editing ? "Cancel" : "Edit"}
+        </button>
+      </div>
+      {editing && (
+        <SlaveRiskForm slave={slave} onDone={() => { setEditing(false); onSaved && onSaved(); }} />
+      )}
+
+      {/* THE SAME DEFECT, found by generalising the test rather than by
+          anyone hitting it: RiskBasisForm was written in full and never
+          mounted either, while describeBasis() has been printing
+          "+100,000 adjustment, never below 250,000" in the head all along.
+          Text claiming a number, no field for it -- which is the complaint
+          that started this, one row up.
+
+          It edits balance_adjustment and min_risk_capital, and both change
+          every size this slave calculates, so being settable only by a
+          PATCH against the API was not a small gap. */}
+      <div className="slave-risk-row">
+        <div>
+          <span className="row-k">Capital basis</span>
+          <div className="slave-risk-sizing">{describeBasis(slave)}</div>
+        </div>
+        <button className="btn btn-small" onClick={() => setEditingBasis((v) => !v)}>
+          {editingBasis ? "Cancel" : "Edit"}
+        </button>
+      </div>
+      {editingBasis && (
+        <RiskBasisForm
+          slave={slave}
+          onDone={() => { setEditingBasis(false); onSaved && onSaved(); }}
+        />
+      )}
+
+      {/* THE BADGE ROW IS GONE for now -- Chris, 2026-11-18: "remove
+          the stale icons". Every figure on it is live and none of it was
+          wrong, but a row of five badges saying what a slave refuses
+          read as a row of warnings about a slave that is working. The
+          same four values are editable one row up, under Capital
+          limits, and the one a reader needs at a glance -- the refusal
+          ceiling -- is CAP on the head row. If they come back, they come
+          back as values in rows like everything else, not as badges. */}
+
+      {/* A ROUTE-SIZED SLAVE HAD NO WAY TO CHANGE ITS CAP AT ALL.
+          ibkr-etf-1 carries no slave-level sizing block, so the Edit
+          button above is correctly hidden -- a slave-level value would
+          save cleanly and never be read. But its ceiling is real and
+          lives on each of twenty routes, and nothing in this UI could
+          touch it: the routes are listed read-only further down.
+          Chris: "I cant adjust the max cap. that initial edit tab, top
+          right, is gone on that slave."
+          So the editor writes to every route at once, which is what a
+          slave-wide figure means here. */}
+      {slave.sizing_per_route && (
+        <>
+          <p className="muted small">
+            Risk <em>sizing</em> is set on each route individually rather than on the slave, so a
+            slave-level block would save cleanly and never be read. Risk <em>calibration</em>{" "}
+            above is the exception -- that one is read off the slave either way.
+          </p>
+          <div className="slave-risk-row">
+            <div>
+              <span className="row-k">Sizing on every route</span>
+              {/* The one descriptor that is a sentence rather than a
+                  state -- twenty routes, their mode, their basis, their
+                  ceiling and the fallback, in one line. Caps on a line
+                  that wraps is harder to read, not easier. */}
+              <div className="slave-risk-sizing is-long">{slave.sizing_summary}</div>
+            </div>
+            <button className="btn btn-small" onClick={() => setEditingRoutes((v) => !v)}>
+              {editingRoutes ? "Cancel" : "Edit"}
+            </button>
+          </div>
+          {editingRoutes && (
+            <RouteSizingForm
+              slave={slave}
+              onDone={() => { setEditingRoutes(false); onSaved && onSaved(); }}
+            />
+          )}
+        </>
+      )}
 
       {/* Asked before the magic, because that is the order the bus
           asks in: magic numbers are per-master and collide across them. */}
       <div className="slave-risk-row">
         <div>
-          <span className="muted small">Masters followed</span>
+          <span className="row-k">Masters followed</span>
           <div className="slave-risk-sizing">{slave.master_filter_summary}</div>
         </div>
         <button className="btn btn-small" onClick={() => setEditingMasters((v) => !v)}>
@@ -456,33 +783,18 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
         />
       )}
 
-      {/* Which signals reach this slave at all. A filter decides that
-          before sizing ever runs, so it belongs above the routes. */}
-      {/* ONE row, because a strategy and the risk it carries here are a
-          single decision. They were two, and a scale a section away from
-          the magic it belongs to is read wrong. */}
-      <div className="slave-risk-row">
-        <div>
-          <span className="muted small">Strategy selection</span>
-          <div className="slave-risk-sizing">{describeSelection(slave)}</div>
-        </div>
-        <button className="btn btn-small" onClick={() => setEditingMagic((v) => !v)}>
-          {editingMagic ? "Cancel" : "Edit"}
-        </button>
-      </div>
-      {editingMagic && (
-        <StrategyForm
-          slave={slave}
-          onDone={() => { setEditingMagic(false); onSaved && onSaved(); }}
-        />
-      )}
-
       {/* Rolling is two market orders per position when it fires, and it
           fires on its own schedule. Running invisibly is the problem. */}
-      {(slave.contract_roll || slave.mode === "autonomous") && (
+      {/* Only where something EXPIRES. A share of UGL has no front
+          month, so this row offered to schedule two market orders for
+          an event that cannot occur. An existing contract_roll block
+          still shows, so a slave configured by hand is never hidden
+          from its own setting. */}
+      {(slave.contract_roll
+        || (slave.mode === "autonomous" && slave.rolls_contracts !== false)) && (
         <div className="slave-risk-row">
           <div>
-            <span className="muted small">Contract roll</span>
+            <span className="row-k">Contract roll</span>
             <div className="slave-risk-sizing">
               {slave.contract_roll?.enabled
                 ? `on -- rolls when the next month out-trades the front by ${
@@ -505,22 +817,228 @@ function SlaveRisk({ slave, knownAccounts, onSaved }) {
         />
       )}
 
+      {/* HOW an entry reaches the market, which is not how big it is --
+          so it sits apart from sizing. Shown on every slave, including
+          the ones that cannot do it: "off" and "this broker places one
+          order per entry" are different answers and the page should not
+          give the first when it means the second. */}
+      <div className="slave-risk-row">
+        <div>
+          <span className="row-k">Order splitting</span>
+          <div className="slave-risk-sizing">
+            {slave.supports_order_split === false
+              ? "not available -- this broker places one order per entry"
+              : slave.split_summary || "off -- each entry goes out as one order"}
+          </div>
+        </div>
+        {slave.supports_order_split !== false && (
+          <button className="btn btn-small" onClick={() => setEditingSplit((v) => !v)}>
+            {editingSplit ? "Cancel" : "Edit"}
+          </button>
+        )}
+      </div>
+      {editingSplit && (
+        <OrderSplitForm
+          slave={slave}
+          onDone={() => { setEditingSplit(false); onSaved && onSaved(); }}
+        />
+      )}
+
+      {/* How a RESTING limit entry follows the market. Only means
+          anything where entries rest -- a market order fills or it does
+          not. */}
+      <div className="slave-risk-row">
+        <div>
+          <span className="row-k">Entry chase</span>
+          <div className="slave-risk-sizing">
+            {slave.entry_chase
+              ? `${slave.entry_chase.steps} re-price(s), ${slave.entry_chase.interval_s}s apart, ` +
+                `up to ${(slave.entry_chase.max_pct * 100).toFixed(2)}% from where it started`
+              : "off -- a resting entry is left at the price it went out at"}
+          </div>
+        </div>
+        <button className="btn btn-small" onClick={() => setEditingChase((v) => !v)}>
+          {editingChase ? "Cancel" : "Edit"}
+        </button>
+      </div>
+      {editingChase && (
+        <EntryChaseForm
+          slave={slave}
+          onDone={() => { setEditingChase(false); onSaved && onSaved(); }}
+        />
+      )}
+
       {slave.routes?.length > 0 && (
+        /* Labelled like every other row. Unlabelled, its control started
+           at the left edge where the others have their label, and the
+           column the rest of the card reads down stopped one row early. */
         <div className="slave-risk-row">
+          <span className="row-k">Routes</span>
           <button className="btn btn-small" onClick={() => setShowRoutes((v) => !v)}>
             {showRoutes ? "Hide" : "Show"} {slave.routes.length} route
             {slave.routes.length === 1 ? "" : "s"}
           </button>
         </div>
       )}
-      {showRoutes && <RouteTable routes={slave.routes} />}
+      {showRoutes && (
+        <RouteTable
+          routes={slave.routes}
+          slave={slave}
+          onSaved={() => onSaved && onSaved()}
+        />
+      )}
       </>
       )}
     </div>
   );
 }
 
-function RouteTable({ routes }) {
+/**
+ * One route's own order splitter, edited in place.
+ *
+ * The first per-route editing on this page, so it carries the check
+ * that per-route editing needs: NOTHING IDENTIFIES A ROUTE but its
+ * position in the array. The row's index is the config's index, and a
+ * config that changed shape between the read and the write would be
+ * written to by position -- putting a split on whichever route had
+ * moved into that slot. So the write re-reads, confirms the route at
+ * that index is still the same one, and refuses rather than guessing.
+ */
+function RouteSplitCell({ slave, route, index, onSaved }) {
+  const [editing, setEditing] = useState(false);
+  const [slices, setSlices] = useState("");
+  const [interval, setInterval] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  function open() {
+    setSlices(route.split_slices != null ? String(route.split_slices) : "");
+    setInterval(route.split_interval != null ? String(route.split_interval) : "");
+    setErr(null);
+    setEditing(true);
+  }
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const n = String(slices).trim();
+      const secs = String(interval).trim();
+
+      // Three states, not two. Blank is "no opinion, use the slave's";
+      // 0 is "opt out of the slave's"; a pair is this route's own. They
+      // are different answers and the config has to keep them apart.
+      const optOut = n === "0";
+      const off = !optOut && n === "" && secs === "";
+      if (!optOut && !off) {
+        if (!Number.isInteger(Number(n)) || Number(n) < 2) {
+          throw new Error("slices must be 2 or more -- 1 is not a split, 0 opts out");
+        }
+        if (Number.isNaN(Number(secs)) || Number(secs) <= 0) {
+          throw new Error("the delay must be more than 0 seconds");
+        }
+      }
+
+      const config = await currentConfig(slave.id);
+      const r = (config.routes || [])[index];
+      const same =
+        r &&
+        r.symbol === route.symbol &&
+        String(r.magic ?? "") === String(route.magic ?? "") &&
+        (Array.isArray(r.target) ? r.target : [r.target]).join("/") ===
+          route.target.join("/");
+      if (!same) {
+        throw new Error(
+          "this slave's routes changed while this row was open -- close it and try again",
+        );
+      }
+
+      if (optOut) {
+        r.split_slices = 0;
+        delete r.split_interval;
+      } else if (off) {
+        delete r.split_slices;
+        delete r.split_interval;
+      } else {
+        r.split_slices = Number(n);
+        r.split_interval = Number(secs);
+      }
+
+      await api.patchSlave(slave.id, { config });
+      setEditing(false);
+      onSaved && onSaved();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (slave?.supports_order_split === false) {
+    return (
+      <span className="muted" title="This broker places one order per entry">
+        n/a
+      </span>
+    );
+  }
+
+  if (!editing) {
+    return (
+      <span className="route-split">
+        {route.split_slices > 1 && route.split_interval > 0 ? (
+          <span
+            title={`One entry goes out as ${route.split_slices} orders ${route.split_interval}s apart -- a ${(route.split_slices - 1) * route.split_interval}s window -- filling into one position`}
+          >
+            {route.split_slices}&times; / {route.split_interval}s
+          </span>
+        ) : route.split_slices === 0 ? (
+          <span className="muted" title="This route opts out of the slave-wide split">
+            opted out
+          </span>
+        ) : (
+          <span className="muted">--</span>
+        )}
+        <button className="btn btn-tiny" onClick={open} title="Edit this route's split">
+          edit
+        </button>
+      </span>
+    );
+  }
+
+  return (
+    <span className="route-split route-split-editing">
+      <input
+        type="number"
+        min="0"
+        step="1"
+        value={slices}
+        placeholder="--"
+        title="Orders to split one entry into. Blank uses the slave's setting, 0 opts out of it."
+        onChange={(e) => setSlices(e.target.value)}
+      />
+      <span className="muted">&times; /</span>
+      <input
+        type="number"
+        min="0"
+        step="1"
+        value={interval}
+        placeholder="--"
+        title="Seconds between them"
+        onChange={(e) => setInterval(e.target.value)}
+      />
+      <span className="muted">s</span>
+      <button className="btn btn-tiny" onClick={save} disabled={busy}>
+        {busy ? "..." : "save"}
+      </button>
+      <button className="btn btn-tiny" onClick={() => setEditing(false)} disabled={busy}>
+        cancel
+      </button>
+      {err && <div className="route-split-err">{err}</div>}
+    </span>
+  );
+}
+
+function RouteTable({ routes, slave, onSaved }) {
   return (
     <div className="table-wrap">
       <table className="positions-table route-table">
@@ -533,6 +1051,7 @@ function RouteTable({ routes }) {
             <th>Order</th>
             <th>Month</th>
             <th>Stop held by</th>
+            <th>Split</th>
             <th>Sizing</th>
           </tr>
         </thead>
@@ -544,7 +1063,7 @@ function RouteTable({ routes }) {
               <td>
                 {r.target.join(" / ")}
                 {r.target.length > 1 && (
-                  <span className="muted small"> (first that resolves)</span>
+                  <span className="muted small"> (next one on capacity)</span>
                 )}
               </td>
               <td>
@@ -556,6 +1075,24 @@ function RouteTable({ routes }) {
               <td>
                 {r.order_type}
                 {r.outside_rth && <span className="badge badge-warn">outside RTH</span>}
+                {/* The pair that decides whether an evening entry can still
+                    be open at the next session. One without the other is
+                    the setting that looks right and does nothing, so both
+                    are shown and a lone TIF is flagged. */}
+                {r.tif && <span className="badge">{r.tif}</span>}
+                {r.tif && r.tif !== "DAY" && !r.entry_timeout && (
+                  <span
+                    className="badge badge-warn"
+                    title="This engine still cancels the unfilled entry on its own default clock, so the longer TIF changes nothing. Set entry_timeout too."
+                  >
+                    no wait set
+                  </span>
+                )}
+                {r.entry_timeout && (
+                  <span className="muted small">
+                    {" "}rests {Math.round(r.entry_timeout / 60)}m
+                  </span>
+                )}
               </td>
               <td>{r.month_slot ?? <span className="muted">--</span>}</td>
               <td>
@@ -567,38 +1104,88 @@ function RouteTable({ routes }) {
                   "broker"
                 )}
               </td>
+              {/* This route's own splitter, which wins over the
+                  slave's. It was invisible: the gold route carried
+                  "3 over 5s" while the slave card said nothing, so
+                  clearing the slave-level setting left a split running
+                  that no screen would own up to. */}
+              <td>
+                <RouteSplitCell
+                  slave={slave}
+                  route={r}
+                  index={i}
+                  onSaved={onSaved}
+                />
+              </td>
               <td>{r.sizing}</td>
             </tr>
           ))}
         </tbody>
       </table>
       <p className="muted small">
-        Read-only for now. These decide what a signal becomes -- which contract month, who holds
-        the stop, whether it may work outside regular hours.
+        These decide what a signal becomes -- which contract month, who holds the stop, whether
+        it may work outside regular hours. Only the split is editable here so far.
+      </p>
+      <p className="muted small">
+        A route&apos;s <strong>split</strong> wins over the slave-wide one. Blank means it has no
+        opinion and takes the slave&apos;s; <strong>0</strong> opts out of the slave&apos;s
+        entirely. Those are different answers, so the column shows them differently.
       </p>
     </div>
   );
 }
 
-function describeHeadline(slave) {
-  // The old line read "1.00% of balance" -- a percentage that is no
-  // longer edited anywhere, because sizing comes from what the master
-  // actually staked. Saying it invites someone to go looking for a field
-  // that is not there.
-  const sizing = slave.sizing_summary || "";
-  if (!/\d+\.\d+% of/.test(sizing)) return sizing;   // routes, lots, etc.
+function ModeCell({ slave, onChanged, compact }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const raw = slave.mode === "autonomous" ? "autonomous" : "mirror";
+  const other = raw === "autonomous" ? "mirror" : "autonomous";
 
-  const scale = slave.risk_scale ?? 1;
-  const byMagic = Object.keys(slave.risk_scale_by_magic || {}).length;
-  const base = slave.sizing_summary.includes("equity") ? "equity" : "balance";
+  async function switchTo(next) {
+    if (next === raw) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      // Only the mode travels. Sending back a config this component had
+      // been holding would make a read-modify-write out of what is meant
+      // to be one decision, and anything edited elsewhere since the page
+      // loaded would be undone. ModeCell always read fresh here -- the
+      // other six forms did not, which is what this now matches.
+      const config = await currentConfig(slave.id);
+      await api.patchSlave(slave.id, { config: { ...config, mode: next } });
+      onChanged && onChanged();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
 
-  let head = `what the master staked, of this ${base}`;
-  if (scale !== 1) head += ` x${scale}`;
-  if (byMagic) head += `, ${byMagic} strategy override${byMagic === 1 ? "" : "s"}`;
-
-  const cap = /capped ([\d.]+%)/.exec(sizing);
-  if (cap) head += ` \u00b7 refuse above ${cap[1]}`;
-  return head;
+  return (
+    <div className="mode-cell">
+      {!compact && <div>{slave.mode_label || slave.mode}</div>}
+      <select
+        value={raw}
+        disabled={busy || slave.mode_editable === false}
+        onChange={(e) => switchTo(e.target.value)}
+      >
+        <option value="mirror">mirror</option>
+        <option value="autonomous">autonomous</option>
+      </select>
+      {slave.mode_editable === false && (
+        <div className="muted small">
+          {slave.mode_locked_reason
+            ? `locked -- ${slave.mode_locked_reason}`
+            : "locked"}
+        </div>
+      )}
+      {busy && <div className="muted small">restarting the engine...</div>}
+      {err && <div className="banner banner-error">{err}</div>}
+      {!busy && !err && slave.mode_editable !== false && (
+        <div className="muted small">switching restarts as {other}</div>
+      )}
+    </div>
+  );
 }
 
 function describeBasis(slave) {
@@ -641,7 +1228,7 @@ function RiskBasisForm({ slave, onDone }) {
     setBusy(true);
     setErr(null);
     try {
-      const config = { ...full.config };
+      const config = await currentConfig(slave.id);
 
       const adj = adjustment.trim();
       if (adj === "" || Number(adj) === 0) delete config.balance_adjustment;
@@ -727,17 +1314,64 @@ function RiskBasisForm({ slave, onDone }) {
   );
 }
 
+/**
+ * The slave's CURRENT config, re-read at the moment of saving.
+ *
+ * Every form here PATCHes the whole config, and PATCH /slaves/{id}
+ * replaces rather than merges -- so a form saving the snapshot it loaded
+ * on open silently restores every value changed since. That is not
+ * hypothetical: risk_scale 0.50 was set on ibkr-paper-1 and wiped twice
+ * in twenty minutes by exactly this, from forms that had been open the
+ * whole time.
+ *
+ * Re-reading shrinks the window from "as long as the form was open" to
+ * one round trip. It is not real concurrency control -- two saves inside
+ * that window still lose one -- and the proper fix is for each form to
+ * send only the keys it owns against a merging endpoint.
+ */
+async function currentConfig(slaveId) {
+  const got = await api.getSlave(slaveId);
+  return { ...got.config };
+}
+
 function describeScale(slave) {
   const byMagic = slave.risk_scale_by_magic || {};
   const entries = Object.entries(byMagic);
   const base = slave.risk_scale ?? 1;
-  const baseText =
-    base === 1 ? "every strategy at full target risk" : `all strategies x${base}`;
-  if (entries.length === 0) return baseText;
+  // The dials MULTIPLY: intake x strategy. So the per-strategy figures
+  // are shown with the product they actually produce -- "2002 x0.50 (=
+  // x0.25)" -- because that product is the number being asked about, and
+  // multiplying two decimals in your head is how a position comes out
+  // four times the size intended.
+  // Chris's words, 2026-11-18. The figure IS a ratio -- what this slave
+  // takes of what the EA signalled -- and the row said it two different
+  // ways depending on the value, so x1.00 read as a sentence about
+  // policy and x0.25 as a measurement. One phrase, always, with the
+  // figure in front of it.
+  //
+  // Returned as elements rather than a string so the multipliers can
+  // opt OUT of the row's uppercase. The descriptors are set in caps and
+  // a plain "x1.00" comes out "X1.00" -- a capital X in the middle of a
+  // number, which is the same defect that was just fixed on the facts
+  // row and would walk straight back in here.
   const listed = entries
-    .map(([magic, scale]) => `${magic} x${scale}`)
+    .map(([magic, scale]) => {
+      const net = Number(base) * Number(scale);
+      return base === 1
+        ? `${magic} x${Number(scale).toFixed(2)}`
+        : `${magic} x${Number(scale).toFixed(2)} (= x${net.toFixed(2)})`;
+    })
     .join(", ");
-  return `${baseText}; ${listed}`;
+  return (
+    <>
+      <span className="mult">x{Number(base).toFixed(2)}</span> ratio of intake signal
+      {entries.length > 0 && (
+        <>
+          ; then <span className="mult">{listed}</span>
+        </>
+      )}
+    </>
+  );
 }
 
 function RiskScaleForm({ slave, onDone }) {
@@ -789,7 +1423,7 @@ function RiskScaleForm({ slave, onDone }) {
         table[magic] = scale;
       }
 
-      const config = { ...full.config };
+      const config = await currentConfig(slave.id);
       if (Number(base) === 1) delete config.risk_scale;
       else config.risk_scale = Number(base);
       if (Object.keys(table).length === 0) delete config.risk_scale_by_magic;
@@ -811,8 +1445,16 @@ function RiskScaleForm({ slave, onDone }) {
     <div className="slave-risk-form with-notes">
       {err && <div className="banner banner-error">{err}</div>}
 
+      {/* The number the folded headline reads out, labelled in the same
+          words so the line and its control are recognisably one thing.
+
+          This is the INTAKE figure: how much of any incoming signal this
+          venue takes, which is a property of the venue's leverage rather
+          than of any strategy. The per-strategy figures below multiply
+          it, so this one applies to every signal whether or not the
+          strategy has a row of its own. */}
       <label>
-        All strategies on this slave
+        Risk calibration &mdash; this slave takes this much of every signal &times;
         <input
           type="number"
           step="0.05"
@@ -828,7 +1470,7 @@ function RiskScaleForm({ slave, onDone }) {
       <div className="scale-rows">
         <div className="scale-head">
           <span>Strategy (magic)</span>
-          <span>Risk scale</span>
+          <span>&times; on top of intake</span>
           <span />
         </div>
         {rows.map((r, i) => (
@@ -864,17 +1506,271 @@ function RiskScaleForm({ slave, onDone }) {
 
       <aside className="side-note">
         <p>
-          <strong>1.0</strong> takes the whole of what the master staked on that strategy.
-          The same share on a futures or ETF slave is usually too much -- far less leverage
-          than the CFD account it was sized for. <strong>0</strong> means do not trade this
-          strategy here at all.
+          {/* BANKED, not deleted: "The same share on a futures or ETF
+              slave is usually too much -- far less leverage than the CFD
+              account it was sized for." It is the reason this field
+              exists, and it is one hover away rather than three lines of
+              the form. */}
+          <span title="The same share on a futures or ETF slave is usually too much -- far less leverage than the CFD account it was sized for.">
+            <strong>1.0</strong> takes the whole of what the master staked on that strategy
+            &mdash; usually too much on a futures or ETF slave. <strong>0</strong> means do
+            not trade it here.
+          </span>
         </p>
-        <p>A route with its own scale wins over this table; this table wins over the slave-wide value.</p>
+        <p>
+          A strategy listed here <strong>multiplies</strong> the intake figure above &mdash; it
+          does not replace it. An EA signalling 2% of balance, into a slave calibrated 0.50, with
+          this strategy at 0.50, trades <strong>0.5% &mdash; a quarter of the original signal</strong>.
+        </p>
+        <p>
+          <strong>1.00 means no further adjustment</strong>, which is what most strategies want:
+          they simply inherit the slave's intake figure. It does not mean full size.
+        </p>
+        <p>A route with its own figure multiplies in turn, on top of both.</p>
       </aside>
 
       <div className="slave-actions">
         <button className="btn btn-small" onClick={save} disabled={busy}>
           {busy ? "Saving..." : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Sizing for EVERY route on a slave that sizes per route.
+ *
+ * Not a slave-level block -- those are ignored when routes size
+ * themselves, which is exactly why the card hides the ordinary Edit
+ * button here. This writes the same numbers into each route's own
+ * sizing, because "the cap on this slave" is what the twenty identical
+ * blocks on ibkr-etf-1 actually mean.
+ *
+ * Routes that carry NO sizing block are left alone: adding one would
+ * change a route that was deliberately inheriting, and the summary line
+ * says how many were skipped.
+ */
+function RouteSizingForm({ slave, onDone }) {
+  const [full, setFull] = useState(null);
+  const [form, setForm] = useState(null);
+  const [mixed, setMixed] = useState(false);
+  const [count, setCount] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const got = await api.getSlave(slave.id);
+        setFull(got);
+        const routes = (got.config.routes || []).filter((r) => r.sizing);
+        setCount(routes.length);
+
+        // Uniform or not is the whole question: one editor over twenty
+        // identical blocks is honest, over twenty different ones it is
+        // a bulk overwrite and has to say so.
+        const shapes = new Set(routes.map((r) => JSON.stringify(r.sizing)));
+        setMixed(shapes.size > 1);
+
+        const first = routes.length ? routes[0].sizing : {};
+        setForm({
+          // risk_pct is carried, not shown. See the note above the save:
+          // the master's measured fraction replaces it on every signal.
+          risk_pct: first.risk_pct,
+          max_risk_pct:
+            first.max_risk_pct != null ? +(first.max_risk_pct * 100).toFixed(4) : "",
+          capital_base: first.capital_base || "balance",
+          rounding: first.rounding || "nearest_min1",
+          round_band: first.round_band != null ? first.round_band : "",
+          max_risk_error:
+            first.max_risk_error != null ? +(first.max_risk_error * 100).toFixed(4) : "",
+        });
+      } catch (e) {
+        setErr(e.message);
+      }
+    })();
+  }, [slave.id]);
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const cap = String(form.max_risk_pct).trim();
+      if (cap !== "" && (Number.isNaN(Number(cap)) || Number(cap) <= 0)) {
+        throw new Error("the ceiling must be a percentage above zero, or blank for none");
+      }
+      const band = String(form.round_band).trim();
+      if (band !== "") {
+        const b = Number(band);
+        if (Number.isNaN(b) || b < 0 || b >= 0.5) {
+          // 0.5 would make every size "near a whole contract" from both
+          // sides at once, so the step-down could never fire.
+          throw new Error("the step-down band must be between 0 and 0.5");
+        }
+      }
+      const tol = String(form.max_risk_error).trim();
+      if (tol !== "") {
+        const t = Number(tol);
+        if (Number.isNaN(t) || t < 0 || t >= 100) {
+          throw new Error("the risk tolerance must be a percentage from 0 to under 100");
+        }
+      }
+
+      // Re-read at save time. These forms PATCH the whole config, and a
+      // snapshot taken when the form opened silently restores anything
+      // changed since -- the bug that wiped risk_scale twice.
+      const config = await currentConfig(slave.id);
+      let touched = 0;
+      config.routes = (config.routes || []).map((r) => {
+        if (!r.sizing) return r;
+        touched += 1;
+        const sizing = { ...r.sizing };
+        // risk_pct is left exactly as found. The master's own figure
+        // replaces it on every signal, so there is no field for it --
+        // but a slave fed by a bridge too old to publish one still
+        // falls back to it, and dropping it would resize those silently.
+        if (band === "") delete sizing.round_band;
+        else sizing.round_band = Number(band);
+        if (tol === "") delete sizing.max_risk_error;
+        else sizing.max_risk_error = Number(tol) / 100;
+        if (cap === "") delete sizing.max_risk_pct;
+        else sizing.max_risk_pct = Number(cap) / 100;
+        sizing.capital_base = form.capital_base;
+        sizing.rounding = form.rounding;
+        return { ...r, sizing };
+      });
+      if (!touched) throw new Error("no route on this slave carries a sizing block");
+
+      await api.patchSlave(slave.id, { config });
+      onDone();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (err && !full) return <div className="banner banner-error">{err}</div>;
+  if (!full || !form) return <p className="muted small">Loading...</p>;
+
+  return (
+    <div className="slave-risk-form">
+      {err && <div className="banner banner-error">{err}</div>}
+
+      {mixed && (
+        <div className="banner banner-error">
+          These routes do not all size the same way today. Saving gives all {count} of
+          them the values below.
+        </div>
+      )}
+
+      <p className="muted small">
+        Sizing lives on each route here rather than on the slave, so this is what a
+        slave-wide figure means: the same values written to all <strong>{count}</strong> of
+        them. The share each signal stakes comes from what the master&apos;s order actually
+        risked, not from a percentage set here; risk calibration above decides how much of it
+        this slave takes.
+      </p>
+
+      <div className="field-row">
+        <label>
+          Measured against
+          <select
+            value={form.capital_base}
+            onChange={(e) => setForm({ ...form, capital_base: e.target.value })}
+          >
+            <option value="balance">Balance</option>
+            <option value="equity">Equity</option>
+          </select>
+        </label>
+        <label>
+          Refuse above (%)
+          <input
+            type="number"
+            step="0.05"
+            min="0"
+            value={form.max_risk_pct}
+            placeholder="none"
+            onChange={(e) => setForm({ ...form, max_risk_pct: e.target.value })}
+          />
+        </label>
+      </div>
+      <p className="muted small">
+        The smallest tradeable size can already risk more than the target -- a leveraged ETF on
+        a wide stop does. Over the ceiling the leg is refused rather than sized down, so a
+        ceiling close to the target means that instrument simply will not trade.
+      </p>
+
+      <div className="field-row">
+        <label>
+          Rounding
+          <select
+            value={form.rounding}
+            onChange={(e) => setForm({ ...form, rounding: e.target.value })}
+          >
+            <option value="nearest_min1">Nearest, never below one</option>
+            <option value="floor">Floor -- skip rather than round up</option>
+          </select>
+        </label>
+        <label>
+          Step down over (% risk off)
+          <input
+            type="number"
+            step="1"
+            min="0"
+            max="99"
+            value={form.max_risk_error}
+            placeholder="off"
+            onChange={(e) => setForm({ ...form, max_risk_error: e.target.value })}
+          />
+        </label>
+        {/* VISIBLY inert when the tolerance is set, not just described
+            as inert in a paragraph below. Two editable fields answering
+            one question is how a config comes to hold two answers -- the
+            margin ceiling did exactly that, and showed 25%% on a slave
+            that was uncapped. */}
+        <label className={form.max_risk_error !== "" ? "muted" : undefined}>
+          Step down outside (band){form.max_risk_error !== "" ? " -- ignored" : ""}
+          <input
+            type="number"
+            step="0.05"
+            min="0"
+            max="0.49"
+            value={form.round_band}
+            placeholder="off"
+            disabled={form.max_risk_error !== ""}
+            title={form.max_risk_error !== ""
+              ? "The risk tolerance decides while it is set. Clear it to use the band again."
+              : undefined}
+            onChange={(e) => setForm({ ...form, round_band: e.target.value })}
+          />
+        </label>
+      </div>
+      <p className="muted small">
+        <strong>Floor</strong> skips a signal that does not reach one whole unit rather than
+        rounding it up to one.
+      </p>
+      {/* Both answer "take the bigger contract, or step down to the
+          smaller one?" and they ask it differently. The newer one is
+          listed first and wins, because a config carrying a stale band
+          should not look like it decides anything. */}
+      <p className="muted small">
+        <strong>% risk off</strong> rounds to the nearest whole contract and steps down to the
+        smaller one only when that rounding is further off the intended risk than this. At
+        15%, 3.35 contracts becomes 3 (10% off) and 6.65 becomes 7 (5% off), while 1.66 steps
+        down to the micros rather than take 2 at 21% over.
+      </p>
+      <p className="muted small">
+        <strong>Band</strong> is the older rule and is ignored while the one above is set. It
+        measures distance to a whole contract instead of cost, which cannot tell those cases
+        apart: the same 0.65 of a contract is 21% of the intended risk at 1 and 5% at 6, and no
+        band width takes the second while refusing the first.
+      </p>
+
+      <div className="slave-actions">
+        <button className="btn btn-small" onClick={save} disabled={busy}>
+          {busy ? "Saving..." : `Save to all ${count} routes`}
         </button>
       </div>
     </div>
@@ -931,7 +1827,7 @@ function MasterFilterForm({ slave, knownAccounts, onDone }) {
         );
       }
 
-      const config = { ...full.config };
+      const config = await currentConfig(slave.id);
       if (allow.length === 0 && deny.length === 0) {
         delete config.master_filter;
       } else {
@@ -978,7 +1874,7 @@ function MasterFilterForm({ slave, knownAccounts, onDone }) {
         Magic numbers are per master and WILL collide: every fxDreema project numbers its
         strategies from 1001, so two masters each running their first EA both stamp 1001. A
         slave that follows both cannot tell them apart -- an accepted magic takes both, and a
-        per-strategy risk scale resizes both. Naming the masters is what makes the strategy
+        per-strategy calibration resizes both. Naming the masters is what makes the strategy
         list mean something.
       </p>
       <div className="slave-actions">
@@ -1022,12 +1918,15 @@ function AccountList({ label, hint, values, onChange }) {
 function describeSelection(slave) {
   const mf = slave.magic_filter;
   const scales = slave.risk_scale_by_magic || {};
-  const base = slave.risk_scale ?? 1;
 
   if (mf && mf.accept === "none") return "no strategies -- nothing is copied";
   if (!mf || (mf.allow == null && !(mf.deny || []).length)) {
-    const all = base === 1 ? "every strategy, full size" : `every strategy x${base}`;
-    return all;
+    // WHICH strategies, not how much they stake. This read "every
+    // strategy x0.5", echoing the slave's intake calibration into a row
+    // about selection -- two rows showing one number, with this one
+    // implying the selection screen is where it is set. It is not; the
+    // Risk calibration row above owns it.
+    return "every strategy";
   }
   const allow = mf.allow || [];
   if (!allow.length) return "every strategy except those denied";
@@ -1039,11 +1938,337 @@ function describeSelection(slave) {
     .join(", ");
 }
 
+/**
+ * A Portfolio Manager export, applied to one slave.
+ *
+ * This is the manual step it removes, in Chris's words on 2026-11-18:
+ * "I dont want to have to (if possible) introduce a manual, error prone
+ * step like adding magic numbers and their risk scale by hand."
+ *
+ * TWO STEPS, ALWAYS, and never one. An import REPLACES this slave's
+ * whole strategy selection -- a magic the file does not mention is one
+ * the slave stops taking -- so the file is read, the hub is asked what
+ * applying it would change, and that answer is shown before anything is
+ * written. The plan shown is the plan the hub returns, not one built
+ * here, so what is approved and what happens are the same words.
+ *
+ * The file never leaves this machine except to the hub. Nothing fetches
+ * a portfolio: see docs/portfolio-import.md.
+ */
+function PortfolioImportForm({ slave, onDone }) {
+  const [document_, setDocument] = useState(null);
+  const [fileName, setFileName] = useState(null);
+  const [plan, setPlan] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  async function choose(event) {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    setErr(null);
+    setPlan(null);
+    setDocument(null);
+    setFileName(file.name);
+
+    let parsed;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch (e) {
+      // Said here rather than sent to the hub: a file that is not JSON
+      // never had a chance of being a portfolio.
+      setErr(`${file.name} is not readable JSON -- ${e.message}`);
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const res = await api.importPortfolio(slave.id, parsed, true);
+      setDocument(parsed);
+      setPlan(res.plan);
+    } catch (e) {
+      setErr(importError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function apply() {
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.importPortfolio(slave.id, document_, false);
+      onDone && onDone();
+    } catch (e) {
+      setErr(importError(e));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="slave-risk-form portfolio-import">
+      <label>
+        Portfolio file from PM
+        <input type="file" accept="application/json,.json" onChange={choose} disabled={busy} />
+      </label>
+
+      {busy && !plan && <p className="muted small">Reading {fileName}...</p>}
+      {err && <div className="banner banner-error">{err}</div>}
+
+      {plan && (
+        <>
+          <div className="import-plan">
+            <div className="import-plan-head">
+              <strong>{plan.portfolio.name || plan.portfolio.id}</strong>{" "}
+              <span className="muted small">
+                {plan.portfolio.revision != null && `rev ${plan.portfolio.revision} `}
+                &middot; {plan.strategies} strateg{plan.strategies === 1 ? "y" : "ies"}
+                {" "}&middot; {fileName}
+              </span>
+            </div>
+
+            {/* The largest change this can make, and "2 added" understates
+                it: every slave today takes every strategy. */}
+            {plan.narrows_from_every_magic && (
+              <p className="import-warn">
+                This slave takes <strong>every strategy</strong> today. Applying this
+                narrows it to the {plan.strategies} listed here &mdash; anything else the
+                master sends stops reaching it.
+              </p>
+            )}
+
+            {plan.replaces_import && (
+              <p className="muted small">
+                Replaces an earlier import:{" "}
+                {plan.replaces_import.portfolio || plan.replaces_import.portfolio_id}
+                {plan.replaces_import.revision != null &&
+                  ` rev ${plan.replaces_import.revision}`}
+                {plan.replaces_import.imported_at &&
+                  `, applied ${plan.replaces_import.imported_at}`}
+                .
+              </p>
+            )}
+
+            <PlanLine
+              label="Strategies added"
+              values={plan.magics_added}
+              empty="none"
+            />
+            {/* Spelled out rather than counted: a strategy this slave
+                stops taking is the change someone most needs to see. */}
+            <PlanLine
+              label="No longer taken"
+              values={plan.magics_removed}
+              empty="none"
+              warn
+            />
+
+            <div className="import-plan-row">
+              <span className="row-k">Risk scales</span>
+              <div>
+                {plan.scales_changed.length === 0 ? (
+                  <span className="muted">unchanged</span>
+                ) : (
+                  plan.scales_changed.map((c) => (
+                    <span key={c.magic} className="import-scale">
+                      {c.magic} {c.from == null ? "new" : `x${Number(c.from).toFixed(2)}`}
+                      {" \u2192 "}
+                      x{Number(c.to).toFixed(2)}
+                    </span>
+                  ))
+                )}
+                {plan.unchanged > 0 && (
+                  <span className="muted small"> &middot; {plan.unchanged} unchanged</span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="form-actions">
+            <button className="btn btn-primary btn-small" onClick={apply} disabled={busy}>
+              {busy ? "Applying..." : "Apply to this slave"}
+            </button>
+            <span className="muted small">
+              Nothing has been written yet. Sizing, routes, masters and every limit on this
+              slave are untouched either way.
+            </span>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Take a portfolio back off a slave.
+ *
+ * APPLYING ONE IS NOT ITS OWN INVERSE, which is the whole reason this
+ * exists. An import writes the selection AND the per-strategy scales,
+ * and only the selection is visible on this card -- so deleting that by
+ * hand leaves the scales in force over a slave that takes every
+ * strategy again. On mt5-icm-1 that left three scales behind, two of
+ * them halving a strategy, showing only as a "+3 EA" badge that read
+ * like a stale display.
+ *
+ * Asks first, like the import, and for a larger reason: removing a
+ * selection WIDENS the slave to everything the master sends, which is
+ * the least visible change either direction can make.
+ */
+function PortfolioRemoveForm({ slave, onDone }) {
+  const [plan, setPlan] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    let live = true;
+    (async () => {
+      try {
+        const res = await api.removePortfolio(slave.id, true);
+        if (live) setPlan(res.plan);
+      } catch (e) {
+        if (live) setErr(importError(e));
+      }
+    })();
+    return () => { live = false; };
+  }, [slave.id]);
+
+  async function remove() {
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.removePortfolio(slave.id, false);
+      onDone && onDone();
+    } catch (e) {
+      setErr(importError(e));
+      setBusy(false);
+    }
+  }
+
+  if (err) return <div className="banner banner-error">{err}</div>;
+  if (!plan) return <p className="muted small">Reading what is on this slave...</p>;
+
+  if (plan.nothing_to_remove) {
+    return (
+      <p className="muted small">
+        Nothing to remove: this slave has no strategy selection and no per-strategy
+        risk scales.
+      </p>
+    );
+  }
+
+  return (
+    <div className="slave-risk-form portfolio-import">
+      <div className="import-plan">
+        <div className="import-plan-head">
+          {plan.portfolio ? (
+            <>
+              <strong>{plan.portfolio.portfolio || plan.portfolio.portfolio_id}</strong>{" "}
+              <span className="muted small">
+                {plan.portfolio.revision != null && `rev ${plan.portfolio.revision} `}
+                &middot; imported {plan.portfolio.imported_at}
+              </span>
+            </>
+          ) : (
+            /* No source block: the selection was written or deleted by
+               hand, so there is no import to undo -- only leftovers to
+               clear, which is exactly the state this is for. */
+            <span className="muted small">
+              Not from an import &mdash; whatever is below was set by hand or left
+              behind by one.
+            </span>
+          )}
+        </div>
+
+        {plan.widens_to_every_magic && (
+          <p className="import-warn">
+            This slave takes <strong>{plan.magics_dropped.length} strateg
+            {plan.magics_dropped.length === 1 ? "y" : "ies"}</strong> today. Removing the
+            portfolio makes it take <strong>every strategy</strong> the master sends.
+          </p>
+        )}
+
+        <PlanLine
+          label="No longer selected"
+          values={plan.magics_dropped}
+          empty="none - it already takes everything"
+        />
+        <div className="import-plan-row">
+          <span className="row-k">Scales cleared</span>
+          <div>
+            {plan.scales_dropped.length === 0 ? (
+              <span className="muted">none</span>
+            ) : (
+              plan.scales_dropped.map((s) => (
+                <span key={s.magic} className="import-scale">
+                  {s.magic} x{Number(s.scale).toFixed(2)}
+                </span>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="form-actions">
+        <button className="btn btn-primary btn-small" onClick={remove} disabled={busy}>
+          {busy ? "Removing..." : "Remove from this slave"}
+        </button>
+        <span className="muted small">
+          Nothing has been written yet. Sizing, routes, masters and every limit on this
+          slave are untouched either way.
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function PlanLine({ label, values, empty, warn }) {
+  return (
+    <div className="import-plan-row">
+      <span className="row-k">{label}</span>
+      <div className={warn && values.length > 0 ? "import-warn-text" : undefined}>
+        {values.length === 0 ? <span className="muted">{empty}</span> : values.join(", ")}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * A failed import, said in words someone can act on.
+ *
+ * The hub answers 400 with the reason -- which entry, and what is wrong
+ * with it -- because whoever is holding the file is the one who can fix
+ * it. The one case it cannot explain is its own absence: the route
+ * arrives with this change, so a hub that has not been restarted since
+ * does not have it.
+ *
+ * MEASURED, not assumed: that hub answers 405, not 404. A POST to a path
+ * the API router does not define falls through to the UI's catch-all,
+ * which is registered for GET -- so the method is what it refuses. The
+ * 404 is kept beside it because it is what the same request would answer
+ * if the catch-all ever stopped matching first.
+ */
+function importError(error) {
+  const text = String(error.message || error);
+  if (/-> 40[45]:/.test(text)) {
+    return (
+      "This hub has no portfolio import yet. The route is part of this change, " +
+      "and it starts answering when the hub is next restarted -- the UI alone " +
+      "cannot add it."
+    );
+  }
+  const detail = /-> \d+: (.*)$/.exec(text);
+  if (!detail) return text;
+  try {
+    const parsed = JSON.parse(detail[1]);
+    return parsed.detail || detail[1];
+  } catch {
+    return detail[1];
+  }
+}
+
 function StrategyForm({ slave, onDone }) {
   const [full, setFull] = useState(null);
   const [mode, setMode] = useState("none");
   const [rows, setRows] = useState([]);
-  const [base, setBase] = useState(1);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
 
@@ -1054,7 +2279,6 @@ function StrategyForm({ slave, onDone }) {
         setFull(got);
         const mf = got.config.magic_filter;
         const scales = got.config.risk_scale_by_magic || {};
-        setBase(got.config.risk_scale ?? 1);
 
         let listed = [];
         let m = "none";
@@ -1084,7 +2308,7 @@ function StrategyForm({ slave, onDone }) {
     setBusy(true);
     setErr(null);
     try {
-      const config = { ...full.config };
+      const config = await currentConfig(slave.id);
 
       if (mode === "all") {
         delete config.magic_filter;
@@ -1115,8 +2339,11 @@ function StrategyForm({ slave, onDone }) {
         else delete config.risk_scale_by_magic;
       }
 
-      if (Number(base) === 1) delete config.risk_scale;
-      else config.risk_scale = Number(base);
+      // risk_scale is deliberately NOT written here any more. This form
+      // patches the whole config from the snapshot it loaded on open, so
+      // while it also owned the slave-wide scale, saving a strategy
+      // selection could quietly put back a scale changed on the Risk scale
+      // row in the meantime.
 
       await api.patchSlave(slave.id, { config });
       onDone();
@@ -1156,7 +2383,7 @@ function StrategyForm({ slave, onDone }) {
         <div className="scale-rows">
           <div className="scale-head">
             <span>Strategy (magic)</span>
-            <span>Risk scale</span>
+            <span>Calibration</span>
             <span />
           </div>
           {rows.map((r, i) => (
@@ -1190,18 +2417,20 @@ function StrategyForm({ slave, onDone }) {
         </div>
       )}
 
-      {mode !== "none" && (
-        <label>
-          All strategies on this slave x
-          <input
-            type="number"
-            step="0.05"
-            min="0"
-            value={base}
-            onChange={(e) => setBase(e.target.value)}
-          />
-        </label>
-      )}
+      {/* The slave-wide scale USED TO BE EDITED HERE, and it was the only
+          place it could be. That is how it came to be invisible: the card
+          leads with "risk scale x1.00" and the field for it was two
+          sections down, inside a form about which strategies are accepted,
+          and hidden entirely while the mode was Accept none.
+
+          It now lives on the Risk scale row, where the text is. Two
+          editors of one JSON key is also a clobbering hazard -- each
+          patches the whole config from its own snapshot -- so this one is
+          gone rather than duplicated. */}
+      <p className="muted small">
+        The default, and per-strategy figures that replace it, are on the{" "}
+        <strong>Risk calibration</strong> row above.
+      </p>
 
       <aside className="side-note">
         <p>
@@ -1209,7 +2438,8 @@ function StrategyForm({ slave, onDone }) {
           should not port all of them here the moment it connects. Opt each one in.
         </p>
         <p>
-          <strong>Risk scale</strong> is how much of what the master staked this slave takes.
+          <strong>Risk calibration</strong> is how much of what the master staked this slave
+          takes, and the figure here multiplies it rather than replacing it.
           1.0 is all of it; the same share on a futures or ETF leg is usually too much, with far
           less leverage than the CFD account it was sized for. <strong>0</strong> means do not
           trade that strategy here.
@@ -1226,138 +2456,8 @@ function StrategyForm({ slave, onDone }) {
   );
 }
 
-function MagicList({ label, hint, values, onChange }) {
-  return (
-    <div className="magic-list">
-      <span className="muted small">
-        {label} <span className="muted small">-- {hint}</span>
-      </span>
-      {values.map((v, i) => (
-        <div className="magic-row" key={i}>
-          <input
-            value={v}
-            placeholder="1001"
-            onChange={(e) => onChange(values.map((x, j) => (i === j ? e.target.value : x)))}
-          />
-          <button
-            className="btn btn-small btn-danger"
-            onClick={() => onChange(values.filter((_, j) => j !== i))}
-          >
-            Remove
-          </button>
-        </div>
-      ))}
-      <button className="btn btn-small" onClick={() => onChange([...values, ""])}>
-        + Add magic
-      </button>
-    </div>
-  );
-}
-
-function MagicFilterForm({ slave, onDone }) {
-  const [full, setFull] = useState(null);
-  // One magic number per field. A comma-separated box reads fine until a
-  // stray character turns the whole list into one unparseable string, and
-  // an allow-list that fails to parse is a slave that stops trading.
-  const [allowRows, setAllowRows] = useState([]);
-  const [denyRows, setDenyRows] = useState([]);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState(null);
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const got = await api.getSlave(slave.id);
-        const mf = got.config.magic_filter;
-        setFull(got);
-        if (Array.isArray(mf)) setAllowRows(mf.map(String));
-        else if (mf && typeof mf === "object") {
-          setAllowRows((mf.allow || []).map(String));
-          setDenyRows((mf.deny || []).map(String));
-        }
-      } catch (e) {
-        setErr(e.message);
-      }
-    })();
-  }, [slave.id]);
-
-  function parseRows(rows, where) {
-    const out = [];
-    for (const raw of rows) {
-      const t = String(raw).trim();
-      if (!t) continue;
-      if (!/^\d+$/.test(t)) throw new Error(`"${t}" in ${where} is not a magic number`);
-      const n = Number(t);
-      if (out.includes(n)) throw new Error(`magic ${n} is listed twice in ${where}`);
-      out.push(n);
-    }
-    return out;
-  }
-
-  async function save() {
-    setBusy(true);
-    setErr(null);
-    try {
-      const allowList = parseRows(allowRows, "the accept list");
-      const denyList = parseRows(denyRows, "the never-accept list");
-      const clash = allowList.filter((n) => denyList.includes(n));
-      if (clash.length) {
-        throw new Error(
-          `magic ${clash.join(", ")} is in both lists -- deny wins, so it would never trade`,
-        );
-      }
-      const config = { ...full.config };
-      if (allowList.length === 0 && denyList.length === 0) {
-        delete config.magic_filter;
-      } else {
-        const next = {};
-        // An EMPTY allow-list is not the same as no allow-list: it would
-        // stop every signal. Only send the key when it has members.
-        if (allowList.length) next.allow = allowList;
-        if (denyList.length) next.deny = denyList;
-        config.magic_filter = next;
-      }
-      await api.patchSlave(slave.id, { config });
-      onDone();
-    } catch (e) {
-      setErr(e.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  if (err && !full) return <div className="banner banner-error">{err}</div>;
-  if (!full) return <p className="muted small">Loading...</p>;
-
-  return (
-    <div className="slave-risk-form">
-      {err && <div className="banner banner-error">{err}</div>}
-      <MagicList
-        label="Accept only these"
-        hint="none listed = accept every strategy"
-        values={allowRows}
-        onChange={setAllowRows}
-      />
-      <MagicList
-        label="Never accept these"
-        hint="applied after the list above"
-        values={denyRows}
-        onChange={setDenyRows}
-      />
-      <p className="muted small">
-        One master terminal can run many EAs, each stamping its own magic number. This decides
-        which of them this slave copies. Leaving both blank accepts every signal -- which is what
-        every slave does today.
-      </p>
-      <div className="slave-actions">
-        <button className="btn btn-small" onClick={save} disabled={busy}>
-          {busy ? "Saving..." : "Save"}
-        </button>
-      </div>
-    </div>
-  );
-}
-
+/* MagicList went with MagicFilterForm, its only caller. AccountList
+   below is the one MasterFilterForm still uses. */
 function ContractRollForm({ slave, onDone }) {
   const [full, setFull] = useState(null);
   const [form, setForm] = useState(null);
@@ -1385,7 +2485,7 @@ function ContractRollForm({ slave, onDone }) {
     setBusy(true);
     setErr(null);
     try {
-      const config = { ...full.config };
+      const config = await currentConfig(slave.id);
       config.contract_roll = {
         ...(config.contract_roll || {}),
         enabled: !!form.enabled,
@@ -1449,6 +2549,290 @@ function ContractRollForm({ slave, onDone }) {
   );
 }
 
+/**
+ * The slave-wide default for the order splitter: how many orders one
+ * entry goes out in, and how long apart.
+ *
+ * A ROUTE may set its own and wins over this. There is no field for that
+ * here on purpose -- a route's split belongs with the rest of its
+ * settings, and a slave-level control that silently loses to a route is
+ * the setting-that-saves-cleanly-and-does-nothing this page has had to
+ * go back and fix twice.
+ */
+function OrderSplitForm({ slave, onDone }) {
+  const [form, setForm] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const got = await api.getSlave(slave.id);
+        setForm({
+          slices: got.config.entry_split_slices ?? "",
+          interval: got.config.entry_split_interval ?? "",
+        });
+      } catch (e) {
+        setErr(e.message);
+      }
+    })();
+  }, [slave.id]);
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const slices = String(form.slices).trim();
+      const interval = String(form.interval).trim();
+
+      // Off is BOTH cleared, not one of them. Slices with no interval is
+      // one order sent in pieces -- commission per piece and nothing
+      // gained -- and the engine reads it as off, so a config that says
+      // "4" while nothing splits is the worst of both.
+      const off = (slices === "" || Number(slices) <= 1) &&
+                  (interval === "" || Number(interval) <= 0);
+
+      let n = null;
+      let secs = null;
+      if (!off) {
+        n = Number(slices);
+        secs = Number(interval);
+        if (!Number.isInteger(n) || n < 2) {
+          throw new Error("slices must be a whole number of 2 or more -- 1 is not a split");
+        }
+        if (Number.isNaN(secs) || secs <= 0) {
+          throw new Error("the delay between slices must be more than 0 seconds");
+        }
+      }
+
+      // Read-modify-write: PATCH replaces config_json whole, so routes,
+      // mirror_map, host and ports travel back untouched or they are
+      // deleted by omission.
+      const config = await currentConfig(slave.id);
+      if (off) {
+        delete config.entry_split_slices;
+        delete config.entry_split_interval;
+      } else {
+        config.entry_split_slices = n;
+        config.entry_split_interval = secs;
+      }
+
+      await api.patchSlave(slave.id, { config });
+      onDone();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (err && !form) return <div className="banner banner-error">{err}</div>;
+  if (!form) return <p className="muted small">Loading this slave&apos;s configuration...</p>;
+
+  const n = Number(form.slices);
+  const secs = Number(form.interval);
+  const window = n > 1 && secs > 0 ? (n - 1) * secs : null;
+
+  return (
+    <div className="slave-risk-form">
+      {err && <div className="banner banner-error">{err}</div>}
+
+      <label>
+        Slices
+        <input
+          type="number"
+          min="0"
+          step="1"
+          value={form.slices}
+          placeholder="off"
+          onChange={(e) => setForm({ ...form, slices: e.target.value })}
+        />
+      </label>
+      <label>
+        Seconds between them
+        <input
+          type="number"
+          min="0"
+          step="1"
+          value={form.interval}
+          placeholder="off"
+          onChange={(e) => setForm({ ...form, interval: e.target.value })}
+        />
+      </label>
+
+      {window != null && (
+        <p className="muted small">
+          One entry goes out as <strong>{n} orders</strong> over{" "}
+          <strong>{window}s</strong>, filling into <strong>one position</strong> -- one
+          row, one stop, one thing to roll. The trade has to outlive that window: a
+          master CLOSE arriving part-way calls off the orders still to come, and the
+          position is whatever had gone out.
+        </p>
+      )}
+      {window == null && (
+        <p className="muted small">
+          Off. Each entry goes to the broker as a single order. Set both fields to
+          split one -- for a size the book cannot absorb in one print.
+        </p>
+      )}
+
+      <p className="muted small">
+        This is the slave-wide default. A route may set its own{" "}
+        <code>split_slices</code> / <code>split_interval</code>, which wins over this,
+        and <code>split_slices: 0</code> on a route opts it out entirely.
+      </p>
+
+      <div className="form-actions">
+        <button className="btn btn-primary" onClick={save} disabled={busy}>
+          {busy ? "Saving..." : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * How a RESTING entry follows the market.
+ *
+ * Each step re-anchors to a FRESH quote -- it does not step by a fixed
+ * amount -- and only moves the order if that quote asks for a better
+ * price. A step is not spent when it does not.
+ */
+function EntryChaseForm({ slave, onDone }) {
+  const [form, setForm] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const got = await api.getSlave(slave.id);
+        setForm({
+          steps: got.config.entry_chase_steps ?? "",
+          interval: got.config.entry_chase_interval ?? "",
+          max_pct: got.config.entry_chase_max_pct != null
+            ? +(got.config.entry_chase_max_pct * 100).toFixed(4) : "",
+        });
+      } catch (e) {
+        setErr(e.message);
+      }
+    })();
+  }, [slave.id]);
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const steps = String(form.steps).trim();
+      const interval = String(form.interval).trim();
+      const pct = String(form.max_pct).trim();
+      const off = steps === "" || Number(steps) <= 0;
+
+      let n = 0;
+      let secs = null;
+      let ceiling = null;
+      if (!off) {
+        n = Number(steps);
+        if (!Number.isInteger(n) || n < 1) throw new Error("steps must be a whole number of 1 or more, or 0 for off");
+        if (interval === "" || Number.isNaN(Number(interval)) || Number(interval) <= 0) {
+          throw new Error("the interval must be more than 0 seconds");
+        }
+        secs = Number(interval);
+        if (pct === "" || Number.isNaN(Number(pct)) || Number(pct) <= 0) {
+          throw new Error("the ceiling must be a percentage above 0");
+        }
+        ceiling = Number(pct) / 100;
+      }
+
+      const config = await currentConfig(slave.id);
+      if (off) {
+        delete config.entry_chase_steps;
+        delete config.entry_chase_interval;
+        delete config.entry_chase_max_pct;
+      } else {
+        config.entry_chase_steps = n;
+        config.entry_chase_interval = secs;
+        config.entry_chase_max_pct = ceiling;
+      }
+
+      await api.patchSlave(slave.id, { config });
+      onDone();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (err && !form) return <div className="banner banner-error">{err}</div>;
+  if (!form) return <p className="muted small">Loading this slave&apos;s configuration...</p>;
+
+  const n = Number(form.steps);
+  const secs = Number(form.interval);
+  const span = n > 0 && secs > 0 ? n * secs : null;
+
+  return (
+    <div className="slave-risk-form">
+      {err && <div className="banner banner-error">{err}</div>}
+
+      <label>
+        Re-prices
+        <input type="number" min="0" step="1" value={form.steps} placeholder="off"
+               onChange={(e) => setForm({ ...form, steps: e.target.value })} />
+      </label>
+      <label>
+        Seconds apart
+        <input type="number" min="0" step="1" value={form.interval} placeholder="--"
+               onChange={(e) => setForm({ ...form, interval: e.target.value })} />
+      </label>
+      <label>
+        Ceiling (% from the first price)
+        <input type="number" min="0" step="0.25" value={form.max_pct} placeholder="--"
+               onChange={(e) => setForm({ ...form, max_pct: e.target.value })} />
+      </label>
+
+      {span != null ? (
+        <p className="muted small">
+          The order is re-priced up to <strong>{n} time(s)</strong>, the first after{" "}
+          <strong>{secs}s</strong> and the last by <strong>{span}s</strong>.{" "}
+          <strong>The trade has to outlive that.</strong> An interval longer than the
+          master holds its position means the chase never fires at all -- which is what
+          60s against 30-second trades was doing.
+        </p>
+      ) : (
+        <p className="muted small">
+          Off. A resting entry stays at the price it went out at until its own timeout
+          cancels it.
+        </p>
+      )}
+
+      <p className="muted small">
+        Each step re-anchors to a <strong>fresh quote</strong> rather than stepping by a
+        fixed amount, and only moves the order if that quote asks for a better price --
+        a step is not spent when it does not. So a frozen quote costs nothing and
+        achieves nothing, which is what <code>quote_fallback: last_close</code> gives you
+        once the broker stops quoting.
+      </p>
+      <p className="muted small">
+        The <strong>ceiling</strong> is measured from the price the order first went out
+        at, and that price is already <code>limit_offset_pct</code> through the quote. A
+        1% ceiling on a 1% offset leaves the chase one further percent of room.
+      </p>
+      <p className="muted small">
+        Not used on an entry that is being <strong>split</strong>: both move the same
+        resting order and neither knows about the other, so the splitter wins and says
+        so in the log.
+      </p>
+
+      <div className="form-actions">
+        <button className="btn btn-primary" onClick={save} disabled={busy}>
+          {busy ? "Saving..." : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function SlaveRiskForm({ slave, onDone }) {
   const [full, setFull] = useState(null);
   const [form, setForm] = useState(null);
@@ -1476,6 +2860,15 @@ function SlaveRiskForm({ slave, onDone }) {
             (got.config.netting || {}).max_aggregate_risk_pct != null
               ? +((got.config.netting || {}).max_aggregate_risk_pct * 100).toFixed(4)
               : "",
+          // Either key, since both have meant this. Saving writes the
+          // canonical one and clears the legacy block, so a slave cannot
+          // keep two answers to one question.
+          max_margin_pct: (() => {
+            const n = got.config.netting || {};
+            const m = got.config.margin || {};
+            const v = n.max_margin_pct != null ? n.max_margin_pct : m.max_pct_of_free;
+            return v != null ? +(v * 100).toFixed(4) : "";
+          })(),
           balance_adjustment: got.config.balance_adjustment != null ? String(got.config.balance_adjustment) : "",
           min_risk_capital: got.config.min_risk_capital != null ? String(got.config.min_risk_capital) : "",
         });
@@ -1492,10 +2885,14 @@ function SlaveRiskForm({ slave, onDone }) {
       // Read-modify-write, deliberately. PATCH replaces config_json whole,
       // so routes, mirror_map, host and ports have to travel back
       // untouched or they are deleted by omission.
-      const config = { ...full.config };
+      const config = await currentConfig(slave.id);
+      // A route-sized slave gets its LIMITS written and its sizing left
+      // alone. Writing a slave-level block is what the hidden button was
+      // protecting against: it saves cleanly and is never read.
+      const sizingIsEditable = !slave.sizing_per_route;
 
       if (form.mode === "mirror_lots") {
-        delete config.sizing;
+        if (sizingIsEditable) delete config.sizing;
       } else {
         const sizing = { ...(config.sizing || {}), mode: "pct_risk" };
         // Untouched. There is no field for it any more -- the master's own
@@ -1506,7 +2903,7 @@ function SlaveRiskForm({ slave, onDone }) {
         sizing.capital_base = form.capital_base;
         if (form.max_risk_pct === "" || form.max_risk_pct === null) delete sizing.max_risk_pct;
         else sizing.max_risk_pct = Number(form.max_risk_pct) / 100;
-        config.sizing = sizing;
+        if (sizingIsEditable) config.sizing = sizing;
       }
 
       const adj = String(form.balance_adjustment).trim();
@@ -1532,6 +2929,25 @@ function SlaveRiskForm({ slave, onDone }) {
         if (!Number.isInteger(n) || n < 1) throw new Error("max legs must be a whole number of 1 or more");
         netting.max_legs = n;
       }
+      const marg = String(form.max_margin_pct).trim();
+      if (marg === "") {
+        delete netting.max_margin_pct;
+      } else {
+        const n = Number(marg);
+        if (Number.isNaN(n) || n <= 0 || n > 100) {
+          throw new Error("the margin ceiling must be a percentage above 0 and at most 100");
+        }
+        netting.max_margin_pct = n / 100;
+      }
+      // The legacy key is cleared whatever happens. Two keys for one
+      // ceiling is how a slave came to show 25% while being uncapped.
+      if (config.margin && config.margin.max_pct_of_free != null) {
+        const rest = { ...config.margin };
+        delete rest.max_pct_of_free;
+        if (Object.keys(rest).length) config.margin = rest;
+        else delete config.margin;
+      }
+
       const agg = String(form.max_aggregate_risk_pct).trim();
       if (agg === "") delete netting.max_aggregate_risk_pct;
       else {
@@ -1557,15 +2973,39 @@ function SlaveRiskForm({ slave, onDone }) {
     <div className="slave-risk-form">
       {err && <div className="banner banner-error">{err}</div>}
 
+      {/* "Mirror the master's lots" was read as the ENGINE mode, because
+          the card said "autonomous"/"mirror" above it with no control. It
+          is a different axis -- HOW MUCH, not which engine -- and picking
+          it deletes the sizing block. So the word "mirror" is gone from
+          here, and the consequence is stated rather than implied. */}
+      {!slave.sizing_per_route && (
       <label>
-        Sizing
+        How much
         <select value={form.mode} onChange={(e) => setForm({ ...form, mode: e.target.value })}>
-          <option value="mirror_lots">Mirror the master&apos;s lots</option>
           <option value="pct_risk">Risk what the master risked</option>
+          <option value="mirror_lots">Copy the master&apos;s lot count as-is</option>
         </select>
       </label>
+      )}
+      {!slave.sizing_per_route && form.mode === "mirror_lots" && (
+        <p className="muted small">
+          <strong>This is not the engine mode.</strong> It removes this slave&apos;s risk
+          sizing: the master&apos;s lot count is sent to the broker unchanged, so a CFD lot
+          becomes that many futures contracts or shares. Use <em>How it copies</em> above to
+          change engines.
+        </p>
+      )}
 
-      {form.mode === "pct_risk" && (
+      {slave.sizing_per_route && (
+        <p className="muted small">
+          Sizing is set on each route on this slave, so there is none to edit here -- a
+          slave-level block would save cleanly and never be read. Use{" "}
+          <strong>Sizing on every route</strong> above for that. The limits below are not
+          sizing and apply either way.
+        </p>
+      )}
+
+      {!slave.sizing_per_route && form.mode === "pct_risk" && (
         <>
           <p className="muted small">
             The share the master staked on each signal, taken from what its order actually risked
@@ -1668,11 +3108,52 @@ function SlaveRiskForm({ slave, onDone }) {
           />
         </label>
       </div>
-      <p className="muted small">
-        Several strategies on one symbol are a single correlated bet. The leg cap counts
-        same-side positions; the combined cap adds up what they risk together and refuses the
-        one that would cross it. A leg with no stop cannot be measured, so the combined cap
-        refuses rather than guesses.
+
+      {/* NO FIELD EXISTED for this, on either form, while both IBKR
+          slaves ran with a 40% ceiling set through the API. It is the
+          cap that refused a 17,408-share UGL leg at 80% of the account,
+          so it is not a setting anybody should have to reach for curl to
+          change. Written to netting.max_margin_pct, the canonical key. */}
+      <div className="field-row">
+        <label>
+          Margin ceiling (% of free)
+          <input
+            type="number"
+            step="5"
+            min="0"
+            max="100"
+            value={form.max_margin_pct}
+            placeholder="no limit"
+            onChange={(e) => setForm({ ...form, max_margin_pct: e.target.value })}
+          />
+        </label>
+        <span />
+      </div>
+      {/* BANKED on the hover, because the measurement is what makes it
+          believable and the sentence is what makes it long: "A tight stop
+          buys a large position for the same risk, so a leg can sit well
+          inside its risk ceiling and still need most of the account to
+          hold -- 17,408 UGL shares risked 1% and wanted 80% of the
+          balance." */}
+      <p
+        className="muted small"
+        title="A tight stop buys a large position for the same risk, so a leg can sit well inside its risk ceiling and still need most of the account to hold -- 17,408 UGL shares risked 1% and wanted 80% of the balance."
+      >
+        Risk and margin are different limits and either can bind first: a leg can sit well
+        inside its risk ceiling and still need most of the account to hold. An autonomous
+        slave refuses it and tries the next instrument on the route; a mirror slave trims
+        the size to fit.
+      </p>
+      {/* Banked: "Several strategies on one symbol are a single
+          correlated bet." -- the why behind both caps, kept on the hover
+          now that the line leads with what they DO. */}
+      <p
+        className="muted small"
+        title="Several strategies on one symbol are a single correlated bet."
+      >
+        The leg cap counts same-side positions; the combined cap adds up what they risk
+        together &mdash; one correlated bet &mdash; and refuses the one that would cross it.
+        A leg with no stop cannot be measured, so it refuses rather than guesses.
       </p>
 
       <label className="checkbox-row">
