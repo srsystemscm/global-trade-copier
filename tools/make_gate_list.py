@@ -101,7 +101,8 @@ def live_set_risk(con: sqlite3.Connection) -> dict[str, tuple]:
     return out
 
 
-def rows_for(db: str, statuses: tuple[str, ...]) -> list[dict]:
+def rows_for(db: str, statuses: tuple[str, ...],
+             only_codes: tuple[str, ...] = ()) -> list[dict]:
     """The units the gate is allowed to fire, and a count of the ones it
     had to leave out.
 
@@ -122,11 +123,25 @@ def rows_for(db: str, statuses: tuple[str, ...]) -> list[dict]:
             code for code, status in con.execute(
                 "SELECT symbol, status FROM v_unit WHERE magic IS NULL")
             if status not in NEVER and status in statuses
+            #--- Scoped like the rows are. Warning about a symbol the
+            #--- caller excluded on purpose is noise, and noise in a
+            #--- go-live gate is what makes a real warning easy to miss.
+            and (not only_codes or code.upper() in only_codes)
         ]
         for unit_id, magic, code, tf, side, status in con.execute(
                 "SELECT id, magic, symbol, timeframe, side, status FROM v_unit "
                 "WHERE magic IS NOT NULL ORDER BY magic"):
             if status in NEVER or status not in statuses:
+                continue
+            #--- Matched on the REGISTRY code (ETH), not the broker symbol
+            #--- (ETHUSD), because the code is what the registry and the
+            #--- strategy names agree on and the broker symbol is a per-
+            #--- account alias.
+            #--- `symbols` above is the ALIAS MAP, not this filter. Naming
+            #--- this one `symbols` too made the test read `code not in
+            #--- <alias dict>`, which is False for every code the registry
+            #--- knows -- so the filter silently passed everything.
+            if only_codes and code.upper() not in only_codes:
                 continue
             mode, risk_json = risks.get(unit_id, (None, None))
             out.append({
@@ -168,6 +183,9 @@ def main() -> int:
     ap.add_argument("--db", default=DEFAULT_DB)
     ap.add_argument("--out", default="gtc-gate-list.csv",
                     help="write here; copy it to the master terminal's MQL4/Files")
+    ap.add_argument("--symbol", action="append", default=None, metavar="CODE",
+                    help="limit to these registry symbol codes (ETH, XAG ...); "
+                         "repeatable. Default: every symbol.")
     ap.add_argument("--status", action="append", default=None,
                     help=f"statuses to include (default {DEFAULT_STATUSES[0]}); "
                          f"{', '.join(NEVER)} are never included")
@@ -184,7 +202,8 @@ def main() -> int:
         print(f"ERROR: no registry at {args.db}", file=sys.stderr)
         return 2
 
-    rows = rows_for(args.db, statuses)
+    rows = rows_for(args.db, statuses,
+                    tuple(sym.upper() for sym in args.symbol or ()))
     if not rows:
         print(f"ERROR: no units with status {', '.join(statuses)} and a magic "
               f"number -- nothing for the gate to fire", file=sys.stderr)
